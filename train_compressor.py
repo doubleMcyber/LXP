@@ -36,6 +36,13 @@ def _sample_steps(sequence: torch.Tensor, target_steps: int) -> torch.Tensor:
 
 def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int) -> torch.Tensor:
     # Differentiable temporal compression: [B, T, D] -> [B, K, D]
+    device = full_latents.device
+    if device.type == "mps":
+        # MPS adaptive_avg_pool1d has limitations on non-divisible sizes
+        full_latents_cpu = full_latents.cpu()
+        pooled = F.adaptive_avg_pool1d(full_latents_cpu.transpose(1, 2), compressed_steps)
+        return pooled.transpose(1, 2).to(device)
+    
     pooled = F.adaptive_avg_pool1d(full_latents.transpose(1, 2), compressed_steps)
     return pooled.transpose(1, 2)
 
@@ -122,6 +129,8 @@ def train_reasoner_stage2(
     - Freeze Actor (Agent B) completely.
     - Update only Reasoner (Agent A).
     """
+    from procrustes_alignment import compute_orthogonal_mapping, apply_orthogonal_mapping
+
     freeze_actor(actor_model)
     reasoner_model.train()
 
@@ -139,8 +148,29 @@ def train_reasoner_stage2(
 
     reasoner_device = _model_device(reasoner_model)
     actor_device = _model_device(actor_model)
-    reasoner_backbone = reasoner_model.get_base_model()
+    
+    if hasattr(reasoner_model, "model"):
+        reasoner_backbone = reasoner_model.model
+    elif hasattr(reasoner_model, "get_base_model"):
+        reasoner_backbone = reasoner_model.get_base_model()
+    else:
+        reasoner_backbone = reasoner_model
+        
     history: list[dict[str, float]] = []
+
+    # Pre-compute alignment mapping using the first batch as anchors
+    print("Computing initial Procrustes alignment...")
+    first_batch = next(iter(train_dataloader))
+    with torch.no_grad():
+        fb_input_ids = first_batch["input_ids"].to(reasoner_device)
+        fb_reasoner_out = reasoner_backbone(input_ids=fb_input_ids, use_cache=False, return_dict=True)
+        fb_reasoner_hidden = fb_reasoner_out.last_hidden_state
+        
+        fb_actor_out = actor_model.model(input_ids=fb_input_ids.to(actor_device), use_cache=False, return_dict=True)
+        fb_actor_hidden = fb_actor_out.last_hidden_state
+        
+        procrustes_q = compute_orthogonal_mapping(fb_reasoner_hidden, fb_actor_hidden)
+        procrustes_q = procrustes_q.to(device=reasoner_device, dtype=reasoner_model.dtype)
 
     for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -161,6 +191,10 @@ def train_reasoner_stage2(
                 compressed_steps=config.compressed_steps,
             )
 
+            # Apply alignment mapping to transfer to Actor's space
+            full_latents_aligned = apply_orthogonal_mapping(full_latents, procrustes_q)
+            compressed_latents_aligned = apply_orthogonal_mapping(compressed_latents, procrustes_q)
+
             full_attention = torch.ones(
                 (full_latents.size(0), full_latents.size(1)),
                 dtype=torch.long,
@@ -174,7 +208,7 @@ def train_reasoner_stage2(
 
             with torch.no_grad():
                 actor_logits_full = actor_model(
-                    inputs_embeds=full_latents.detach().to(
+                    inputs_embeds=full_latents_aligned.detach().to(
                         device=actor_device,
                         dtype=actor_model.get_input_embeddings().weight.dtype,
                     ),
@@ -184,7 +218,7 @@ def train_reasoner_stage2(
                 ).logits
 
             actor_logits_compressed = actor_model(
-                inputs_embeds=compressed_latents.to(
+                inputs_embeds=compressed_latents_aligned.to(
                     device=actor_device,
                     dtype=actor_model.get_input_embeddings().weight.dtype,
                 ),

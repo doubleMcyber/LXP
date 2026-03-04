@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from procrustes_alignment import apply_orthogonal_mapping, compute_orthogonal_mapping
 
 AGENT_A_MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-AGENT_B_MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+AGENT_B_MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-1.2B"
 DEFAULT_PROMPT = "Explain the concept of entropy"
 LATENT_STEPS = 10
 MAX_NEW_TOKENS = 50
@@ -27,15 +27,20 @@ def load_agent(model_name: str) -> AutoModelForCausalLM:
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
+        trust_remote_code=True,
     )
 
 
-def _normalize_kv_cache(past_key_values: Any) -> tuple:
+def _normalize_kv_cache(past_key_values: Any) -> Any:
     if past_key_values is None:
-        return tuple()
+        return None
+    # If it's a DynamicCache or similar non-iterable cache object, return it directly.
+    # Otherwise, if it's already a tuple, or can be converted to one via legacy methods, do so.
     if hasattr(past_key_values, "to_legacy_cache"):
-        return tuple(past_key_values.to_legacy_cache())
-    return tuple(past_key_values)
+        return past_key_values.to_legacy_cache()
+    if isinstance(past_key_values, (tuple, list)):
+        return tuple(past_key_values)
+    return past_key_values
 
 
 def _build_position_ids(attention_mask: torch.Tensor) -> torch.LongTensor:
@@ -43,23 +48,87 @@ def _build_position_ids(attention_mask: torch.Tensor) -> torch.LongTensor:
     return position_ids.clamp_min_(0)
 
 
-def _kv_cache_seq_len(kv_cache: tuple) -> int:
-    if not kv_cache:
+def _kv_cache_seq_len(kv_cache: Any) -> int:
+    if kv_cache is None:
+        return 0
+    if hasattr(kv_cache, "get_seq_length"):
+        return kv_cache.get_seq_length()
+    if not isinstance(kv_cache, (tuple, list)) or not kv_cache:
         return 0
     first_layer = kv_cache[0]
+    if not isinstance(first_layer, (tuple, list)) or not first_layer:
+        return 0
     key_tensor = first_layer[0]
     return int(key_tensor.shape[-2])
 
 
-def _move_kv_cache_to_device(kv_cache: tuple, device: torch.device) -> tuple:
-    moved_layers = []
-    for layer_cache in kv_cache:
-        moved_layer = tuple(
-            tensor.to(device) if torch.is_tensor(tensor) else tensor
-            for tensor in layer_cache
-        )
-        moved_layers.append(moved_layer)
-    return tuple(moved_layers)
+def _kv_cache_layer_count(kv_cache: Any) -> int:
+    if kv_cache is None:
+        return 0
+    if isinstance(kv_cache, (tuple, list)):
+        return len(kv_cache)
+    try:
+        return len(kv_cache)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _move_kv_cache_to_device(kv_cache: Any, device: torch.device) -> Any:
+    if kv_cache is None:
+        return None
+    if hasattr(kv_cache, "to"):
+        return kv_cache.to(device)
+    
+    if isinstance(kv_cache, (tuple, list)):
+        moved_layers = []
+        for layer_cache in kv_cache:
+            if isinstance(layer_cache, (tuple, list)):
+                moved_layer = tuple(
+                    tensor.to(device) if torch.is_tensor(tensor) else tensor
+                    for tensor in layer_cache
+                )
+                moved_layers.append(moved_layer)
+            else:
+                moved_layers.append(layer_cache.to(device) if hasattr(layer_cache, "to") else layer_cache)
+        return tuple(moved_layers)
+    return kv_cache
+
+
+def _is_kv_cache_compatible(kv_cache: Any, actor_model: AutoModelForCausalLM) -> bool:
+    if kv_cache is None:
+        return False
+    if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) == 0:
+        # Unknown cache object: keep it if it comes from the same architecture.
+        return AGENT_A_MODEL_NAME == AGENT_B_MODEL_NAME
+
+    cfg = actor_model.config
+    expected_layers = getattr(cfg, "num_hidden_layers", None)
+    if isinstance(expected_layers, int) and len(kv_cache) != expected_layers:
+        return False
+
+    first_layer = kv_cache[0]
+    if not isinstance(first_layer, (tuple, list)) or len(first_layer) == 0:
+        return False
+    key_tensor = first_layer[0]
+    if not torch.is_tensor(key_tensor) or key_tensor.dim() < 4:
+        return False
+
+    expected_heads = getattr(cfg, "num_key_value_heads", None)
+    if expected_heads is None:
+        expected_heads = getattr(cfg, "num_attention_heads", None)
+    if isinstance(expected_heads, int) and key_tensor.shape[1] != expected_heads:
+        return False
+
+    expected_head_dim = getattr(cfg, "head_dim", None)
+    if expected_head_dim is None:
+        hidden_size = getattr(cfg, "hidden_size", None)
+        num_heads = getattr(cfg, "num_attention_heads", None)
+        if isinstance(hidden_size, int) and isinstance(num_heads, int) and num_heads > 0:
+            expected_head_dim = hidden_size // num_heads
+    if isinstance(expected_head_dim, int) and key_tensor.shape[-1] != expected_head_dim:
+        return False
+
+    return True
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -68,9 +137,10 @@ def _sync_if_cuda(device: torch.device) -> None:
 
 
 class TransformerBlockDynamics(nn.Module):
-    def __init__(self, transformer_block: nn.Module) -> None:
+    def __init__(self, transformer_block: nn.Module, rotary_emb: Optional[nn.Module] = None) -> None:
         super().__init__()
         self.transformer_block = transformer_block
+        self.rotary_emb = rotary_emb
         self._accepted_args = set(inspect.signature(transformer_block.forward).parameters.keys())
         self._attention_mask: Optional[torch.Tensor] = None
         self._position_ids: Optional[torch.LongTensor] = None
@@ -109,6 +179,8 @@ class TransformerBlockDynamics(nn.Module):
             kwargs["position_ids"] = self._position_ids
         if "cache_position" in self._accepted_args and self._cache_position is not None:
             kwargs["cache_position"] = self._cache_position
+        if "position_embeddings" in self._accepted_args and self.rotary_emb is not None:
+            kwargs["position_embeddings"] = self.rotary_emb(hidden_states, self._position_ids)
         if "past_key_value" in self._accepted_args:
             kwargs["past_key_value"] = None
         if "past_key_values" in self._accepted_args:
@@ -142,7 +214,7 @@ def attach_latent_forward(agent_model: AutoModelForCausalLM) -> None:
         return_dict: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, tuple]:
+    ) -> tuple[torch.Tensor, Any]:
         del return_dict
         model_outputs = self.model(
             input_ids=input_ids,
@@ -169,8 +241,8 @@ def _get_pipeline_state() -> dict[str, Any]:
     if _PIPELINE_STATE is not None:
         return _PIPELINE_STATE
 
-    tokenizer_a = AutoTokenizer.from_pretrained(AGENT_A_MODEL_NAME)
-    tokenizer_b = AutoTokenizer.from_pretrained(AGENT_B_MODEL_NAME)
+    tokenizer_a = AutoTokenizer.from_pretrained(AGENT_A_MODEL_NAME, trust_remote_code=True)
+    tokenizer_b = AutoTokenizer.from_pretrained(AGENT_B_MODEL_NAME, trust_remote_code=True)
     agent_a = load_agent(AGENT_A_MODEL_NAME)
     agent_b = load_agent(AGENT_B_MODEL_NAME)
     attach_latent_forward(agent_a)
@@ -230,7 +302,9 @@ def run_hybrid_pipeline(prompt: str = DEFAULT_PROMPT) -> dict[str, Any]:
     procrustes_q = procrustes_q.to(device=hidden_states.device, dtype=hidden_states.dtype)
     current_latent_step = hidden_states[:, -1:, :]
     continuous_position_ids = position_ids_a[:, -1:] + 1
-    dynamics = TransformerBlockDynamics(agent_a.model.layers[0])
+    
+    rotary_emb = getattr(agent_a.model, "rotary_emb", None)
+    dynamics = TransformerBlockDynamics(agent_a.model.layers[0], rotary_emb=rotary_emb)
     dynamics.set_context(position_ids=continuous_position_ids)
 
     time_space = torch.linspace(
@@ -274,7 +348,9 @@ def run_hybrid_pipeline(prompt: str = DEFAULT_PROMPT) -> dict[str, Any]:
         device=agent_b_device,
         dtype=agent_b_embed_dtype,
     )
-    kv_cache_b = _move_kv_cache_to_device(kv_cache_a, agent_b_device)
+    kv_cache_b_candidate = _move_kv_cache_to_device(kv_cache_a, agent_b_device)
+    kv_cache_transferred = _is_kv_cache_compatible(kv_cache_b_candidate, agent_b)
+    kv_cache_b = kv_cache_b_candidate if kv_cache_transferred else None
     attention_mask_b = torch.ones(
         (handoff_step.shape[0], _kv_cache_seq_len(kv_cache_b) + 1),
         dtype=torch.long,
@@ -332,7 +408,8 @@ def run_hybrid_pipeline(prompt: str = DEFAULT_PROMPT) -> dict[str, Any]:
         "final_latent_shape": tuple(current_latent_step.shape),
         "final_latent_dtype": str(current_latent_step.dtype),
         "procrustes_q_shape": tuple(procrustes_q.shape),
-        "kv_cache_length": len(kv_cache_a),
+        "kv_cache_length": _kv_cache_layer_count(kv_cache_a),
+        "kv_cache_transferred": kv_cache_transferred,
         "continuous_integration_50_steps_seconds": integration_duration,
     }
 
@@ -343,6 +420,7 @@ def main() -> None:
     print(f"Final latent step dtype: {outputs['final_latent_dtype']}")
     print(f"Procrustes Q shape: {outputs['procrustes_q_shape']}")
     print(f"KV cache tuple length: {outputs['kv_cache_length']}")
+    print(f"KV cache transferred to Agent B: {outputs['kv_cache_transferred']}")
     print(
         "Continuous integration time (50 steps): "
         f"{outputs['continuous_integration_50_steps_seconds']:.4f} seconds"
