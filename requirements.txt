@@ -2,3 +2,5 @@ torch
 transformers
 accelerate
 vllm
+torchdiffeq
+datasets
