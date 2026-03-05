@@ -1,0 +1,37 @@
+{
+  "os": "macOS-15.1-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.14.2",
+  "startedAt": "2026-03-05T01:46:47.789758Z",
+  "program": "/Users/noahnowaczewski/LXP/run_training.py",
+  "codePath": "run_training.py",
+  "codePathLocal": "run_training.py",
+  "git": {
+    "remote": "https://github.com/doubleMcyber/LXP",
+    "commit": "caca95231bee831c2c3390a421a80bdadeb164ea"
+  },
+  "email": "noahn@stanford.edu",
+  "root": "/Users/noahnowaczewski/LXP",
+  "host": "DN0a1f2252.SUNet",
+  "executable": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "cpu_count": 14,
+  "cpu_count_logical": 14,
+  "disk": {
+    "/": {
+      "total": "994662584320",
+      "used": "396183273472"
+    }
+  },
+  "memory": {
+    "total": "38654705664"
+  },
+  "apple": {
+    "name": "Apple M4 Max",
+    "ecpuCores": 4,
+    "pcpuCores": 10,
+    "gpuCores": 32,
+    "memoryGb": 36,
+    "swapTotalBytes": "6442450944",
+    "ramTotalBytes": "38654705664"
+  },
+  "writerId": "w87ghpz1nab5gaximwydoslfz1ijl8oi"
+}

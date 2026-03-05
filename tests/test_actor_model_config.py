@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from omegaconf import OmegaConf
 from transformers import AutoConfig
 
-from latent_pipeline import AGENT_B_MODEL_NAME
+_CFG = OmegaConf.load(Path(__file__).resolve().parent.parent / "configs" / "main.yaml")
 
 
 def test_actor_model_config_loads() -> None:
-    config = AutoConfig.from_pretrained(AGENT_B_MODEL_NAME, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(_CFG.agent_b_model, trust_remote_code=True)
     assert config is not None
     assert hasattr(config, "num_hidden_layers")
     assert hasattr(config, "num_attention_heads")

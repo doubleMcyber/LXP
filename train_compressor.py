@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
-from typing import Iterable
+from pathlib import Path
+from typing import Iterable, Optional
 
+import hydra
 import torch
+import wandb
 import torch.nn.functional as F
+from omegaconf import DictConfig
 from torch import nn
 from transformers import AutoModelForCausalLM
 
@@ -20,6 +25,34 @@ class CompressionTrainConfig:
     lambda_pref: float = 1.0
     lambda_geom: float = 1.0
     eps: float = 1e-8
+    wandb_enabled: bool = True
+    wandb_project: str = "lxp-stage2"
+    wandb_entity: Optional[str] = None
+    checkpoint_enabled: bool = True
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_every_n_steps: int = 0
+
+    @classmethod
+    def from_cfg(cls, cfg: DictConfig) -> "CompressionTrainConfig":
+        t = cfg.training
+        wandb_cfg = getattr(t, "wandb", None)
+        return cls(
+            compressed_steps=t.compressed_steps,
+            learning_rate=t.learning_rate,
+            weight_decay=t.weight_decay,
+            max_grad_norm=t.max_grad_norm,
+            num_epochs=t.num_epochs,
+            lambda_task=t.lambda_task,
+            lambda_pref=t.lambda_pref,
+            lambda_geom=t.lambda_geom,
+            eps=t.eps,
+            wandb_enabled=bool(wandb_cfg.enabled) if wandb_cfg else False,
+            wandb_project=str(wandb_cfg.project) if wandb_cfg else "lxp-stage2",
+            wandb_entity=str(wandb_cfg.entity) if wandb_cfg and wandb_cfg.entity else None,
+            checkpoint_enabled=bool(ckpt_cfg.enabled) if (ckpt_cfg := getattr(t, "checkpointing", None)) else True,
+            checkpoint_dir=str(ckpt_cfg.dir) if ckpt_cfg else "checkpoints",
+            checkpoint_every_n_steps=int(ckpt_cfg.save_every_n_steps) if ckpt_cfg else 0,
+        )
 
 
 def _sample_steps(sequence: torch.Tensor, target_steps: int) -> torch.Tensor:
@@ -129,7 +162,14 @@ def train_reasoner_stage2(
     - Freeze Actor (Agent B) completely.
     - Update only Reasoner (Agent A).
     """
-    from procrustes_alignment import compute_orthogonal_mapping, apply_orthogonal_mapping
+    from src.utils.alignment import compute_orthogonal_mapping, apply_orthogonal_mapping
+
+    if config.wandb_enabled:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            config=dataclasses.asdict(config),
+        )
 
     freeze_actor(actor_model)
     reasoner_model.train()
@@ -157,6 +197,11 @@ def train_reasoner_stage2(
         reasoner_backbone = reasoner_model
         
     history: list[dict[str, float]] = []
+    global_step = 0
+
+    if config.checkpoint_enabled:
+        ckpt_dir = Path(config.checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-compute alignment mapping using the first batch as anchors
     print("Computing initial Procrustes alignment...")
@@ -240,22 +285,69 @@ def train_reasoner_stage2(
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
             optimizer.step()
 
-            history.append(
-                {
-                    "epoch": float(epoch),
-                    "step": float(step),
-                    "loss": float(loss_outputs["loss"].detach().cpu().item()),
-                    "l_task": float(loss_outputs["l_task"].detach().cpu().item()),
-                    "l_pref": float(loss_outputs["l_pref"].detach().cpu().item()),
-                    "l_geom": float(loss_outputs["l_geom"].detach().cpu().item()),
-                }
-            )
+            metrics = {
+                "epoch": float(epoch),
+                "step": float(step),
+                "loss": float(loss_outputs["loss"].detach().cpu().item()),
+                "l_task": float(loss_outputs["l_task"].detach().cpu().item()),
+                "l_pref": float(loss_outputs["l_pref"].detach().cpu().item()),
+                "l_geom": float(loss_outputs["l_geom"].detach().cpu().item()),
+            }
+            history.append(metrics)
+
+            if config.wandb_enabled:
+                wandb.log(
+                    {
+                        "loss": metrics["loss"],
+                        "l_task": metrics["l_task"],
+                        "l_pref": metrics["l_pref"],
+                        "l_geom": metrics["l_geom"],
+                    },
+                    step=global_step,
+                )
+            if config.checkpoint_enabled and config.checkpoint_every_n_steps > 0:
+                if global_step % config.checkpoint_every_n_steps == 0:
+                    step_path = ckpt_dir / f"step_{global_step}.pt"
+                    torch.save(reasoner_model.state_dict(), step_path)
+                    print(f"Saved checkpoint: {step_path}")
+
+            global_step += 1
+
+        if config.checkpoint_enabled:
+            epoch_path = ckpt_dir / f"epoch_{epoch}.pt"
+            torch.save(reasoner_model.state_dict(), epoch_path)
+            print(f"Saved checkpoint: {epoch_path}")
+
+    if config.wandb_enabled:
+        wandb.finish()
 
     return history
 
 
-if __name__ == "__main__":
-    raise SystemExit(
-        "This module provides Stage II training utilities. Import and call "
-        "`train_reasoner_stage2(...)` with initialized reasoner/actor models and a dataloader."
+@hydra.main(version_base=None, config_path="configs", config_name="main")
+def main(cfg: DictConfig) -> None:
+    config = CompressionTrainConfig.from_cfg(cfg)
+    print("Loaded CompressionTrainConfig from Hydra:")
+    print(f"  compressed_steps = {config.compressed_steps}")
+    print(f"  learning_rate    = {config.learning_rate}")
+    print(f"  weight_decay     = {config.weight_decay}")
+    print(f"  max_grad_norm    = {config.max_grad_norm}")
+    print(f"  num_epochs       = {config.num_epochs}")
+    print(f"  lambda_task      = {config.lambda_task}")
+    print(f"  lambda_pref      = {config.lambda_pref}")
+    print(f"  lambda_geom      = {config.lambda_geom}")
+    print(f"  eps              = {config.eps}")
+    print(f"  wandb_enabled    = {config.wandb_enabled}")
+    print(f"  wandb_project    = {config.wandb_project}")
+    print(f"  wandb_entity     = {config.wandb_entity}")
+    print(f"  checkpoint_enabled = {config.checkpoint_enabled}")
+    print(f"  checkpoint_dir     = {config.checkpoint_dir}")
+    print(f"  checkpoint_every_n_steps = {config.checkpoint_every_n_steps}")
+    print(
+        "\nTo run training, call train_reasoner_stage2(...) with "
+        "initialized reasoner/actor models and a dataloader."
     )
+
+
+if __name__ == "__main__":
+    main()

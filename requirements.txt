@@ -4,3 +4,6 @@ accelerate
 vllm
 torchdiffeq
 datasets
+hydra-core
+omegaconf
+wandb

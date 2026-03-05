@@ -1,83 +1,39 @@
 from __future__ import annotations
 
 import json
-import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from datasets import load_dataset
+from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
 from latent_pipeline import (
-    AGENT_B_MODEL_NAME,
     initialize_hybrid_pipeline,
     run_hybrid_pipeline,
 )
+from src.data.loader import load_math_level5, pick_field
+from src.utils.metrics import (
+    EvalSampleResult,
+    calculate_latency_stats,
+    extract_boxed_text,
+    normalize_answer,
+)
 
-BOXED_REGEX = re.compile(r"\\boxed\s*\{([^{}]+)\}")
 RESULTS_PATH = Path("results.json")
 
 
-@dataclass
-class EvalSampleResult:
-    index: int
-    latency_seconds: float
-    generated_tokens: int
-    predicted_boxed: Optional[str]
-    target_boxed: Optional[str]
-    correct: bool
-    error: Optional[str] = None
+def _load_cfg():
+    return OmegaConf.load(Path(__file__).resolve().parent / "configs" / "main.yaml")
 
 
-def extract_boxed_text(text: str) -> Optional[str]:
-    matches = BOXED_REGEX.findall(text)
-    if not matches:
-        return None
-    return matches[-1].strip()
-
-
-def normalize_answer(answer: Optional[str]) -> Optional[str]:
-    if answer is None:
-        return None
-    cleaned = answer.replace("$", "").strip()
-    return re.sub(r"\s+", "", cleaned)
-
-
-def load_math_level5(limit: int = 100):
-    dataset_candidates = [
-        ("hendrycks/competition_math", "test"),
-        ("competition_math", "test"),
-    ]
-    last_error: Optional[Exception] = None
-
-    for dataset_name, split in dataset_candidates:
-        try:
-            dataset = load_dataset(dataset_name, split=split)
-            if "level" in dataset.column_names:
-                level5 = dataset.filter(lambda row: "Level 5" in str(row.get("level", "")))
-            else:
-                level5 = dataset
-            return level5.select(range(min(limit, len(level5))))
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-
-    raise RuntimeError("Failed to load a MATH dataset candidate") from last_error
-
-
-def _pick_field(row: dict, keys: tuple[str, ...]) -> str:
-    for key in keys:
-        value = row.get(key)
-        if value is not None:
-            return str(value)
-    return ""
-
-
-def evaluate(limit: int = 100) -> dict:
+def evaluate(limit: int = 100, cfg=None) -> dict:
+    if cfg is None:
+        cfg = _load_cfg()
     samples = load_math_level5(limit=limit)
-    initialize_hybrid_pipeline()
-    tokenizer = AutoTokenizer.from_pretrained(AGENT_B_MODEL_NAME)
+    initialize_hybrid_pipeline(cfg)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.agent_b_model)
 
     per_sample: list[EvalSampleResult] = []
     total_latency = 0.0
@@ -85,8 +41,8 @@ def evaluate(limit: int = 100) -> dict:
     total_correct = 0
 
     for idx, row in enumerate(samples):
-        problem = _pick_field(row, ("problem", "question"))
-        target_boxed = extract_boxed_text(_pick_field(row, ("solution", "answer")))
+        problem = pick_field(row, ("problem", "question"))
+        target_boxed = extract_boxed_text(pick_field(row, ("solution", "answer")))
 
         error: Optional[str] = None
         decoded_text = ""
@@ -96,7 +52,7 @@ def evaluate(limit: int = 100) -> dict:
 
         start = time.perf_counter()
         try:
-            pipeline_output = run_hybrid_pipeline(prompt=problem)
+            pipeline_output = run_hybrid_pipeline(cfg, prompt=problem)
             decoded_text = str(pipeline_output["decoded_text"])
             predicted_boxed = extract_boxed_text(decoded_text)
             generated_tokens = len(tokenizer.encode(decoded_text, add_special_tokens=False))
@@ -124,13 +80,14 @@ def evaluate(limit: int = 100) -> dict:
 
     sample_count = len(per_sample)
     accuracy_percentage = (100.0 * total_correct / sample_count) if sample_count else 0.0
-    avg_latency = (total_latency / sample_count) if sample_count else 0.0
+    latency_stats = calculate_latency_stats(per_sample)
 
     return {
         "benchmark": "MATH Level 5",
         "sample_count": sample_count,
-        "total_latency_seconds": total_latency,
-        "average_latency_seconds": avg_latency,
+        "total_latency_seconds": latency_stats["total_latency_seconds"],
+        "average_latency_seconds": latency_stats["average_latency_seconds"],
+        "tokens_per_second": latency_stats["tokens_per_second"],
         "total_text_tokens_generated": total_generated_tokens,
         "accuracy_percentage": accuracy_percentage,
         "results": [asdict(item) for item in per_sample],

@@ -1,0 +1,3 @@
+Computing initial Procrustes alignment...
+/Users/noahnowaczewski/LXP/src/utils/alignment.py:39: UserWarning: The operator 'aten::linalg_svd' is not currently supported on the MPS backend and will fall back to run on the CPU. This may have performance implications. (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/aten/src/ATen/mps/MPSFallback.mm:15.)
+  u, _, vh = torch.linalg.svd(cross_covariance, full_matrices=False)
