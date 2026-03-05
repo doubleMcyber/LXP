@@ -1,2 +1,16 @@
 __pycache__/
 *.pyc
+checkpoints/
+outputs/
+wandb/
+__pycache__/
+*.pyc
+*.so
+*.dylib
+.hydra/
+.pytest_cache/
+.ruff_cache/
+venv/
+*.pt
+*.pth
+*.bin
