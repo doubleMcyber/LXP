@@ -1,0 +1,3 @@
+latent_steps,compression_ratio,accuracy_percentage,total_latency_seconds,average_latency_seconds,tokens_per_second,total_text_tokens_generated,error_count,sample_count
+1,2.0,0.0,1.2400537499925122,1.2400537499925122,0.0,0,1,1
+2,1.0,0.0,4.656992209027521,4.656992209027521,10.736543622099179,50,0,1

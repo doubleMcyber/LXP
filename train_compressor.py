@@ -13,6 +13,8 @@ from omegaconf import DictConfig
 from torch import nn
 from transformers import AutoModelForCausalLM
 
+from src.models.losses import LatentCompressorLoss
+
 
 @dataclass
 class CompressionTrainConfig:
@@ -54,19 +56,6 @@ class CompressionTrainConfig:
             checkpoint_every_n_steps=int(ckpt_cfg.save_every_n_steps) if ckpt_cfg else 0,
         )
 
-
-def _sample_steps(sequence: torch.Tensor, target_steps: int) -> torch.Tensor:
-    if sequence.size(1) == target_steps:
-        return sequence
-    indices = torch.linspace(
-        0,
-        sequence.size(1) - 1,
-        steps=target_steps,
-        device=sequence.device,
-    ).round().long()
-    return sequence.index_select(dim=1, index=indices)
-
-
 def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int) -> torch.Tensor:
     # Differentiable temporal compression: [B, T, D] -> [B, K, D]
     device = full_latents.device
@@ -78,67 +67,6 @@ def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int
     
     pooled = F.adaptive_avg_pool1d(full_latents.transpose(1, 2), compressed_steps)
     return pooled.transpose(1, 2)
-
-
-class LatentCompressorLoss(nn.Module):
-    def __init__(
-        self,
-        lambda_task: float = 1.0,
-        lambda_pref: float = 1.0,
-        lambda_geom: float = 1.0,
-        eps: float = 1e-8,
-    ) -> None:
-        super().__init__()
-        self.lambda_task = lambda_task
-        self.lambda_pref = lambda_pref
-        self.lambda_geom = lambda_geom
-        self.eps = eps
-
-    def forward(
-        self,
-        actor_logits_compressed: torch.Tensor,
-        actor_logits_full: torch.Tensor,
-        full_latents: torch.Tensor,
-        compressed_latents: torch.Tensor,
-        labels: torch.LongTensor,
-    ) -> dict[str, torch.Tensor]:
-        vocab_size = actor_logits_compressed.size(-1)
-        compressed_steps = actor_logits_compressed.size(1)
-
-        sampled_labels = _sample_steps(labels, compressed_steps)
-        l_task = F.cross_entropy(
-            actor_logits_compressed.reshape(-1, vocab_size),
-            sampled_labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-        teacher_logits = _sample_steps(actor_logits_full.detach(), compressed_steps)
-        p_teacher = F.softmax(teacher_logits, dim=-1)
-        p_student = F.softmax(actor_logits_compressed, dim=-1)
-
-        # Required numerical safety clamp for KL log probabilities.
-        log_p_student = torch.log(p_student + self.eps)
-        kl_per_token = F.kl_div(log_p_student, p_teacher, reduction="none").sum(dim=-1)
-
-        entropy_teacher = -(p_teacher * torch.log(p_teacher + self.eps)).sum(dim=-1)
-        token_weights = 1.0 / (entropy_teacher + self.eps)
-        l_pref = (token_weights * kl_per_token).sum() / token_weights.sum().clamp_min(self.eps)
-
-        full_step_avg = full_latents.mean(dim=1)
-        compressed_step_avg = compressed_latents.mean(dim=1)
-        l_geom = 1.0 - F.cosine_similarity(compressed_step_avg, full_step_avg.detach(), dim=-1).mean()
-
-        total_loss = (
-            self.lambda_task * l_task
-            + self.lambda_pref * l_pref
-            + self.lambda_geom * l_geom
-        )
-        return {
-            "loss": total_loss,
-            "l_task": l_task,
-            "l_pref": l_pref,
-            "l_geom": l_geom,
-        }
 
 
 def _model_device(model: nn.Module) -> torch.device:
@@ -292,6 +220,17 @@ def train_reasoner_stage2(
                 "l_task": float(loss_outputs["l_task"].detach().cpu().item()),
                 "l_pref": float(loss_outputs["l_pref"].detach().cpu().item()),
                 "l_geom": float(loss_outputs["l_geom"].detach().cpu().item()),
+                "pref_avg_entropy": float(loss_outputs["pref_avg_entropy"].detach().cpu().item()),
+                "pref_avg_weight": float(loss_outputs["pref_avg_weight"].detach().cpu().item()),
+                "pref_first_token_entropy": float(
+                    loss_outputs["pref_first_token_entropy"].detach().cpu().item()
+                ),
+                "pref_first_token_weight": float(
+                    loss_outputs["pref_first_token_weight"].detach().cpu().item()
+                ),
+                "pref_first_token_kl": float(
+                    loss_outputs["pref_first_token_kl"].detach().cpu().item()
+                ),
             }
             history.append(metrics)
 
@@ -302,6 +241,11 @@ def train_reasoner_stage2(
                         "l_task": metrics["l_task"],
                         "l_pref": metrics["l_pref"],
                         "l_geom": metrics["l_geom"],
+                        "pref_avg_entropy": metrics["pref_avg_entropy"],
+                        "pref_avg_weight": metrics["pref_avg_weight"],
+                        "pref_first_token_entropy": metrics["pref_first_token_entropy"],
+                        "pref_first_token_weight": metrics["pref_first_token_weight"],
+                        "pref_first_token_kl": metrics["pref_first_token_kl"],
                     },
                     step=global_step,
                 )

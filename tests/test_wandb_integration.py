@@ -157,6 +157,11 @@ def test_wandb_init_log_finish_called(mock_wandb) -> None:
         assert "l_task" in logged
         assert "l_pref" in logged
         assert "l_geom" in logged
+        assert "pref_avg_entropy" in logged
+        assert "pref_avg_weight" in logged
+        assert "pref_first_token_entropy" in logged
+        assert "pref_first_token_weight" in logged
+        assert "pref_first_token_kl" in logged
         assert "step" in call_args[1]
     mock_wandb.finish.assert_called_once()
 
@@ -201,6 +206,11 @@ def test_wandb_logs_match_history(mock_wandb) -> None:
         assert logged["l_task"] == history[i]["l_task"]
         assert logged["l_pref"] == history[i]["l_pref"]
         assert logged["l_geom"] == history[i]["l_geom"]
+        assert logged["pref_avg_entropy"] == history[i]["pref_avg_entropy"]
+        assert logged["pref_avg_weight"] == history[i]["pref_avg_weight"]
+        assert logged["pref_first_token_entropy"] == history[i]["pref_first_token_entropy"]
+        assert logged["pref_first_token_weight"] == history[i]["pref_first_token_weight"]
+        assert logged["pref_first_token_kl"] == history[i]["pref_first_token_kl"]
 
 
 @patch("train_compressor.wandb")
