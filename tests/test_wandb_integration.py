@@ -7,11 +7,61 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 from train_compressor import CompressionTrainConfig, train_reasoner_stage2
 
 _CFG = OmegaConf.load(Path(__file__).resolve().parent.parent / "configs" / "main.yaml")
+
+
+class _TinyTokenizer:
+    def __init__(self, *, vocab_size: int = 128, offset: int = 0) -> None:
+        self.vocab_size = vocab_size
+        self.offset = offset
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.pad_token = "<pad>"
+        self.eos_token = "<eos>"
+
+    def _encode_text(self, text: str) -> list[int]:
+        pieces = [piece for piece in text.lower().split() if piece]
+        if not pieces:
+            return [self.eos_token_id]
+        return [
+            ((sum(ord(char) for char in piece) + self.offset) % (self.vocab_size - 2)) + 2
+            for piece in pieces
+        ]
+
+    def __call__(
+        self,
+        texts,
+        *,
+        padding: bool = True,
+        truncation: bool = True,
+        max_length: int = 16,
+        return_tensors: str = "pt",
+    ):
+        del return_tensors
+        if isinstance(texts, str):
+            texts = [texts]
+        encoded = [self._encode_text(text) for text in texts]
+        if truncation:
+            encoded = [tokens[:max_length] for tokens in encoded]
+        pad_to = max(len(tokens) for tokens in encoded) if padding else None
+        if pad_to is None:
+            input_ids = encoded
+            attention_mask = [[1] * len(tokens) for tokens in encoded]
+        else:
+            input_ids = []
+            attention_mask = []
+            for tokens in encoded:
+                pad_width = pad_to - len(tokens)
+                input_ids.append(tokens + [self.pad_token_id] * pad_width)
+                attention_mask.append([1] * len(tokens) + [0] * pad_width)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
 
 
 def test_wandb_config_fields_parsed_from_yaml() -> None:
@@ -19,6 +69,8 @@ def test_wandb_config_fields_parsed_from_yaml() -> None:
     assert config.wandb_enabled is True
     assert config.wandb_project == "lxp-stage2"
     assert config.wandb_entity is None
+    assert config.reasoner_max_length == 96
+    assert config.actor_max_length == 96
 
 
 def test_wandb_config_custom_values() -> None:
@@ -34,6 +86,8 @@ def test_wandb_config_custom_values() -> None:
                 "lambda_pref": 1.0,
                 "lambda_geom": 1.0,
                 "eps": 1e-8,
+                "reasoner_max_length": 48,
+                "actor_max_length": 24,
                 "wandb": {
                     "enabled": True,
                     "project": "my-project",
@@ -46,6 +100,8 @@ def test_wandb_config_custom_values() -> None:
     assert config.wandb_enabled is True
     assert config.wandb_project == "my-project"
     assert config.wandb_entity == "my-team"
+    assert config.reasoner_max_length == 48
+    assert config.actor_max_length == 24
 
 
 def test_wandb_config_missing_section_uses_defaults() -> None:
@@ -65,48 +121,64 @@ def test_wandb_config_missing_section_uses_defaults() -> None:
         }
     )
     config = CompressionTrainConfig.from_cfg(cfg)
-    # Without wandb section, from_cfg falls back to False
     assert config.wandb_enabled is False
     assert config.wandb_project == "lxp-stage2"
     assert config.wandb_entity is None
+    assert config.reasoner_max_length == 128
+    assert config.actor_max_length == 128
 
 
-def _make_tiny_models(hidden_dim: int = 32, vocab_size: int = 64):
-    """Build minimal nn.Module stand-ins for reasoner and actor."""
+def _make_tiny_models(hidden_dim: int = 32, vocab_size: int = 128):
     from torch import nn
 
     class TinyBackbone(nn.Module):
         def __init__(self):
             super().__init__()
             self.linear = nn.Linear(hidden_dim, hidden_dim)
+            self.embedding = nn.Embedding(vocab_size, hidden_dim)
 
-        def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, use_cache=False, return_dict=True):
+        def forward(
+            self,
+            input_ids=None,
+            inputs_embeds=None,
+            attention_mask=None,
+            use_cache=False,
+            return_dict=True,
+        ):
+            del attention_mask, use_cache, return_dict
             if inputs_embeds is not None:
-                h = self.linear(inputs_embeds)
+                hidden = self.linear(inputs_embeds)
             else:
-                h = self.linear(torch.randn(input_ids.shape[0], input_ids.shape[1], hidden_dim, device=input_ids.device))
-            return MagicMock(last_hidden_state=h)
+                hidden = self.linear(self.embedding(input_ids))
+            return MagicMock(last_hidden_state=hidden)
 
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.model = TinyBackbone()
             self.lm_head = nn.Linear(hidden_dim, vocab_size)
-            self._embed = nn.Embedding(vocab_size, hidden_dim)
+            self._embed = self.model.embedding
             self.dtype = torch.float32
 
-        def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, use_cache=False, return_dict=True):
+        def forward(
+            self,
+            input_ids=None,
+            inputs_embeds=None,
+            attention_mask=None,
+            use_cache=False,
+            return_dict=True,
+        ):
+            del attention_mask, use_cache, return_dict
             if inputs_embeds is not None:
-                h = self.model.linear(inputs_embeds)
+                hidden = self.model.linear(inputs_embeds)
             else:
-                h = self.model(input_ids=input_ids).last_hidden_state
-            logits = self.lm_head(h)
-            return MagicMock(logits=logits)
+                hidden = self.model(input_ids=input_ids).last_hidden_state
+            return MagicMock(logits=self.lm_head(hidden))
 
         def get_input_embeddings(self):
             return self._embed
 
-        def parameters(self, recurse=True):
+        def parameters(self, recurse: bool = True):
             return super().parameters(recurse=recurse)
 
         def eval(self):
@@ -115,23 +187,20 @@ def _make_tiny_models(hidden_dim: int = 32, vocab_size: int = 64):
     return TinyModel(), TinyModel()
 
 
-def _make_dataloader(batch_size: int = 2, seq_len: int = 8, vocab_size: int = 64, num_batches: int = 3):
-    input_ids = torch.randint(0, vocab_size, (batch_size * num_batches, seq_len))
-    attention_mask = torch.ones_like(input_ids)
-    labels = input_ids.clone()
-    ds = TensorDataset(input_ids, attention_mask, labels)
-    dl = DataLoader(ds, batch_size=batch_size)
-
-    def collate_iter():
-        for batch in dl:
-            yield {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[2]}
-
-    return collate_iter()
+def _make_text_dataloader(batch_size: int = 2, num_batches: int = 3):
+    texts = [f"sample question {index}" for index in range(batch_size * num_batches)]
+    return DataLoader(
+        texts,
+        batch_size=batch_size,
+        collate_fn=lambda batch: {"texts": list(batch)},
+    )
 
 
 @patch("train_compressor.wandb")
 def test_wandb_init_log_finish_called(mock_wandb) -> None:
     reasoner, actor = _make_tiny_models()
+    reasoner_tokenizer = _TinyTokenizer(offset=0)
+    actor_tokenizer = _TinyTokenizer(offset=17)
     config = CompressionTrainConfig(
         compressed_steps=4,
         learning_rate=1e-3,
@@ -140,10 +209,18 @@ def test_wandb_init_log_finish_called(mock_wandb) -> None:
         wandb_enabled=True,
         wandb_project="test-proj",
         wandb_entity="test-team",
+        reasoner_max_length=12,
+        actor_max_length=12,
     )
 
-    dl = _make_dataloader()
-    history = train_reasoner_stage2(reasoner, actor, dl, config)
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        _make_text_dataloader(),
+        config,
+        reasoner_tokenizer=reasoner_tokenizer,
+        actor_tokenizer=actor_tokenizer,
+    )
 
     mock_wandb.init.assert_called_once_with(
         project="test-proj",
@@ -162,6 +239,11 @@ def test_wandb_init_log_finish_called(mock_wandb) -> None:
         assert "pref_first_token_entropy" in logged
         assert "pref_first_token_weight" in logged
         assert "pref_first_token_kl" in logged
+        assert "pref_avg_top1_probability" in logged
+        assert "pref_first_token_top1_probability" in logged
+        assert "pref_avg_logit_margin" in logged
+        assert "pref_first_token_logit_margin" in logged
+        assert "pref_first_token_weight_ratio" in logged
         assert "step" in call_args[1]
     mock_wandb.finish.assert_called_once()
 
@@ -176,10 +258,18 @@ def test_wandb_step_values_are_sequential(mock_wandb) -> None:
         num_epochs=1,
         wandb_enabled=True,
         wandb_project="test-proj",
+        reasoner_max_length=12,
+        actor_max_length=12,
     )
 
-    dl = _make_dataloader(num_batches=4)
-    history = train_reasoner_stage2(reasoner, actor, dl, config)
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        _make_text_dataloader(num_batches=4),
+        config,
+        reasoner_tokenizer=_TinyTokenizer(offset=0),
+        actor_tokenizer=_TinyTokenizer(offset=5),
+    )
 
     steps = [call.kwargs["step"] for call in mock_wandb.log.call_args_list]
     assert steps == list(range(len(history)))
@@ -195,22 +285,23 @@ def test_wandb_logs_match_history(mock_wandb) -> None:
         num_epochs=1,
         wandb_enabled=True,
         wandb_project="test-proj",
+        reasoner_max_length=12,
+        actor_max_length=12,
     )
 
-    dl = _make_dataloader()
-    history = train_reasoner_stage2(reasoner, actor, dl, config)
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        _make_text_dataloader(),
+        config,
+        reasoner_tokenizer=_TinyTokenizer(offset=0),
+        actor_tokenizer=_TinyTokenizer(offset=9),
+    )
 
-    for i, call_args in enumerate(mock_wandb.log.call_args_list):
+    for index, call_args in enumerate(mock_wandb.log.call_args_list):
         logged = call_args[0][0]
-        assert logged["loss"] == history[i]["loss"]
-        assert logged["l_task"] == history[i]["l_task"]
-        assert logged["l_pref"] == history[i]["l_pref"]
-        assert logged["l_geom"] == history[i]["l_geom"]
-        assert logged["pref_avg_entropy"] == history[i]["pref_avg_entropy"]
-        assert logged["pref_avg_weight"] == history[i]["pref_avg_weight"]
-        assert logged["pref_first_token_entropy"] == history[i]["pref_first_token_entropy"]
-        assert logged["pref_first_token_weight"] == history[i]["pref_first_token_weight"]
-        assert logged["pref_first_token_kl"] == history[i]["pref_first_token_kl"]
+        for key, value in logged.items():
+            assert logged[key] == history[index][key]
 
 
 @patch("train_compressor.wandb")
@@ -222,18 +313,23 @@ def test_no_wandb_calls_when_disabled(mock_wandb) -> None:
         weight_decay=0.0,
         num_epochs=1,
         wandb_enabled=False,
+        reasoner_max_length=12,
+        actor_max_length=12,
     )
 
-    dl = _make_dataloader()
-    history = train_reasoner_stage2(reasoner, actor, dl, config)
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        _make_text_dataloader(),
+        config,
+        reasoner_tokenizer=_TinyTokenizer(offset=0),
+        actor_tokenizer=_TinyTokenizer(offset=11),
+    )
 
     mock_wandb.init.assert_not_called()
     mock_wandb.log.assert_not_called()
     mock_wandb.finish.assert_not_called()
     assert len(history) > 0
-
-
-# --- Checkpoint tests ---
 
 
 def test_checkpoint_config_parsed_from_yaml() -> None:
@@ -278,9 +374,17 @@ def test_epoch_checkpoint_saved(mock_wandb) -> None:
             checkpoint_enabled=True,
             checkpoint_dir=tmp,
             checkpoint_every_n_steps=0,
+            reasoner_max_length=12,
+            actor_max_length=12,
         )
-        dl = _make_dataloader()
-        train_reasoner_stage2(reasoner, actor, dl, config)
+        train_reasoner_stage2(
+            reasoner,
+            actor,
+            _make_text_dataloader(),
+            config,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=13),
+        )
 
         assert (Path(tmp) / "epoch_0.pt").exists()
         assert (Path(tmp) / "epoch_1.pt").exists()
@@ -302,14 +406,20 @@ def test_step_checkpoint_saved(mock_wandb) -> None:
             checkpoint_enabled=True,
             checkpoint_dir=tmp,
             checkpoint_every_n_steps=2,
+            reasoner_max_length=12,
+            actor_max_length=12,
         )
-        dl = _make_dataloader(num_batches=5)
-        train_reasoner_stage2(reasoner, actor, dl, config)
+        train_reasoner_stage2(
+            reasoner,
+            actor,
+            _make_text_dataloader(num_batches=5),
+            config,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=15),
+        )
 
-        # Steps 0, 2 should be saved (global_step 0, 2 match % 2 == 0)
         assert (Path(tmp) / "step_0.pt").exists()
         assert (Path(tmp) / "step_2.pt").exists()
-        # Epoch checkpoint always saved
         assert (Path(tmp) / "epoch_0.pt").exists()
 
 
@@ -326,9 +436,17 @@ def test_no_checkpoints_when_disabled(mock_wandb) -> None:
             wandb_enabled=False,
             checkpoint_enabled=False,
             checkpoint_dir=str(ckpt_dir),
+            reasoner_max_length=12,
+            actor_max_length=12,
         )
-        dl = _make_dataloader()
-        history = train_reasoner_stage2(reasoner, actor, dl, config)
+        history = train_reasoner_stage2(
+            reasoner,
+            actor,
+            _make_text_dataloader(),
+            config,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=21),
+        )
 
         assert not ckpt_dir.exists()
         assert len(history) > 0

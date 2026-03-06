@@ -3,17 +3,21 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import hydra
 import torch
-import wandb
 import torch.nn.functional as F
+import wandb
+from latent_pipeline import load_or_compute_global_alignment_state
 from omegaconf import DictConfig
 from torch import nn
 from transformers import AutoModelForCausalLM
 
 from src.models.losses import LatentCompressorLoss
+from src.utils.alignment import apply_orthogonal_mapping
+
+EvaluationFn = Callable[[AutoModelForCausalLM, AutoModelForCausalLM, dict[str, Any]], dict[str, float]]
 
 
 @dataclass
@@ -33,6 +37,8 @@ class CompressionTrainConfig:
     checkpoint_enabled: bool = True
     checkpoint_dir: str = "checkpoints"
     checkpoint_every_n_steps: int = 0
+    reasoner_max_length: int = 128
+    actor_max_length: int = 128
 
     @classmethod
     def from_cfg(cls, cfg: DictConfig) -> "CompressionTrainConfig":
@@ -54,6 +60,8 @@ class CompressionTrainConfig:
             checkpoint_enabled=bool(ckpt_cfg.enabled) if (ckpt_cfg := getattr(t, "checkpointing", None)) else True,
             checkpoint_dir=str(ckpt_cfg.dir) if ckpt_cfg else "checkpoints",
             checkpoint_every_n_steps=int(ckpt_cfg.save_every_n_steps) if ckpt_cfg else 0,
+            reasoner_max_length=int(getattr(t, "reasoner_max_length", 128)),
+            actor_max_length=int(getattr(t, "actor_max_length", 128)),
         )
 
 def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int) -> torch.Tensor:
@@ -73,6 +81,116 @@ def _model_device(model: nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def _model_backbone(model: AutoModelForCausalLM) -> nn.Module:
+    if hasattr(model, "model"):
+        return model.model
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model()
+    return model
+
+
+def _extract_text_batch(batch: dict[str, Any]) -> list[str]:
+    texts = batch.get("texts")
+    if texts is None:
+        raise ValueError("train_reasoner_stage2 expects batches with a 'texts' field")
+    if isinstance(texts, str):
+        return [texts]
+    return [str(text) for text in texts]
+
+
+def _ensure_padding_token(tokenizer: Any) -> None:
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+
+def _tokenize_text_batch(
+    tokenizer: Any,
+    texts: list[str],
+    *,
+    device: torch.device,
+    max_length: int,
+) -> dict[str, torch.Tensor]:
+    _ensure_padding_token(tokenizer)
+    encoded = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
+def _identity_alignment_mapping(
+    reasoner_model: AutoModelForCausalLM,
+    actor_model: AutoModelForCausalLM,
+) -> torch.Tensor:
+    reasoner_dim = int(reasoner_model.get_input_embeddings().weight.shape[-1])
+    actor_dim = int(actor_model.get_input_embeddings().weight.shape[-1])
+    if reasoner_dim != actor_dim:
+        raise ValueError(
+            "Global alignment configuration is required when reasoner and actor hidden sizes differ"
+        )
+    return torch.eye(reasoner_dim, dtype=torch.float32)
+
+
+def _supports_cached_alignment(model: AutoModelForCausalLM) -> bool:
+    return hasattr(model, "model") and hasattr(model.model, "layers")
+
+
+def resolve_training_alignment_context(
+    *,
+    reasoner_model: AutoModelForCausalLM,
+    actor_model: AutoModelForCausalLM,
+    reasoner_tokenizer: Any,
+    actor_tokenizer: Any,
+    alignment_cfg: Optional[DictConfig],
+) -> dict[str, Any]:
+    if (
+        alignment_cfg is not None
+        and reasoner_tokenizer is not None
+        and actor_tokenizer is not None
+        and _supports_cached_alignment(reasoner_model)
+        and _supports_cached_alignment(actor_model)
+    ):
+        alignment_state = load_or_compute_global_alignment_state(
+            alignment_cfg,
+            tokenizer_a=reasoner_tokenizer,
+            tokenizer_b=actor_tokenizer,
+            agent_a=reasoner_model,
+            agent_b=actor_model,
+        )
+        return {
+            "alignment_q": alignment_state["global_alignment_q"],
+            "alignment_mode": alignment_state["alignment_mode"],
+            "global_alignment_cache_key": alignment_state["global_alignment_cache_key"],
+            "global_alignment_cache_hit": bool(alignment_state["global_alignment_cache_hit"]),
+            "global_alignment_cache_path": str(alignment_state["global_alignment_cache_path"]),
+            "reasoning_layer_indices": tuple(alignment_state["global_reasoning_layer_indices"]),
+            "reasoning_layer_weights": tuple(alignment_state["global_reasoning_layer_weights"]),
+            "semantic_anchor_count": int(alignment_state["semantic_anchor_count"]),
+        }
+
+    return {
+        "alignment_q": _identity_alignment_mapping(reasoner_model, actor_model),
+        "alignment_mode": "identity_fallback",
+        "global_alignment_cache_key": None,
+        "global_alignment_cache_hit": False,
+        "global_alignment_cache_path": "",
+        "reasoning_layer_indices": (),
+        "reasoning_layer_weights": (),
+        "semantic_anchor_count": 0,
+    }
+
+
 def freeze_actor(actor_model: AutoModelForCausalLM) -> None:
     actor_model.eval()
     for parameter in actor_model.parameters():
@@ -82,16 +200,19 @@ def freeze_actor(actor_model: AutoModelForCausalLM) -> None:
 def train_reasoner_stage2(
     reasoner_model: AutoModelForCausalLM,
     actor_model: AutoModelForCausalLM,
-    train_dataloader: Iterable[dict[str, torch.Tensor]],
+    train_dataloader: Iterable[dict[str, Any]],
     config: CompressionTrainConfig,
+    *,
+    reasoner_tokenizer: Any,
+    actor_tokenizer: Any,
+    alignment_cfg: Optional[DictConfig] = None,
+    evaluation_fn: Optional[EvaluationFn] = None,
 ) -> list[dict[str, float]]:
     """
     Stage II Interlat-style training loop:
     - Freeze Actor (Agent B) completely.
     - Update only Reasoner (Agent A).
     """
-    from src.utils.alignment import compute_orthogonal_mapping, apply_orthogonal_mapping
-
     if config.wandb_enabled:
         wandb.init(
             project=config.wandb_project,
@@ -116,14 +237,19 @@ def train_reasoner_stage2(
 
     reasoner_device = _model_device(reasoner_model)
     actor_device = _model_device(actor_model)
-    
-    if hasattr(reasoner_model, "model"):
-        reasoner_backbone = reasoner_model.model
-    elif hasattr(reasoner_model, "get_base_model"):
-        reasoner_backbone = reasoner_model.get_base_model()
-    else:
-        reasoner_backbone = reasoner_model
-        
+    reasoner_backbone = _model_backbone(reasoner_model)
+    alignment_context = resolve_training_alignment_context(
+        reasoner_model=reasoner_model,
+        actor_model=actor_model,
+        reasoner_tokenizer=reasoner_tokenizer,
+        actor_tokenizer=actor_tokenizer,
+        alignment_cfg=alignment_cfg,
+    )
+    procrustes_q = alignment_context["alignment_q"].to(
+        device=reasoner_device,
+        dtype=reasoner_model.get_input_embeddings().weight.dtype,
+    )
+
     history: list[dict[str, float]] = []
     global_step = 0
 
@@ -131,25 +257,24 @@ def train_reasoner_stage2(
         ckpt_dir = Path(config.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-compute alignment mapping using the first batch as anchors
-    print("Computing initial Procrustes alignment...")
-    first_batch = next(iter(train_dataloader))
-    with torch.no_grad():
-        fb_input_ids = first_batch["input_ids"].to(reasoner_device)
-        fb_reasoner_out = reasoner_backbone(input_ids=fb_input_ids, use_cache=False, return_dict=True)
-        fb_reasoner_hidden = fb_reasoner_out.last_hidden_state
-        
-        fb_actor_out = actor_model.model(input_ids=fb_input_ids.to(actor_device), use_cache=False, return_dict=True)
-        fb_actor_hidden = fb_actor_out.last_hidden_state
-        
-        procrustes_q = compute_orthogonal_mapping(fb_reasoner_hidden, fb_actor_hidden)
-        procrustes_q = procrustes_q.to(device=reasoner_device, dtype=reasoner_model.dtype)
-
     for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
-            input_ids = batch["input_ids"].to(reasoner_device)
-            attention_mask = batch["attention_mask"].to(reasoner_device)
-            labels = batch.get("labels", input_ids).to(reasoner_device)
+            texts = _extract_text_batch(batch)
+            reasoner_batch = _tokenize_text_batch(
+                reasoner_tokenizer,
+                texts,
+                device=reasoner_device,
+                max_length=config.reasoner_max_length,
+            )
+            actor_batch = _tokenize_text_batch(
+                actor_tokenizer,
+                texts,
+                device=reasoner_device,
+                max_length=config.actor_max_length,
+            )
+            input_ids = reasoner_batch["input_ids"]
+            attention_mask = reasoner_batch["attention_mask"]
+            actor_labels = actor_batch["labels"]
 
             reasoner_hidden_outputs = reasoner_backbone(
                 input_ids=input_ids,
@@ -205,7 +330,7 @@ def train_reasoner_stage2(
                 actor_logits_full=actor_logits_full.to(reasoner_device),
                 full_latents=full_latents,
                 compressed_latents=compressed_latents,
-                labels=labels,
+                actor_labels=actor_labels,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -231,6 +356,21 @@ def train_reasoner_stage2(
                 "pref_first_token_kl": float(
                     loss_outputs["pref_first_token_kl"].detach().cpu().item()
                 ),
+                "pref_avg_top1_probability": float(
+                    loss_outputs["pref_avg_top1_probability"].detach().cpu().item()
+                ),
+                "pref_first_token_top1_probability": float(
+                    loss_outputs["pref_first_token_top1_probability"].detach().cpu().item()
+                ),
+                "pref_avg_logit_margin": float(
+                    loss_outputs["pref_avg_logit_margin"].detach().cpu().item()
+                ),
+                "pref_first_token_logit_margin": float(
+                    loss_outputs["pref_first_token_logit_margin"].detach().cpu().item()
+                ),
+                "pref_first_token_weight_ratio": float(
+                    loss_outputs["pref_first_token_weight_ratio"].detach().cpu().item()
+                ),
             }
             history.append(metrics)
 
@@ -246,6 +386,11 @@ def train_reasoner_stage2(
                         "pref_first_token_entropy": metrics["pref_first_token_entropy"],
                         "pref_first_token_weight": metrics["pref_first_token_weight"],
                         "pref_first_token_kl": metrics["pref_first_token_kl"],
+                        "pref_avg_top1_probability": metrics["pref_avg_top1_probability"],
+                        "pref_first_token_top1_probability": metrics["pref_first_token_top1_probability"],
+                        "pref_avg_logit_margin": metrics["pref_avg_logit_margin"],
+                        "pref_first_token_logit_margin": metrics["pref_first_token_logit_margin"],
+                        "pref_first_token_weight_ratio": metrics["pref_first_token_weight_ratio"],
                     },
                     step=global_step,
                 )
@@ -256,6 +401,20 @@ def train_reasoner_stage2(
                     print(f"Saved checkpoint: {step_path}")
 
             global_step += 1
+
+        if evaluation_fn is not None:
+            evaluation_metrics = {
+                key: float(value)
+                for key, value in evaluation_fn(reasoner_model, actor_model, alignment_context).items()
+            }
+            eval_history_entry = {
+                "epoch": float(epoch),
+                "step": float(global_step),
+                **evaluation_metrics,
+            }
+            history.append(eval_history_entry)
+            if config.wandb_enabled:
+                wandb.log(evaluation_metrics, step=global_step)
 
         if config.checkpoint_enabled:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"
@@ -287,9 +446,11 @@ def main(cfg: DictConfig) -> None:
     print(f"  checkpoint_enabled = {config.checkpoint_enabled}")
     print(f"  checkpoint_dir     = {config.checkpoint_dir}")
     print(f"  checkpoint_every_n_steps = {config.checkpoint_every_n_steps}")
+    print(f"  reasoner_max_length = {config.reasoner_max_length}")
+    print(f"  actor_max_length    = {config.actor_max_length}")
     print(
         "\nTo run training, call train_reasoner_stage2(...) with "
-        "initialized reasoner/actor models and a dataloader."
+        "initialized reasoner/actor models, tokenizers, and a text-first dataloader."
     )
 
 

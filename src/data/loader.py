@@ -15,11 +15,11 @@ def pick_field(row: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def load_math_level5(limit: int = 100):
+def load_math_level5(limit: int = 100, split: str = "test"):
     """Load MATH Level 5 problems from Hugging Face."""
     dataset_candidates = [
-        ("hendrycks/competition_math", "test"),
-        ("competition_math", "test"),
+        ("hendrycks/competition_math", split),
+        ("competition_math", split),
     ]
     last_error: Optional[Exception] = None
 
@@ -37,11 +37,11 @@ def load_math_level5(limit: int = 100):
     raise RuntimeError("Failed to load a MATH dataset candidate") from last_error
 
 
-def load_gsm8k(limit: int = 100):
+def load_gsm8k(limit: int = 100, split: str = "test"):
     """Load GSM8K problems from Hugging Face."""
     dataset_candidates = [
-        ("openai/gsm8k", "main", "test"),
-        ("gsm8k", "main", "test"),
+        ("openai/gsm8k", "main", split),
+        ("gsm8k", "main", split),
     ]
     last_error: Optional[Exception] = None
 
@@ -60,6 +60,19 @@ _LOADERS = {
     "math": load_math_level5,
     "gsm8k": load_gsm8k,
 }
+
+
+def get_dataset_split(dataset_name: str, split: str, limit: int = 100):
+    """Load a benchmark dataset split by name."""
+    dataset_name = dataset_name.lower()
+    if dataset_name == "math":
+        return load_math_level5(limit=limit, split=split)
+    if dataset_name == "gsm8k":
+        return load_gsm8k(limit=limit, split=split)
+    raise ValueError(
+        f"Unknown dataset {dataset_name!r}. "
+        f"Supported: {', '.join(sorted(_LOADERS))}"
+    )
 
 
 def get_dataloader(dataset_name: str, limit: int = 100):

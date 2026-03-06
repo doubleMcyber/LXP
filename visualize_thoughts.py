@@ -10,9 +10,10 @@ from typing import Sequence
 import torch
 from omegaconf import OmegaConf
 
-from latent_pipeline import extract_reasoning_trace, initialize_hybrid_pipeline
+from latent_pipeline import extract_reasoning_trace, initialize_hybrid_pipeline, run_hybrid_pipeline
 
 DEFAULT_OUTPUT = Path("thought_trajectories.png")
+DEFAULT_VIEW = "actor_aligned"
 DEFAULT_CORRECT_PROMPT = (
     "A student solves 12 * 7 and correctly concludes the answer is 84. "
     "Explain the reasoning."
@@ -24,6 +25,7 @@ DEFAULT_INCORRECT_PROMPT = (
 _CORRECT_COLOR = (32, 158, 119)
 _INCORRECT_COLOR = (214, 57, 30)
 _HANDOFF_COLOR = (240, 196, 25)
+_REFERENCE_COLOR = (68, 110, 179)
 _BACKGROUND_COLOR = (247, 245, 240)
 _AXIS_COLOR = (190, 186, 178)
 
@@ -36,6 +38,18 @@ def _trajectory_points(trace: torch.Tensor) -> torch.Tensor:
     if trace.dim() != 4:
         raise ValueError("Expected continuous trajectory shape [steps, batch, seq, hidden]")
     return trace[:, 0, 0, :].to(torch.float32)
+
+
+def _trajectory_for_view(trace: dict[str, torch.Tensor], view: str) -> torch.Tensor:
+    if view == "reasoner_raw":
+        return _trajectory_points(trace["continuous_trajectory"])
+    if view == "actor_aligned":
+        return _trajectory_points(trace["aligned_continuous_trajectory"])
+    raise ValueError(f"Unsupported view {view!r}. Expected 'reasoner_raw' or 'actor_aligned'.")
+
+
+def _single_point(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to(torch.float32).reshape(1, -1)
 
 
 def _project_with_pca(trajectories: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -152,12 +166,19 @@ def _plot_trajectories(
     *,
     projected_correct: torch.Tensor,
     projected_incorrect: torch.Tensor,
+    projected_correct_reference: torch.Tensor | None,
+    projected_incorrect_reference: torch.Tensor | None,
     output_path: Path,
     width: int = 1200,
     height: int = 800,
     margin: int = 80,
 ) -> dict[str, float]:
-    all_points = torch.cat([projected_correct, projected_incorrect], dim=0)
+    all_series = [projected_correct, projected_incorrect]
+    if projected_correct_reference is not None:
+        all_series.append(projected_correct_reference)
+    if projected_incorrect_reference is not None:
+        all_series.append(projected_incorrect_reference)
+    all_points = torch.cat(all_series, dim=0)
     min_x = float(all_points[:, 0].min().item())
     max_x = float(all_points[:, 0].max().item())
     min_y = float(all_points[:, 1].min().item())
@@ -205,8 +226,17 @@ def _plot_trajectories(
         _draw_circle(pixels, width, height, handoff_x, handoff_y, 9, _HANDOFF_COLOR)
         _draw_circle(pixels, width, height, handoff_x, handoff_y, 5, color)
 
+    def draw_reference(point: torch.Tensor | None) -> None:
+        if point is None:
+            return
+        reference_x, reference_y = to_pixel(point[0])
+        _draw_circle(pixels, width, height, reference_x, reference_y, 7, _REFERENCE_COLOR)
+        _draw_circle(pixels, width, height, reference_x, reference_y, 3, _BACKGROUND_COLOR)
+
     draw_path(projected_correct, _CORRECT_COLOR)
     draw_path(projected_incorrect, _INCORRECT_COLOR)
+    draw_reference(projected_correct_reference)
+    draw_reference(projected_incorrect_reference)
     _write_png(output_path, width, height, pixels)
 
     return {
@@ -231,35 +261,82 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--correct-prompt", default=DEFAULT_CORRECT_PROMPT)
     parser.add_argument("--incorrect-prompt", default=DEFAULT_INCORRECT_PROMPT)
+    parser.add_argument(
+        "--view",
+        choices=("reasoner_raw", "actor_aligned"),
+        default=DEFAULT_VIEW,
+        help="Whether to project the raw reasoner trajectory or the actor-aligned trajectory.",
+    )
     args = parser.parse_args()
 
     cfg = _load_cfg()
     initialize_hybrid_pipeline(cfg)
+    metrics_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    metrics_cfg.max_new_tokens = 0
 
     correct_trace = extract_reasoning_trace(cfg, prompt=args.correct_prompt)
     incorrect_trace = extract_reasoning_trace(cfg, prompt=args.incorrect_prompt)
-
-    projected_correct, projected_incorrect = _project_with_pca(
-        [
-            _trajectory_points(correct_trace["continuous_trajectory"]),
-            _trajectory_points(incorrect_trace["continuous_trajectory"]),
-        ]
+    correct_metrics = run_hybrid_pipeline(
+        metrics_cfg,
+        prompt=args.correct_prompt,
+        collect_alignment_metrics=True,
     )
+    incorrect_metrics = run_hybrid_pipeline(
+        metrics_cfg,
+        prompt=args.incorrect_prompt,
+        collect_alignment_metrics=True,
+    )
+
+    projection_inputs = [
+        _trajectory_for_view(correct_trace, args.view),
+        _trajectory_for_view(incorrect_trace, args.view),
+    ]
+    include_reference_markers = args.view == "actor_aligned"
+    if include_reference_markers and correct_metrics["receiver_reference_handoff"] is not None:
+        projection_inputs.append(_single_point(correct_metrics["receiver_reference_handoff"]))
+    if include_reference_markers and incorrect_metrics["receiver_reference_handoff"] is not None:
+        projection_inputs.append(_single_point(incorrect_metrics["receiver_reference_handoff"]))
+
+    projected_series = _project_with_pca(projection_inputs)
+    projected_correct, projected_incorrect = projected_series[:2]
+    next_projection_index = 2
+    projected_correct_reference = None
+    projected_incorrect_reference = None
+    if include_reference_markers and correct_metrics["receiver_reference_handoff"] is not None:
+        projected_correct_reference = projected_series[next_projection_index]
+        next_projection_index += 1
+    if include_reference_markers and incorrect_metrics["receiver_reference_handoff"] is not None:
+        projected_incorrect_reference = projected_series[next_projection_index]
     stats = _plot_trajectories(
         projected_correct=projected_correct,
         projected_incorrect=projected_incorrect,
+        projected_correct_reference=projected_correct_reference,
+        projected_incorrect_reference=projected_incorrect_reference,
         output_path=args.output,
     )
 
     print(f"Wrote trajectory plot to {args.output}")
+    print(f"Visualization view: {args.view}")
     print("Correct trajectory color: green")
     print("Incorrect trajectory color: red")
     print("Handoff point highlight: gold")
+    if include_reference_markers:
+        print("Receiver reference marker: blue")
     print(f"Correct latent steps: {correct_trace['latent_trajectory_steps']}")
     print(f"Incorrect latent steps: {incorrect_trace['latent_trajectory_steps']}")
     print(f"Handoff distance in 2D PCA space: {stats['handoff_distance_2d']:.4f}")
     print(f"Correct path extent in 2D PCA space: {stats['correct_path_extent']:.4f}")
     print(f"Incorrect path extent in 2D PCA space: {stats['incorrect_path_extent']:.4f}")
+    print(
+        "Correct post-alignment actor-space distances: "
+        f"L2={correct_metrics['post_alignment_l2_distance']:.4f}, "
+        f"cosine={correct_metrics['post_alignment_cosine_distance']:.4f}"
+    )
+    print(
+        "Incorrect post-alignment actor-space distances: "
+        f"L2={incorrect_metrics['post_alignment_l2_distance']:.4f}, "
+        f"cosine={incorrect_metrics['post_alignment_cosine_distance']:.4f}"
+    )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,11 @@ simulated_continuous_steps: 50
 device_map: "auto"
 torch_dtype: "bfloat16"
 
+alignment:
+  semantic_anchor_count: 250
+  cache_dir: ".cache/alignment"
+  reasoning_layer_weights: [0.2, 0.3, 0.5]
+
 dynamics:
   complexity_thresholds:
     default: 1.0
@@ -28,10 +33,23 @@ training:
   weight_decay: 0.01
   max_grad_norm: 1.0
   num_epochs: 1
+  reasoner_max_length: 96
+  actor_max_length: 96
   lambda_task: 1.0
   lambda_pref: 1.0
   lambda_geom: 1.0
   eps: 1.0e-8
+  data:
+    mode: smoke
+    batch_size: 2
+    smoke_num_samples: 16
+    dataset_name: gsm8k
+    train_limit: 32
+    eval_limit: 16
+  evaluation:
+    max_new_tokens: 16
+    baseline_accuracy_percentage: null
+    seed_count: 1
   checkpointing:
     enabled: true
     dir: "checkpoints"
@@ -40,3 +58,19 @@ training:
     enabled: true
     project: "lxp-stage2"
     entity: null
+
+reporting:
+  training:
+    history_output: "training_history.csv"
+    report_output: "training_report.json"
+  phase_gates:
+    phase1:
+      required_repetitions: 3
+      max_error_rate_percentage: 0.0
+      min_cache_transfer_rate_percentage: 100.0
+      min_non_empty_decoded_rate_percentage: 100.0
+    phase2:
+      min_accuracy_retention_ratio: 0.85
+      required_seed_count: 3
+    phase3:
+      require_q_global_beats_prompt_local: true

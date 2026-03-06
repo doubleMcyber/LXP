@@ -35,3 +35,6 @@ def test_uncertainty_weighting_emphasizes_low_entropy_teacher_tokens() -> None:
     assert torch.allclose(l_pref, expected_l_pref, atol=1e-6)
     assert diagnostics["pref_first_token_entropy"] < diagnostics["pref_avg_entropy"]
     assert diagnostics["pref_first_token_weight"] > diagnostics["pref_avg_weight"]
+    assert diagnostics["pref_first_token_top1_probability"] > diagnostics["pref_avg_top1_probability"]
+    assert diagnostics["pref_first_token_logit_margin"] > diagnostics["pref_avg_logit_margin"]
+    assert diagnostics["pref_first_token_weight_ratio"] > 1.0

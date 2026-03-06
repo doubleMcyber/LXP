@@ -47,13 +47,27 @@ class LatentCompressorLoss(nn.Module):
         token_weights = 1.0 / (actor_entropy + self.eps)
         weighted_kl = token_weights * kl_per_token
         l_pref = weighted_kl.sum() / token_weights.sum().clamp_min(self.eps)
+        top_teacher_probs = teacher_probs.max(dim=-1).values
+        top_teacher_logits = torch.topk(teacher_logits, k=min(2, teacher_logits.size(-1)), dim=-1).values
+        if top_teacher_logits.size(-1) == 1:
+            teacher_margin = torch.zeros_like(top_teacher_logits[..., 0])
+        else:
+            teacher_margin = top_teacher_logits[..., 0] - top_teacher_logits[..., 1]
+
+        pref_avg_weight = token_weights.mean()
+        pref_first_token_weight = token_weights[:, 0].mean()
 
         diagnostics = {
             "pref_avg_entropy": actor_entropy.mean(),
-            "pref_avg_weight": token_weights.mean(),
+            "pref_avg_weight": pref_avg_weight,
             "pref_first_token_entropy": actor_entropy[:, 0].mean(),
-            "pref_first_token_weight": token_weights[:, 0].mean(),
+            "pref_first_token_weight": pref_first_token_weight,
             "pref_first_token_kl": kl_per_token[:, 0].mean(),
+            "pref_avg_top1_probability": top_teacher_probs.mean(),
+            "pref_first_token_top1_probability": top_teacher_probs[:, 0].mean(),
+            "pref_avg_logit_margin": teacher_margin.mean(),
+            "pref_first_token_logit_margin": teacher_margin[:, 0].mean(),
+            "pref_first_token_weight_ratio": pref_first_token_weight / pref_avg_weight.clamp_min(self.eps),
         }
         return l_pref, diagnostics
 
@@ -63,12 +77,12 @@ class LatentCompressorLoss(nn.Module):
         actor_logits_full: torch.Tensor,
         full_latents: torch.Tensor,
         compressed_latents: torch.Tensor,
-        labels: torch.LongTensor,
+        actor_labels: torch.LongTensor,
     ) -> dict[str, torch.Tensor]:
         vocab_size = actor_logits_compressed.size(-1)
         compressed_steps = actor_logits_compressed.size(1)
 
-        sampled_labels = _sample_steps(labels, compressed_steps)
+        sampled_labels = _sample_steps(actor_labels, compressed_steps)
         l_task = F.cross_entropy(
             actor_logits_compressed.reshape(-1, vocab_size),
             sampled_labels.reshape(-1),

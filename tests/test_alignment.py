@@ -3,8 +3,10 @@ from __future__ import annotations
 import torch
 
 from src.utils.alignment import (
+    apply_linear_mapping,
     compute_cross_covariance,
     compute_orthogonal_mapping,
+    compute_ridge_mapping,
     get_preferred_semantic_anchors,
     resolve_shared_semantic_anchor_ids,
 )
@@ -39,6 +41,41 @@ def test_mean_cross_covariance_alignment_increases_rank_with_multiple_layers() -
     assert torch.linalg.matrix_rank(single_layer_covariance).item() == 1
     assert torch.linalg.matrix_rank(multi_layer_covariance).item() == 2
     assert torch.allclose(mapping.transpose(0, 1) @ mapping, torch.eye(2), atol=1e-6)
+
+
+def test_compute_cross_covariance_uniform_layer_weights_matches_default() -> None:
+    sender_layers = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+        torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
+    ]
+    receiver_layers = [
+        torch.tensor([[[2.0, 1.0], [4.0, 3.0]]]),
+        torch.tensor([[[6.0, 5.0], [8.0, 7.0]]]),
+    ]
+
+    default_covariance = compute_cross_covariance(sender_layers, receiver_layers)
+    weighted_covariance = compute_cross_covariance(
+        sender_layers,
+        receiver_layers,
+        layer_weights=[0.5, 0.5],
+    )
+
+    assert torch.allclose(default_covariance, weighted_covariance)
+
+
+def test_compute_ridge_mapping_matches_identity_for_identical_anchor_spaces() -> None:
+    source = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    mapping = compute_ridge_mapping(source, source, regularization=1e-6)
+    transformed = apply_linear_mapping(source, mapping)
+
+    assert mapping.shape == (2, 2)
+    assert torch.allclose(transformed, source, atol=1e-4)
 
 
 class _FakeTokenizer:
@@ -80,3 +117,21 @@ def test_resolve_shared_semantic_anchor_ids_prefers_curated_anchor_list() -> Non
     assert anchor_strings == tuple(preferred)
     assert anchor_ids_a.shape == (100,)
     assert anchor_ids_b.shape == (100,)
+
+
+def test_resolve_shared_semantic_anchor_ids_scales_beyond_curated_seed_bank() -> None:
+    preferred = list(get_preferred_semantic_anchors())
+    extras = [f"tok{index:03d}" for index in range(600)]
+    tokenizer_a = _FakeTokenizer(preferred + extras)
+    tokenizer_b = _FakeTokenizer(preferred + extras)
+
+    anchor_strings, anchor_ids_a, anchor_ids_b = resolve_shared_semantic_anchor_ids(
+        tokenizer_a,
+        tokenizer_b,
+        anchor_count=500,
+    )
+
+    assert len(anchor_strings) == 500
+    assert anchor_strings[:100] == tuple(preferred)
+    assert anchor_ids_a.shape == (500,)
+    assert anchor_ids_b.shape == (500,)
