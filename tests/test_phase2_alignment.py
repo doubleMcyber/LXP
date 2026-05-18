@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
 from analyze_distance_accuracy import _assign_distance_deciles, _breaking_point_decile
 from latent_pipeline import (
     _aggregate_hidden_layers,
+    _alignment_diagnostic_target,
+    _alignment_handoff_target,
     _build_alignment_cache_key,
     _resolve_reasoning_layer_indices_from_counts,
     _resolve_reasoning_layer_weights,
@@ -16,9 +19,20 @@ def _make_cfg():
     return OmegaConf.create(
         {
             "alignment": {
+                "strategy": "hybrid_affine",
                 "semantic_anchor_count": 250,
                 "cache_dir": ".cache/alignment",
                 "reasoning_layer_weights": [0.2, 0.3, 0.5],
+                "center_anchors": True,
+                "use_bias": True,
+                "residual_lambda": 1.0e-3,
+                "residual_alpha": 1.0,
+                "residual_max_norm_ratio": 0.25,
+                "adaptive_projection": {
+                    "enabled": True,
+                    "strength": 0.15,
+                    "clip_std_multiplier": 4.0,
+                },
             }
         }
     )
@@ -59,6 +73,17 @@ def test_build_alignment_cache_key_changes_with_anchor_count_and_layer_weights()
         semantic_anchor_count=100,
         reasoning_layer_indices=(12, 16, 20),
         reasoning_layer_weights=(0.2, 0.3, 0.5),
+        alignment_strategy="hybrid_affine",
+        center_anchors=True,
+        use_bias=True,
+        residual_lambda=1.0e-3,
+        residual_alpha=1.0,
+        residual_max_norm_ratio=0.25,
+        adaptive_projection_enabled=True,
+        adaptive_projection_strength=0.15,
+        adaptive_projection_clip_std_multiplier=4.0,
+        handoff_target="input_embedding",
+        diagnostic_target="hidden_consensus",
     )
     second_key = _build_alignment_cache_key(
         agent_a_model="a",
@@ -67,6 +92,17 @@ def test_build_alignment_cache_key_changes_with_anchor_count_and_layer_weights()
         semantic_anchor_count=250,
         reasoning_layer_indices=(12, 16, 20),
         reasoning_layer_weights=(0.2, 0.3, 0.5),
+        alignment_strategy="hybrid_affine",
+        center_anchors=True,
+        use_bias=True,
+        residual_lambda=1.0e-3,
+        residual_alpha=1.0,
+        residual_max_norm_ratio=0.25,
+        adaptive_projection_enabled=True,
+        adaptive_projection_strength=0.15,
+        adaptive_projection_clip_std_multiplier=4.0,
+        handoff_target="input_embedding",
+        diagnostic_target="hidden_consensus",
     )
     third_key = _build_alignment_cache_key(
         agent_a_model="a",
@@ -75,10 +111,37 @@ def test_build_alignment_cache_key_changes_with_anchor_count_and_layer_weights()
         semantic_anchor_count=250,
         reasoning_layer_indices=(12, 16, 20),
         reasoning_layer_weights=(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+        alignment_strategy="hybrid_affine",
+        center_anchors=True,
+        use_bias=True,
+        residual_lambda=1.0e-3,
+        residual_alpha=1.0,
+        residual_max_norm_ratio=0.25,
+        adaptive_projection_enabled=True,
+        adaptive_projection_strength=0.15,
+        adaptive_projection_clip_std_multiplier=4.0,
+        handoff_target="input_embedding",
+        diagnostic_target="hidden_consensus",
     )
 
     assert first_key != second_key
     assert second_key != third_key
+
+
+def test_alignment_surface_config_rejects_unsupported_targets() -> None:
+    cfg = OmegaConf.create(
+        {
+            "alignment": {
+                "handoff_target": "hidden_consensus",
+                "diagnostic_target": "input_embedding",
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="alignment.handoff_target"):
+        _alignment_handoff_target(cfg)
+    with pytest.raises(ValueError, match="alignment.diagnostic_target"):
+        _alignment_diagnostic_target(cfg)
 
 
 def test_distance_decile_breaking_point_tracks_accuracy_drop() -> None:

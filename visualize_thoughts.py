@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 
 from latent_pipeline import extract_reasoning_trace, initialize_hybrid_pipeline, run_hybrid_pipeline
 
-DEFAULT_OUTPUT = Path("thought_trajectories.png")
+DEFAULT_OUTPUT = Path("outputs/thought_trajectories.png")
 DEFAULT_VIEW = "actor_aligned"
 DEFAULT_CORRECT_PROMPT = (
     "A student solves 12 * 7 and correctly concludes the answer is 84. "
@@ -307,6 +307,7 @@ def main() -> None:
         next_projection_index += 1
     if include_reference_markers and incorrect_metrics["receiver_reference_handoff"] is not None:
         projected_incorrect_reference = projected_series[next_projection_index]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     stats = _plot_trajectories(
         projected_correct=projected_correct,
         projected_incorrect=projected_incorrect,

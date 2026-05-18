@@ -1,3 +1,4 @@
+seed: 0
 agent_a_model: "Qwen/Qwen3.5-0.8B"
 agent_b_model: "LGAI-EXAONE/EXAONE-4.0-1.2B"
 default_prompt: "Explain the concept of entropy"
@@ -7,12 +8,46 @@ simulated_continuous_steps: 50
 device_map: "auto"
 torch_dtype: "bfloat16"
 
+datasets:
+  gsm8k:
+    validation_size: 256
+  math:
+    validation_size: 128
+
+benchmark:
+  text_hybrid_reasoning_max_new_tokens: 64
+  latent_steps_sweep: [1, 2, 4, 8, 16, 32, 64]
+  q_generalization:
+    heldout_anchor_ratio: 0.2
+    bootstrap_count: 5
+
 alignment:
+  strategy: "hybrid_affine"
+  handoff_target: "input_embedding"
+  diagnostic_target: "hidden_consensus"
   semantic_anchor_count: 250
   cache_dir: ".cache/alignment"
   reasoning_layer_weights: [0.2, 0.3, 0.5]
+  center_anchors: true
+  use_bias: true
+  residual_lambda: 1.0e-3
+  residual_alpha: 1.0
+  residual_max_norm_ratio: 0.25
+  anchor_selection_pool_size: 500
+  anchor_stability_bootstrap_count: 3
+  anchor_stability_bootstrap_ratio: 0.8
+  anchor_stability_bootstrap_weight: 0.5
+  adaptive_projection:
+    enabled: true
+    strength: 0.15
+    clip_std_multiplier: 4.0
+  prompt_calibration:
+    enabled: true
+    strength: 0.2
+    max_norm_ratio: 0.15
 
 dynamics:
+  mode: "identity"
   complexity_thresholds:
     default: 1.0
     short: 0.75
@@ -38,7 +73,27 @@ training:
   lambda_task: 1.0
   lambda_pref: 1.0
   lambda_geom: 1.0
+  lambda_plan: 0.25
+  lambda_contrast: 0.1
+  contrast_temperature: 0.1
   eps: 1.0e-8
+  curriculum:
+    enabled: true
+    stages: ["identity", "orthogonal", "hybrid_affine"]
+    boundaries: [0.33, 0.66, 1.0]
+  adaptive_loss:
+    enabled: true
+    ema_beta: 0.9
+    min_weight: 0.25
+    max_weight: 4.0
+  adaptive_projection:
+    enabled: true
+    strength: 0.15
+    clip_std_multiplier: 4.0
+  hidden_state_processor:
+    enabled: false
+    num_heads: 4
+    dropout: 0.0
   data:
     mode: smoke
     batch_size: 2
@@ -46,6 +101,7 @@ training:
     dataset_name: gsm8k
     train_limit: 32
     eval_limit: 16
+    eval_split: validation
   evaluation:
     max_new_tokens: 16
     baseline_accuracy_percentage: null
@@ -55,14 +111,20 @@ training:
     dir: "checkpoints"
     save_every_n_steps: 0
   wandb:
-    enabled: true
+    enabled: false
     project: "lxp-stage2"
     entity: null
 
 reporting:
   training:
-    history_output: "training_history.csv"
-    report_output: "training_report.json"
+    history_output: "outputs/training_history.csv"
+    report_output: "outputs/training_report.json"
+  runtime_smoke:
+    enabled: true
+    max_samples: 1
+    max_repetitions: 1
+    max_error_count: 0
+    require_explicit_statuses: true
   phase_gates:
     phase1:
       required_repetitions: 3
@@ -74,3 +136,6 @@ reporting:
       required_seed_count: 3
     phase3:
       require_q_global_beats_prompt_local: true
+      min_hybrid_accuracy_gain_over_text_text: 3.0
+      max_accuracy_gap_for_perplexity_tie: 1.0
+      min_perplexity_improvement_ratio: 0.10

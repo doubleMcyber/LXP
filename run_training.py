@@ -12,8 +12,14 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from src.data.loader import get_dataset_split, pick_field
-from src.utils.alignment import apply_orthogonal_mapping
+from src.utils.alignment import apply_alignment
 from src.utils.benchmarking import build_training_phase2_report, write_json
+from src.utils.lm_eval import (
+    build_position_ids,
+    compute_answer_metrics_from_prefix,
+    greedy_decode_from_prefix,
+    prepare_latent_prefix_state,
+)
 from src.utils.metrics import extract_boxed_text, normalize_answer
 from train_compressor import (
     CompressionTrainConfig,
@@ -59,14 +65,17 @@ def _phase2_gate_cfg(cfg: Any) -> Any:
     return getattr(getattr(getattr(cfg, "reporting", None), "phase_gates", None), "phase2", None)
 
 
+def _dataset_validation_size(cfg: Any, dataset_name: str) -> int | None:
+    dataset_cfg = getattr(getattr(cfg, "datasets", None), dataset_name, None)
+    if dataset_cfg is None:
+        return None
+    raw_value = getattr(dataset_cfg, "validation_size", None)
+    return None if raw_value is None else int(raw_value)
+
+
 def _ensure_padding_token(tokenizer: Any) -> None:
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
-
-
-def _build_position_ids(attention_mask: torch.Tensor) -> torch.LongTensor:
-    position_ids = attention_mask.long().cumsum(dim=-1) - 1
-    return position_ids.clamp_min_(0)
 
 
 def _model_backbone(model: AutoModelForCausalLM) -> Any:
@@ -155,8 +164,18 @@ def _answers_match(dataset_name: str, predicted_answer: str | None, target_answe
     return normalize_answer(predicted_answer) == normalize_answer(target_answer)
 
 
-def _build_real_examples(dataset_name: str, split: str, limit: int) -> list[dict[str, str | None]]:
-    rows = get_dataset_split(dataset_name, split, limit=limit)
+def _build_real_examples(
+    cfg: Any,
+    dataset_name: str,
+    split: str,
+    limit: int,
+) -> list[dict[str, str | None]]:
+    rows = get_dataset_split(
+        dataset_name,
+        split,
+        limit=limit,
+        validation_size=_dataset_validation_size(cfg, dataset_name),
+    )
     examples: list[dict[str, str | None]] = []
     for row in rows:
         prompt = pick_field(row, ("question", "problem"))
@@ -189,8 +208,9 @@ def _build_training_payloads(cfg: Any) -> tuple[DataLoader, list[dict[str, str |
         dataset_name = str(getattr(data_cfg, "dataset_name", "gsm8k")).lower()
         train_limit = int(getattr(data_cfg, "train_limit", 32))
         eval_limit = int(getattr(data_cfg, "eval_limit", 16))
-        train_examples = _build_real_examples(dataset_name, "train", train_limit)
-        eval_examples = _build_real_examples(dataset_name, "test", eval_limit)
+        eval_split = str(getattr(data_cfg, "eval_split", "validation")).lower()
+        train_examples = _build_real_examples(cfg, dataset_name, "train", train_limit)
+        eval_examples = _build_real_examples(cfg, dataset_name, eval_split, eval_limit)
         train_loader = _build_text_dataloader(
             [str(example["supervision_text"]) for example in train_examples],
             batch_size=batch_size,
@@ -233,7 +253,7 @@ def _decode_actor_response(
         dtype=torch.long,
         device=actor_device,
     )
-    position_ids = _build_position_ids(attention_mask)
+    position_ids = build_position_ids(attention_mask)
     generated_token_ids: list[int] = []
     eos_token_id = getattr(actor_tokenizer, "eos_token_id", None)
 
@@ -259,7 +279,7 @@ def _decode_actor_response(
             ],
             dim=1,
         )
-        position_ids = _build_position_ids(attention_mask)[:, -1:]
+        position_ids = build_position_ids(attention_mask)[:, -1:]
         with torch.no_grad():
             outputs = actor_model(
                 input_ids=next_token.unsqueeze(-1),
@@ -295,11 +315,10 @@ def _build_evaluation_callback(
 
         reasoner_device = next(reasoner_model.parameters()).device
         reasoner_backbone = _model_backbone(reasoner_model)
-        alignment_q = alignment_context["alignment_q"].to(
-            device=reasoner_device,
-            dtype=reasoner_model.get_input_embeddings().weight.dtype,
-        )
+        alignment_state = alignment_context["alignment_state"]
         correct_count = 0
+        total_answer_tokens = 0
+        total_answer_nll = 0.0
 
         for example in eval_examples:
             prompt = str(example["prompt"])
@@ -321,22 +340,42 @@ def _build_evaluation_callback(
                 outputs.last_hidden_state,
                 compressed_steps=config.compressed_steps,
             )
-            aligned_latents = apply_orthogonal_mapping(compressed_latents, alignment_q)
+            aligned_latents = apply_alignment(compressed_latents, alignment_state)
+            prefix_state = prepare_latent_prefix_state(
+                model=actor_model,
+                handoff_step=aligned_latents,
+                kv_cache=None,
+            )
             decoded_text = _decode_actor_response(
                 actor_model,
                 actor_tokenizer,
                 aligned_latents,
                 max_new_tokens=max_new_tokens,
             )
+            answer_metrics = compute_answer_metrics_from_prefix(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_state=prefix_state,
+                answer_text=target_answer,
+            )
+            if answer_metrics["answer_nll"] is not None:
+                token_count = int(answer_metrics["answer_token_count"] or 0)
+                total_answer_tokens += token_count
+                total_answer_nll += float(answer_metrics["answer_nll"]) * token_count
             predicted_answer = _predicted_answer(dataset_name, decoded_text)
             if dataset_name == "smoke":
                 predicted_answer = normalize_answer(decoded_text)
             if _answers_match(dataset_name, predicted_answer, target_answer):
                 correct_count += 1
 
+        heldout_answer_nll = (
+            total_answer_nll / total_answer_tokens if total_answer_tokens > 0 else 0.0
+        )
         return {
             "heldout_exact_match_accuracy": 100.0 * correct_count / len(eval_examples),
             "heldout_eval_samples": float(len(eval_examples)),
+            "heldout_answer_nll": heldout_answer_nll,
+            "heldout_answer_perplexity": float(torch.exp(torch.tensor(heldout_answer_nll)).item()),
         }
 
     return evaluate
@@ -354,6 +393,7 @@ def _write_history_csv(path: Path, history: list[dict[str, float]]) -> None:
 
 def main() -> None:
     cfg = _load_cfg()
+    torch.manual_seed(int(getattr(cfg, "seed", 0)))
     config = CompressionTrainConfig.from_cfg(cfg)
     torch_dtype = _DTYPE_MAP.get(cfg.torch_dtype, torch.bfloat16)
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -421,6 +461,8 @@ def main() -> None:
         alignment_cfg=cfg,
         evaluation_fn=evaluation_fn,
     )
+    history_output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_output_path.parent.mkdir(parents=True, exist_ok=True)
     _write_history_csv(history_output_path, history)
     training_report = build_training_phase2_report(
         history=history,

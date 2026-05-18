@@ -14,12 +14,13 @@ import hydra
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
-from torchdiffeq import odeint_adjoint
+from torchdiffeq import odeint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.models.dynamics import (
     TransformerBlockDynamics,
     _is_kv_cache_compatible,
+    _kv_cache_compatibility_status,
     _kv_cache_layer_count,
     _kv_cache_seq_len,
     _move_kv_cache_to_device,
@@ -27,9 +28,17 @@ from src.models.dynamics import (
     _sync_if_cuda,
 )
 from src.utils.alignment import (
-    apply_orthogonal_mapping,
+    apply_alignment,
+    compute_cross_covariance,
+    compute_alignment_state,
     compute_orthogonal_mapping,
+    score_anchor_stability,
     resolve_shared_semantic_anchor_ids,
+)
+from src.utils.lm_eval import (
+    compute_answer_metrics_from_prefix,
+    greedy_decode_from_prefix,
+    prepare_latent_prefix_state,
 )
 
 _DTYPE_MAP = {
@@ -43,7 +52,9 @@ _PIPELINE_STATE_KEY: Optional[tuple[str, str, str, str]] = None
 _GLOBAL_ALIGNMENT_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _PREFERRED_REASONING_LAYERS: tuple[int, ...] = (12, 16, 20)
 _DEFAULT_REASONING_LAYER_WEIGHTS: tuple[float, ...] = (0.2, 0.3, 0.5)
-_ALIGNMENT_CACHE_VERSION = 1
+_ALIGNMENT_CACHE_VERSION = 4
+_SUPPORTED_HANDOFF_TARGETS: frozenset[str] = frozenset({"input_embedding"})
+_SUPPORTED_DIAGNOSTIC_TARGETS: frozenset[str] = frozenset({"hidden_consensus"})
 _MATH_COMPLEXITY_PATTERNS: tuple[str, ...] = (
     "solve",
     "equation",
@@ -141,9 +152,9 @@ def estimate_problem_complexity(
 
 
 def _scale_integration_points(base_points: int, complexity_factor: float) -> int:
-    if base_points < 2:
-        raise ValueError("base_points must be at least 2 for ODE integration")
-    return max(2, math.ceil(base_points * complexity_factor))
+    if base_points < 1:
+        raise ValueError("base_points must be at least 1")
+    return max(1, math.ceil(base_points * complexity_factor))
 
 
 def _build_integration_time_space(
@@ -171,6 +182,110 @@ def _alignment_cfg(cfg: Optional[DictConfig]) -> Any:
 def _semantic_anchor_count(cfg: Optional[DictConfig]) -> int:
     alignment_cfg = _alignment_cfg(cfg)
     return int(getattr(alignment_cfg, "semantic_anchor_count", 250))
+
+
+def _alignment_strategy(cfg: Optional[DictConfig]) -> str:
+    alignment_cfg = _alignment_cfg(cfg)
+    return str(getattr(alignment_cfg, "strategy", "hybrid_affine")).strip().lower()
+
+
+def _alignment_handoff_target(cfg: Optional[DictConfig]) -> str:
+    alignment_cfg = _alignment_cfg(cfg)
+    target = str(getattr(alignment_cfg, "handoff_target", "input_embedding")).strip().lower()
+    if target not in _SUPPORTED_HANDOFF_TARGETS:
+        supported = ", ".join(sorted(_SUPPORTED_HANDOFF_TARGETS))
+        raise ValueError(f"alignment.handoff_target must be one of: {supported}")
+    return target
+
+
+def _alignment_diagnostic_target(cfg: Optional[DictConfig]) -> str:
+    alignment_cfg = _alignment_cfg(cfg)
+    target = str(getattr(alignment_cfg, "diagnostic_target", "hidden_consensus")).strip().lower()
+    if target not in _SUPPORTED_DIAGNOSTIC_TARGETS:
+        supported = ", ".join(sorted(_SUPPORTED_DIAGNOSTIC_TARGETS))
+        raise ValueError(f"alignment.diagnostic_target must be one of: {supported}")
+    return target
+
+
+def _dynamics_mode(cfg: Optional[DictConfig]) -> str:
+    dynamics_cfg = getattr(cfg, "dynamics", None)
+    mode = str(getattr(dynamics_cfg, "mode", "identity")).strip().lower()
+    if mode not in {"identity", "ode"}:
+        raise ValueError("dynamics.mode must be either 'identity' or 'ode'")
+    return mode
+
+
+def _alignment_center_anchors(cfg: Optional[DictConfig]) -> bool:
+    alignment_cfg = _alignment_cfg(cfg)
+    return bool(getattr(alignment_cfg, "center_anchors", True))
+
+
+def _alignment_use_bias(cfg: Optional[DictConfig]) -> bool:
+    alignment_cfg = _alignment_cfg(cfg)
+    return bool(getattr(alignment_cfg, "use_bias", True))
+
+
+def _alignment_residual_lambda(cfg: Optional[DictConfig]) -> float:
+    alignment_cfg = _alignment_cfg(cfg)
+    return float(getattr(alignment_cfg, "residual_lambda", 1e-3))
+
+
+def _alignment_residual_alpha(cfg: Optional[DictConfig]) -> float:
+    alignment_cfg = _alignment_cfg(cfg)
+    return float(getattr(alignment_cfg, "residual_alpha", 1.0))
+
+
+def _alignment_residual_max_norm_ratio(cfg: Optional[DictConfig]) -> float:
+    alignment_cfg = _alignment_cfg(cfg)
+    return float(getattr(alignment_cfg, "residual_max_norm_ratio", 0.25))
+
+
+def _alignment_anchor_selection_pool_size(
+    cfg: Optional[DictConfig],
+    semantic_anchor_count: int,
+) -> int:
+    alignment_cfg = _alignment_cfg(cfg)
+    configured = getattr(alignment_cfg, "anchor_selection_pool_size", None)
+    if configured is None:
+        return max(int(semantic_anchor_count), min(500, int(semantic_anchor_count) * 2))
+    return max(int(semantic_anchor_count), int(configured))
+
+
+def _alignment_anchor_stability_bootstrap_count(cfg: Optional[DictConfig]) -> int:
+    alignment_cfg = _alignment_cfg(cfg)
+    return int(getattr(alignment_cfg, "anchor_stability_bootstrap_count", 3))
+
+
+def _alignment_anchor_stability_bootstrap_ratio(cfg: Optional[DictConfig]) -> float:
+    alignment_cfg = _alignment_cfg(cfg)
+    return float(getattr(alignment_cfg, "anchor_stability_bootstrap_ratio", 0.8))
+
+
+def _alignment_anchor_stability_bootstrap_weight(cfg: Optional[DictConfig]) -> float:
+    alignment_cfg = _alignment_cfg(cfg)
+    return float(getattr(alignment_cfg, "anchor_stability_bootstrap_weight", 0.5))
+
+
+def _alignment_adaptive_projection_settings(
+    cfg: Optional[DictConfig],
+) -> tuple[bool, float, float]:
+    projection_cfg = getattr(_alignment_cfg(cfg), "adaptive_projection", None)
+    enabled = bool(getattr(projection_cfg, "enabled", True))
+    strength = float(getattr(projection_cfg, "strength", 0.15))
+    clip_std_multiplier = float(
+        getattr(projection_cfg, "clip_std_multiplier", 4.0)
+    )
+    return enabled, strength, clip_std_multiplier
+
+
+def _prompt_calibration_settings(
+    cfg: Optional[DictConfig],
+) -> tuple[bool, float, float]:
+    calibration_cfg = getattr(_alignment_cfg(cfg), "prompt_calibration", None)
+    enabled = bool(getattr(calibration_cfg, "enabled", True))
+    strength = float(getattr(calibration_cfg, "strength", 0.2))
+    max_norm_ratio = float(getattr(calibration_cfg, "max_norm_ratio", 0.15))
+    return enabled, strength, max_norm_ratio
 
 
 def _alignment_cache_dir(cfg: Optional[DictConfig]) -> Path:
@@ -456,6 +571,117 @@ def _collect_single_token_hidden_states(
     return outputs.hidden_states
 
 
+def _collect_single_token_input_embeddings(
+    agent_model: AutoModelForCausalLM,
+    token_ids: torch.LongTensor,
+    device: torch.device,
+) -> torch.Tensor:
+    input_ids = token_ids.to(device=device, dtype=torch.long).reshape(-1, 1)
+    with torch.no_grad():
+        return agent_model.get_input_embeddings()(input_ids)
+
+
+def _repeat_alignment_target_for_layers(
+    target_hidden_states: torch.Tensor,
+    layer_count: int,
+) -> tuple[torch.Tensor, ...]:
+    if layer_count <= 0:
+        raise ValueError("layer_count must be positive")
+    return tuple(target_hidden_states for _ in range(layer_count))
+
+
+def _build_latent_trajectory(
+    *,
+    dynamics_mode: str,
+    dynamics: TransformerBlockDynamics,
+    current_latent_step: torch.Tensor,
+    point_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if point_count < 1:
+        raise ValueError("point_count must be at least 1")
+    if dynamics_mode == "identity" or point_count == 1:
+        time_space = torch.zeros(
+            point_count,
+            device=current_latent_step.device,
+            dtype=torch.float32,
+        )
+        trajectory = current_latent_step.unsqueeze(0).expand(
+            (point_count,) + tuple(current_latent_step.shape)
+        ).clone()
+        return trajectory, time_space
+
+    time_space = _build_integration_time_space(
+        point_count,
+        device=current_latent_step.device,
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        trajectory = odeint(
+            dynamics,
+            current_latent_step,
+            time_space,
+            method="rk4",
+        )
+    return trajectory, time_space
+
+
+def _time_simulated_integration(
+    *,
+    dynamics_mode: str,
+    dynamics: TransformerBlockDynamics,
+    current_latent_step: torch.Tensor,
+    point_count: int,
+) -> float:
+    if dynamics_mode == "identity" or point_count < 2:
+        return 0.0
+
+    simulated_time_space = _build_integration_time_space(
+        point_count,
+        device=current_latent_step.device,
+        dtype=torch.float32,
+    )
+    _sync_if_cuda(current_latent_step.device)
+    integration_start = time.perf_counter()
+    with torch.no_grad():
+        _ = odeint(
+            dynamics,
+            current_latent_step,
+            simulated_time_space,
+            method="rk4",
+        )
+    _sync_if_cuda(current_latent_step.device)
+    return time.perf_counter() - integration_start
+
+
+def _trace_tensor_event(
+    *,
+    operation: str,
+    tensor: torch.Tensor,
+    source_surface: str,
+    target_surface: str,
+    model_id: str,
+    diagnostics: Optional[dict[str, Any]] = None,
+    kv_cache_status: Optional[str] = None,
+    decode_status: Optional[str] = None,
+) -> dict[str, Any]:
+    scalar_diagnostics = {
+        key: value
+        for key, value in (diagnostics or {}).items()
+        if isinstance(value, (bool, int, float, str)) or value is None
+    }
+    return {
+        "operation": operation,
+        "tensor_shape": tuple(int(dim) for dim in tensor.shape),
+        "source_surface": source_surface,
+        "target_surface": target_surface,
+        "model_id": model_id,
+        "kv_cache_status": kv_cache_status,
+        "decode_status": decode_status,
+        "scalar_diagnostics": scalar_diagnostics,
+        "diagnostics": diagnostics or {},
+    }
+
+
 def _build_alignment_cache_key(
     *,
     agent_a_model: str,
@@ -464,6 +690,17 @@ def _build_alignment_cache_key(
     semantic_anchor_count: int,
     reasoning_layer_indices: Sequence[int],
     reasoning_layer_weights: Sequence[float],
+    alignment_strategy: str,
+    center_anchors: bool,
+    use_bias: bool,
+    residual_lambda: float,
+    residual_alpha: float,
+    residual_max_norm_ratio: float,
+    adaptive_projection_enabled: bool,
+    adaptive_projection_strength: float,
+    adaptive_projection_clip_std_multiplier: float,
+    handoff_target: str,
+    diagnostic_target: str,
 ) -> tuple[Any, ...]:
     return (
         _ALIGNMENT_CACHE_VERSION,
@@ -473,6 +710,17 @@ def _build_alignment_cache_key(
         int(semantic_anchor_count),
         tuple(int(index) for index in reasoning_layer_indices),
         tuple(round(float(weight), 8) for weight in reasoning_layer_weights),
+        str(alignment_strategy),
+        bool(center_anchors),
+        bool(use_bias),
+        round(float(residual_lambda), 8),
+        round(float(residual_alpha), 8),
+        round(float(residual_max_norm_ratio), 8),
+        bool(adaptive_projection_enabled),
+        round(float(adaptive_projection_strength), 8),
+        round(float(adaptive_projection_clip_std_multiplier), 8),
+        str(handoff_target),
+        str(diagnostic_target),
     )
 
 
@@ -496,13 +744,14 @@ def _load_alignment_state_from_disk(cache_path: Path) -> Optional[dict[str, Any]
         return None
     if not isinstance(cached_state, dict):
         return None
-    if "global_alignment_q" not in cached_state:
+    if "global_alignment_q" not in cached_state and "mapping_matrix" not in cached_state:
         return None
     return cached_state
 
 
 def _compute_global_semantic_alignment(
     *,
+    cfg: DictConfig,
     tokenizer_a: AutoTokenizer,
     tokenizer_b: AutoTokenizer,
     agent_a: AutoModelForCausalLM,
@@ -511,40 +760,248 @@ def _compute_global_semantic_alignment(
     reasoning_layer_weights: Sequence[float],
     semantic_anchor_count: int,
 ) -> dict[str, Any]:
-    semantic_anchor_strings, anchor_token_ids_a, anchor_token_ids_b = (
+    candidate_anchor_count = _alignment_anchor_selection_pool_size(
+        cfg,
+        semantic_anchor_count,
+    )
+    semantic_anchor_strings, candidate_anchor_ids_a, candidate_anchor_ids_b = (
         resolve_shared_semantic_anchor_ids(
             tokenizer_a,
             tokenizer_b,
-            anchor_count=semantic_anchor_count,
+            anchor_count=candidate_anchor_count,
         )
     )
+    selected_indices = _select_stable_anchor_subset(
+        cfg=cfg,
+        agent_a=agent_a,
+        agent_b=agent_b,
+        candidate_anchor_ids_a=candidate_anchor_ids_a,
+        candidate_anchor_ids_b=candidate_anchor_ids_b,
+        reasoning_layer_indices=reasoning_layer_indices,
+        reasoning_layer_weights=reasoning_layer_weights,
+        target_anchor_count=semantic_anchor_count,
+    )
+    anchor_token_ids_a = candidate_anchor_ids_a.index_select(0, selected_indices)
+    anchor_token_ids_b = candidate_anchor_ids_b.index_select(0, selected_indices)
+    selected_anchor_strings = tuple(
+        semantic_anchor_strings[int(index)] for index in selected_indices.tolist()
+    )
+    return compute_semantic_alignment_from_token_ids(
+        cfg=cfg,
+        tokenizer_a=tokenizer_a,
+        tokenizer_b=tokenizer_b,
+        agent_a=agent_a,
+        agent_b=agent_b,
+        sender_anchor_ids=anchor_token_ids_a,
+        receiver_anchor_ids=anchor_token_ids_b,
+        reasoning_layer_indices=reasoning_layer_indices,
+        reasoning_layer_weights=reasoning_layer_weights,
+        alignment_mode=_alignment_strategy(cfg),
+        semantic_anchor_strings=selected_anchor_strings,
+        candidate_anchor_strings=semantic_anchor_strings,
+        candidate_anchor_ids_a=candidate_anchor_ids_a,
+        candidate_anchor_ids_b=candidate_anchor_ids_b,
+        selected_anchor_indices=selected_indices,
+    )
+
+
+def _select_stable_anchor_subset(
+    *,
+    cfg: Optional[DictConfig],
+    agent_a: AutoModelForCausalLM,
+    agent_b: AutoModelForCausalLM,
+    candidate_anchor_ids_a: torch.LongTensor,
+    candidate_anchor_ids_b: torch.LongTensor,
+    reasoning_layer_indices: Sequence[int],
+    reasoning_layer_weights: Sequence[float],
+    target_anchor_count: int,
+) -> torch.LongTensor:
+    candidate_count = int(candidate_anchor_ids_a.numel())
+    if target_anchor_count >= candidate_count:
+        return torch.arange(candidate_count, dtype=torch.long)
+
+    sender_hidden_states = _collect_single_token_hidden_states(
+        agent_a,
+        candidate_anchor_ids_a,
+        next(agent_a.parameters()).device,
+    )
+    receiver_hidden_states = _collect_single_token_hidden_states(
+        agent_b,
+        candidate_anchor_ids_b,
+        next(agent_b.parameters()).device,
+    )
+    sender_consensus = _aggregate_hidden_layers(
+        _select_hidden_layers(sender_hidden_states, reasoning_layer_indices),
+        reasoning_layer_weights,
+    ).reshape(candidate_count, -1)
+    receiver_consensus = _aggregate_hidden_layers(
+        _select_hidden_layers(receiver_hidden_states, reasoning_layer_indices),
+        reasoning_layer_weights,
+    ).reshape(candidate_count, -1)
+    stability = score_anchor_stability(
+        sender_consensus,
+        receiver_consensus,
+        strategy=_alignment_strategy(cfg),
+        regularization=_alignment_residual_lambda(cfg),
+        residual_alpha=_alignment_residual_alpha(cfg),
+        residual_max_norm_ratio=_alignment_residual_max_norm_ratio(cfg),
+        center=_alignment_center_anchors(cfg),
+        use_bias=_alignment_use_bias(cfg),
+        bootstrap_count=_alignment_anchor_stability_bootstrap_count(cfg),
+        bootstrap_ratio=_alignment_anchor_stability_bootstrap_ratio(cfg),
+        bootstrap_weight=_alignment_anchor_stability_bootstrap_weight(cfg),
+        seed=int(getattr(cfg, "seed", 0)),
+    )
+    combined_score = stability["combined_score"].float()
+    sorted_indices = torch.argsort(combined_score, dim=0, descending=False)
+    return sorted_indices[:target_anchor_count].cpu()
+
+
+def compute_semantic_alignment_from_token_ids(
+    *,
+    cfg: Optional[DictConfig],
+    tokenizer_a: AutoTokenizer,
+    tokenizer_b: AutoTokenizer,
+    agent_a: AutoModelForCausalLM,
+    agent_b: AutoModelForCausalLM,
+    sender_anchor_ids: torch.LongTensor,
+    receiver_anchor_ids: torch.LongTensor,
+    reasoning_layer_indices: Sequence[int],
+    reasoning_layer_weights: Sequence[float],
+    alignment_mode: str,
+    semantic_anchor_strings: Optional[Sequence[str]] = None,
+    candidate_anchor_strings: Optional[Sequence[str]] = None,
+    candidate_anchor_ids_a: Optional[torch.LongTensor] = None,
+    candidate_anchor_ids_b: Optional[torch.LongTensor] = None,
+    selected_anchor_indices: Optional[torch.LongTensor] = None,
+) -> dict[str, Any]:
     anchor_hidden_states_a = _collect_single_token_hidden_states(
         agent_a,
-        anchor_token_ids_a,
+        sender_anchor_ids,
         next(agent_a.parameters()).device,
     )
     anchor_hidden_states_b = _collect_single_token_hidden_states(
         agent_b,
-        anchor_token_ids_b,
+        receiver_anchor_ids,
         next(agent_b.parameters()).device,
     )
-    q_global = compute_orthogonal_mapping(
-        _select_hidden_layers(anchor_hidden_states_a, reasoning_layer_indices),
-        _select_hidden_layers(anchor_hidden_states_b, reasoning_layer_indices),
+    sender_layers = _select_hidden_layers(anchor_hidden_states_a, reasoning_layer_indices)
+    receiver_layers = _select_hidden_layers(anchor_hidden_states_b, reasoning_layer_indices)
+    receiver_input_embeddings = _collect_single_token_input_embeddings(
+        agent_b,
+        receiver_anchor_ids,
+        next(agent_b.parameters()).device,
+    )
+    handoff_receiver_layers = _repeat_alignment_target_for_layers(
+        receiver_input_embeddings,
+        len(sender_layers),
+    )
+    handoff_target = _alignment_handoff_target(cfg)
+    diagnostic_target = _alignment_diagnostic_target(cfg)
+    adaptive_projection_enabled, adaptive_projection_strength, adaptive_projection_clip_std = (
+        _alignment_adaptive_projection_settings(cfg)
+    )
+    diagnostic_alignment_state = compute_alignment_state(
+        sender_layers,
+        receiver_layers,
         layer_weights=reasoning_layer_weights,
-    ).detach()
+        strategy=alignment_mode,
+        center=_alignment_center_anchors(cfg),
+        use_bias=_alignment_use_bias(cfg),
+        regularization=_alignment_residual_lambda(cfg),
+        residual_alpha=_alignment_residual_alpha(cfg),
+        residual_max_norm_ratio=_alignment_residual_max_norm_ratio(cfg),
+        adaptive_projection_strength=(
+            adaptive_projection_strength if adaptive_projection_enabled else 0.0
+        ),
+        adaptive_projection_clip_std_multiplier=adaptive_projection_clip_std,
+    )
+    handoff_alignment_state = compute_alignment_state(
+        sender_layers,
+        handoff_receiver_layers,
+        layer_weights=reasoning_layer_weights,
+        strategy=alignment_mode,
+        center=_alignment_center_anchors(cfg),
+        use_bias=_alignment_use_bias(cfg),
+        regularization=_alignment_residual_lambda(cfg),
+        residual_alpha=_alignment_residual_alpha(cfg),
+        residual_max_norm_ratio=_alignment_residual_max_norm_ratio(cfg),
+        adaptive_projection_strength=(
+            adaptive_projection_strength if adaptive_projection_enabled else 0.0
+        ),
+        adaptive_projection_clip_std_multiplier=adaptive_projection_clip_std,
+    )
+    mapping_matrix = diagnostic_alignment_state["mapping_matrix"].detach()
+    bias_vector = diagnostic_alignment_state["mapping_bias"].detach()
+    orthogonal_q = diagnostic_alignment_state["orthogonal_q"].detach()
+    residual_matrix = diagnostic_alignment_state["residual_matrix"].detach()
+    singular_values = diagnostic_alignment_state["alignment_singular_values"].detach()
+    handoff_mapping_matrix = handoff_alignment_state["mapping_matrix"].detach()
+    handoff_bias_vector = handoff_alignment_state["mapping_bias"].detach()
+    handoff_orthogonal_q = handoff_alignment_state["orthogonal_q"].detach()
+    handoff_residual_matrix = handoff_alignment_state["residual_matrix"].detach()
+    handoff_singular_values = handoff_alignment_state["alignment_singular_values"].detach()
 
     return {
-        "alignment_mode": "semantic_anchor_global",
-        "semantic_anchor_count": len(semantic_anchor_strings),
-        "semantic_anchor_strings": semantic_anchor_strings,
-        "semantic_anchor_ids_a": tuple(int(token_id) for token_id in anchor_token_ids_a.tolist()),
-        "semantic_anchor_ids_b": tuple(int(token_id) for token_id in anchor_token_ids_b.tolist()),
+        "alignment_mode": str(alignment_mode),
+        "alignment_strategy": str(diagnostic_alignment_state["alignment_strategy"]),
+        "handoff_surface": handoff_target,
+        "diagnostic_surface": diagnostic_target,
+        "semantic_anchor_count": int(sender_anchor_ids.numel()),
+        "semantic_anchor_strings": tuple(semantic_anchor_strings or ()),
+        "semantic_anchor_ids_a": tuple(int(token_id) for token_id in sender_anchor_ids.tolist()),
+        "semantic_anchor_ids_b": tuple(int(token_id) for token_id in receiver_anchor_ids.tolist()),
+        "candidate_anchor_strings": tuple(candidate_anchor_strings or ()),
+        "candidate_anchor_ids_a": tuple()
+        if candidate_anchor_ids_a is None
+        else tuple(int(token_id) for token_id in candidate_anchor_ids_a.tolist()),
+        "candidate_anchor_ids_b": tuple()
+        if candidate_anchor_ids_b is None
+        else tuple(int(token_id) for token_id in candidate_anchor_ids_b.tolist()),
+        "selected_anchor_indices": tuple()
+        if selected_anchor_indices is None
+        else tuple(int(index) for index in selected_anchor_indices.tolist()),
         "global_reasoning_layer_indices": tuple(int(index) for index in reasoning_layer_indices),
-        "global_reasoning_layer_weights": tuple(
-            float(weight) for weight in reasoning_layer_weights
+        "global_reasoning_layer_weights": tuple(float(weight) for weight in reasoning_layer_weights),
+        "global_alignment_q": mapping_matrix.cpu(),
+        "global_alignment_bias": bias_vector.cpu(),
+        "global_alignment_backbone_q": orthogonal_q.cpu(),
+        "global_alignment_residual": residual_matrix.cpu(),
+        "alignment_singular_values": singular_values.cpu(),
+        "handoff_alignment_q": handoff_mapping_matrix.cpu(),
+        "handoff_alignment_bias": handoff_bias_vector.cpu(),
+        "handoff_alignment_backbone_q": handoff_orthogonal_q.cpu(),
+        "handoff_alignment_residual": handoff_residual_matrix.cpu(),
+        "handoff_alignment_singular_values": handoff_singular_values.cpu(),
+        "center_anchors": bool(diagnostic_alignment_state["center_anchors"]),
+        "use_bias": bool(diagnostic_alignment_state["use_bias"]),
+        "residual_norm_ratio": float(diagnostic_alignment_state["residual_norm_ratio"]),
+        "bias_norm": float(diagnostic_alignment_state["bias_norm"]),
+        "handoff_residual_norm_ratio": float(handoff_alignment_state["residual_norm_ratio"]),
+        "handoff_bias_norm": float(handoff_alignment_state["bias_norm"]),
+        "anchor_reconstruction_mse": float(diagnostic_alignment_state["anchor_reconstruction_mse"]),
+        "handoff_anchor_reconstruction_mse": float(
+            handoff_alignment_state["anchor_reconstruction_mse"]
         ),
-        "global_alignment_q": q_global.cpu(),
+        "anchor_pairwise_distance_distortion": float(
+            diagnostic_alignment_state["anchor_pairwise_distance_distortion"]
+        ),
+        "anchor_cosine_structure_error": float(
+            diagnostic_alignment_state["anchor_cosine_structure_error"]
+        ),
+        "handoff_anchor_pairwise_distance_distortion": float(
+            handoff_alignment_state["anchor_pairwise_distance_distortion"]
+        ),
+        "handoff_anchor_cosine_structure_error": float(
+            handoff_alignment_state["anchor_cosine_structure_error"]
+        ),
+        "pre_projection_state": diagnostic_alignment_state["pre_projection_state"],
+        "post_projection_state": diagnostic_alignment_state["post_projection_state"],
+        "handoff_pre_projection_state": handoff_alignment_state["pre_projection_state"],
+        "handoff_post_projection_state": handoff_alignment_state["post_projection_state"],
+        "sender_anchor_mean": diagnostic_alignment_state["sender_anchor_mean"],
+        "receiver_anchor_mean": diagnostic_alignment_state["receiver_anchor_mean"],
+        "handoff_receiver_anchor_mean": handoff_alignment_state["receiver_anchor_mean"],
     }
 
 
@@ -564,6 +1021,17 @@ def load_or_compute_global_alignment_state(
     )
     reasoning_layer_weights = _resolve_reasoning_layer_weights(cfg, reasoning_layer_indices)
     semantic_anchor_count = _semantic_anchor_count(cfg)
+    alignment_strategy = _alignment_strategy(cfg)
+    center_anchors = _alignment_center_anchors(cfg)
+    use_bias = _alignment_use_bias(cfg)
+    residual_lambda = _alignment_residual_lambda(cfg)
+    residual_alpha = _alignment_residual_alpha(cfg)
+    residual_max_norm_ratio = _alignment_residual_max_norm_ratio(cfg)
+    handoff_target = _alignment_handoff_target(cfg)
+    diagnostic_target = _alignment_diagnostic_target(cfg)
+    adaptive_projection_enabled, adaptive_projection_strength, adaptive_projection_clip_std = (
+        _alignment_adaptive_projection_settings(cfg)
+    )
     alignment_cache_key = _build_alignment_cache_key(
         agent_a_model=str(cfg.agent_a_model),
         agent_b_model=str(cfg.agent_b_model),
@@ -571,6 +1039,17 @@ def load_or_compute_global_alignment_state(
         semantic_anchor_count=semantic_anchor_count,
         reasoning_layer_indices=reasoning_layer_indices,
         reasoning_layer_weights=reasoning_layer_weights,
+        alignment_strategy=alignment_strategy,
+        center_anchors=center_anchors,
+        use_bias=use_bias,
+        residual_lambda=residual_lambda,
+        residual_alpha=residual_alpha,
+        residual_max_norm_ratio=residual_max_norm_ratio,
+        adaptive_projection_enabled=adaptive_projection_enabled,
+        adaptive_projection_strength=adaptive_projection_strength,
+        adaptive_projection_clip_std_multiplier=adaptive_projection_clip_std,
+        handoff_target=handoff_target,
+        diagnostic_target=diagnostic_target,
     )
 
     cached_alignment_state = _GLOBAL_ALIGNMENT_MEMORY_CACHE.get(alignment_cache_key)
@@ -583,6 +1062,7 @@ def load_or_compute_global_alignment_state(
 
     if cached_alignment_state is None:
         cached_alignment_state = _compute_global_semantic_alignment(
+            cfg=cfg,
             tokenizer_a=tokenizer_a,
             tokenizer_b=tokenizer_b,
             agent_a=agent_a,
@@ -693,49 +1173,124 @@ def _compute_receiver_reference_handoff(
     reasoning_layer_indices: Sequence[int],
     reasoning_layer_weights: Sequence[float],
 ) -> torch.Tensor:
+    del reasoning_layer_indices, reasoning_layer_weights
     tokenizer_b = state["tokenizer_b"]
     agent_b = state["agent_b"]
     agent_b_device = next(agent_b.parameters()).device
     encoded_b = tokenizer_b(prompt, return_tensors="pt")
     input_ids_b = encoded_b["input_ids"].to(agent_b_device)
-    attention_mask_b = encoded_b["attention_mask"].to(agent_b_device)
-    position_ids_b = _build_position_ids(attention_mask_b)
-
     with torch.no_grad():
-        receiver_outputs = agent_b.model(
-            input_ids=input_ids_b,
-            attention_mask=attention_mask_b,
-            position_ids=position_ids_b,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        receiver_input_embeddings = agent_b.get_input_embeddings()(input_ids_b)
+    return receiver_input_embeddings[:, -1:, :]
 
-    if receiver_outputs.hidden_states is None:
-        raise ValueError("Agent B did not return hidden states for receiver reference extraction")
 
-    receiver_layers = _select_hidden_layers(
-        receiver_outputs.hidden_states,
-        reasoning_layer_indices,
+def _alignment_state_from_pipeline_state(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    mapping_matrix = state.get("global_alignment_q", state.get("mapping_matrix"))
+    mapping_bias = state.get("global_alignment_bias", state.get("mapping_bias"))
+    return {
+        "mapping_matrix": mapping_matrix,
+        "mapping_bias": mapping_bias,
+        "pre_projection_state": state.get("pre_projection_state"),
+        "post_projection_state": state.get("post_projection_state"),
+        "alignment_strategy": state.get("alignment_strategy", state.get("alignment_mode", "unknown")),
+        "orthogonal_q": state.get("global_alignment_backbone_q", state.get("orthogonal_q", mapping_matrix)),
+        "residual_matrix": state.get("global_alignment_residual", state.get("residual_matrix")),
+        "residual_norm_ratio": state.get("residual_norm_ratio"),
+        "bias_norm": state.get("bias_norm"),
+    }
+
+
+def _handoff_alignment_state_from_pipeline_state(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    mapping_matrix = state.get("handoff_alignment_q", state.get("global_alignment_q"))
+    mapping_bias = state.get("handoff_alignment_bias", state.get("global_alignment_bias"))
+    return {
+        "mapping_matrix": mapping_matrix,
+        "mapping_bias": mapping_bias,
+        "pre_projection_state": state.get(
+            "handoff_pre_projection_state",
+            state.get("pre_projection_state"),
+        ),
+        "post_projection_state": state.get(
+            "handoff_post_projection_state",
+            state.get("post_projection_state"),
+        ),
+        "alignment_strategy": state.get("alignment_strategy", state.get("alignment_mode")),
+        "orthogonal_q": state.get(
+            "handoff_alignment_backbone_q",
+            state.get("global_alignment_backbone_q", mapping_matrix),
+        ),
+        "residual_matrix": state.get("handoff_alignment_residual"),
+        "residual_norm_ratio": state.get(
+            "handoff_residual_norm_ratio",
+            state.get("residual_norm_ratio"),
+        ),
+        "bias_norm": state.get("handoff_bias_norm", state.get("bias_norm")),
+    }
+
+
+def _apply_prompt_calibration(
+    handoff_step: torch.Tensor,
+    receiver_reference_handoff: torch.Tensor,
+    *,
+    strength: float,
+    max_norm_ratio: float,
+) -> tuple[torch.Tensor, float]:
+    correction = (receiver_reference_handoff - handoff_step).float()
+    correction = correction * float(strength)
+    correction_norm = float(
+        torch.linalg.vector_norm(correction.reshape(correction.shape[0], -1), dim=-1)
+        .mean()
+        .item()
     )
-    receiver_consensus = _aggregate_hidden_layers(
-        receiver_layers,
-        reasoning_layer_weights,
+    if max_norm_ratio > 0.0:
+        handoff_norm = torch.linalg.vector_norm(
+            handoff_step.float().reshape(handoff_step.shape[0], -1),
+            dim=-1,
+        ).mean()
+        max_norm = float(handoff_norm.item()) * float(max_norm_ratio)
+        if correction_norm > max_norm > 0.0:
+            correction = correction * (max_norm / max(correction_norm, 1e-8))
+            correction_norm = max_norm
+    calibrated = handoff_step + correction.to(
+        device=handoff_step.device,
+        dtype=handoff_step.dtype,
     )
-    return receiver_consensus[:, -1:, :]
+    return calibrated, correction_norm
 
 
 def get_global_alignment_metadata(cfg: DictConfig) -> dict[str, Any]:
     state = _get_pipeline_state(cfg)
     return {
         "alignment_mode": state["alignment_mode"],
+        "alignment_strategy": state.get("alignment_strategy", state["alignment_mode"]),
         "semantic_anchor_count": int(state["semantic_anchor_count"]),
         "semantic_anchor_preview": tuple(state["semantic_anchor_strings"][:10]),
         "semantic_anchor_ids_a_preview": tuple(state["semantic_anchor_ids_a"][:10]),
         "semantic_anchor_ids_b_preview": tuple(state["semantic_anchor_ids_b"][:10]),
+        "candidate_anchor_count": len(state.get("candidate_anchor_strings", ())),
+        "selected_anchor_indices_preview": tuple(state.get("selected_anchor_indices", ())[:10]),
         "reasoning_layer_indices": tuple(state["global_reasoning_layer_indices"]),
         "reasoning_layer_weights": tuple(state["global_reasoning_layer_weights"]),
         "q_global_shape": tuple(state["global_alignment_q"].shape),
+        "handoff_q_shape": tuple(
+            state.get("handoff_alignment_q", state["global_alignment_q"]).shape
+        ),
+        "global_alignment_bias_shape": tuple(state["global_alignment_bias"].shape),
+        "handoff_alignment_bias_shape": tuple(
+            state.get("handoff_alignment_bias", state["global_alignment_bias"]).shape
+        ),
+        "residual_norm_ratio": float(state.get("residual_norm_ratio", 0.0)),
+        "handoff_residual_norm_ratio": float(
+            state.get("handoff_residual_norm_ratio", state.get("residual_norm_ratio", 0.0))
+        ),
+        "bias_norm": float(state.get("bias_norm", 0.0)),
+        "handoff_bias_norm": float(state.get("handoff_bias_norm", state.get("bias_norm", 0.0))),
+        "handoff_surface": state.get("handoff_surface", _alignment_handoff_target(cfg)),
+        "diagnostic_surface": state.get("diagnostic_surface", _alignment_diagnostic_target(cfg)),
         "global_alignment_cache_hit": bool(state["global_alignment_cache_hit"]),
         "global_alignment_cache_path": str(state["global_alignment_cache_path"]),
     }
@@ -779,10 +1334,7 @@ def extract_reasoning_trace(cfg: DictConfig, prompt: Optional[str] = None) -> di
         sender_reasoning_layers,
         reasoning_layer_weights,
     )
-    procrustes_q = state["global_alignment_q"].to(
-        device=consensus_hidden_states.device,
-        dtype=consensus_hidden_states.dtype,
-    )
+    alignment_state = _handoff_alignment_state_from_pipeline_state(state)
 
     current_latent_step = consensus_hidden_states[:, -1:, :]
     continuous_position_ids = position_ids_a[:, -1:] + 1
@@ -790,31 +1342,30 @@ def extract_reasoning_trace(cfg: DictConfig, prompt: Optional[str] = None) -> di
         int(cfg.latent_steps), complexity_factor
     )
 
+    dynamics_mode = _dynamics_mode(cfg)
     rotary_emb = getattr(agent_a.model, "rotary_emb", None)
     dynamics = TransformerBlockDynamics(agent_a.model.layers[0], rotary_emb=rotary_emb)
     dynamics.set_context(position_ids=continuous_position_ids)
 
-    time_space = _build_integration_time_space(
-        effective_latent_steps,
-        device=current_latent_step.device,
-        dtype=torch.float32,
+    continuous_trajectory, time_space = _build_latent_trajectory(
+        dynamics_mode=dynamics_mode,
+        dynamics=dynamics,
+        current_latent_step=current_latent_step,
+        point_count=effective_latent_steps,
     )
-    with torch.no_grad():
-        continuous_trajectory = odeint_adjoint(
-            dynamics,
-            current_latent_step,
-            time_space,
-            method="rk4",
-        )
-    aligned_continuous_trajectory = apply_orthogonal_mapping(
+    aligned_continuous_trajectory = apply_alignment(
         continuous_trajectory,
-        procrustes_q,
+        alignment_state,
     )
 
     return {
         "prompt": prompt,
         "complexity_factor": complexity_factor,
         "alignment_mode": state["alignment_mode"],
+        "alignment_strategy": state.get("alignment_strategy", state["alignment_mode"]),
+        "handoff_surface": state.get("handoff_surface", _alignment_handoff_target(cfg)),
+        "diagnostic_surface": state.get("diagnostic_surface", _alignment_diagnostic_target(cfg)),
+        "dynamics_mode": dynamics_mode,
         "semantic_anchor_count": int(state["semantic_anchor_count"]),
         "semantic_anchor_preview": semantic_anchor_strings[:10],
         "reasoning_layer_weights": reasoning_layer_weights,
@@ -826,7 +1377,11 @@ def extract_reasoning_trace(cfg: DictConfig, prompt: Optional[str] = None) -> di
         "pre_alignment_handoff": continuous_trajectory[-1].detach().cpu(),
         "post_alignment_handoff": aligned_continuous_trajectory[-1].detach().cpu(),
         "time_space": time_space.detach().cpu(),
-        "procrustes_q_shape": tuple(procrustes_q.shape),
+        "procrustes_q_shape": tuple(state["global_alignment_q"].shape),
+        "handoff_q_shape": tuple(
+            state.get("handoff_alignment_q", state["global_alignment_q"]).shape
+        ),
+        "alignment_bias_shape": tuple(state["global_alignment_bias"].shape),
         "global_alignment_cache_hit": bool(state["global_alignment_cache_hit"]),
     }
 
@@ -836,6 +1391,9 @@ def run_hybrid_pipeline(
     prompt: Optional[str] = None,
     *,
     collect_alignment_metrics: bool = False,
+    target_answer_text: Optional[str] = None,
+    alignment_q_override: Optional[Any] = None,
+    alignment_mode_override: Optional[str] = None,
 ) -> dict[str, Any]:
     if prompt is None:
         prompt = cfg.default_prompt
@@ -852,6 +1410,11 @@ def run_hybrid_pipeline(
     reasoning_layer_indices = tuple(state["global_reasoning_layer_indices"])
     reasoning_layer_weights = tuple(state["global_reasoning_layer_weights"])
     semantic_anchor_strings = tuple(state["semantic_anchor_strings"])
+    prompt_calibration_enabled, prompt_calibration_strength, prompt_calibration_max_norm = (
+        _prompt_calibration_settings(cfg)
+    )
+    dynamics_mode = _dynamics_mode(cfg)
+    trace_events: list[dict[str, Any]] = []
 
     encoded = tokenizer_a(prompt, return_tensors="pt")
     agent_a_device = next(agent_a.parameters()).device
@@ -882,10 +1445,43 @@ def run_hybrid_pipeline(
         sender_reasoning_layers,
         reasoning_layer_weights,
     )
-    procrustes_q = state["global_alignment_q"].to(
-        device=consensus_hidden_states.device, dtype=consensus_hidden_states.dtype
+    base_handoff_alignment_state = _handoff_alignment_state_from_pipeline_state(state)
+    if alignment_q_override is None:
+        alignment_state: Any = base_handoff_alignment_state
+    elif isinstance(alignment_q_override, torch.Tensor):
+        alignment_state = {
+            "mapping_matrix": alignment_q_override.detach().cpu(),
+            "mapping_bias": torch.zeros(
+                (1, int(alignment_q_override.shape[-1])),
+                dtype=torch.float32,
+            ),
+            "alignment_strategy": "override_matrix",
+        }
+    elif isinstance(alignment_q_override, dict):
+        alignment_state = _handoff_alignment_state_from_pipeline_state(alignment_q_override)
+    else:
+        raise TypeError("alignment_q_override must be None, a tensor, or an alignment-state dictionary")
+    alignment_mode = (
+        str(alignment_mode_override)
+        if alignment_mode_override is not None
+        else str(
+            alignment_state.get(
+                "alignment_strategy",
+                state.get("alignment_strategy", state["alignment_mode"]),
+            )
+        )
     )
     current_latent_step = consensus_hidden_states[:, -1:, :]
+    trace_events.append(
+        _trace_tensor_event(
+            operation="sender_consensus",
+            tensor=current_latent_step,
+            source_surface="reasoner_hidden_consensus",
+            target_surface="reasoner_hidden_consensus",
+            model_id=str(cfg.agent_a_model),
+            diagnostics={"reasoning_layer_indices": reasoning_layer_indices},
+        )
+    )
     continuous_position_ids = position_ids_a[:, -1:] + 1
     effective_latent_steps = _scale_integration_points(
         int(cfg.latent_steps), complexity_factor
@@ -898,60 +1494,96 @@ def run_hybrid_pipeline(
     dynamics = TransformerBlockDynamics(agent_a.model.layers[0], rotary_emb=rotary_emb)
     dynamics.set_context(position_ids=continuous_position_ids)
 
-    time_space = _build_integration_time_space(
-        effective_latent_steps,
-        device=current_latent_step.device,
-        dtype=torch.float32,
+    continuous_trajectory, time_space = _build_latent_trajectory(
+        dynamics_mode=dynamics_mode,
+        dynamics=dynamics,
+        current_latent_step=current_latent_step,
+        point_count=effective_latent_steps,
     )
-    with torch.no_grad():
-        continuous_trajectory = odeint_adjoint(
-            dynamics,
-            current_latent_step,
-            time_space,
-            method="rk4",
+    trace_events.append(
+        _trace_tensor_event(
+            operation="latent_dynamics",
+            tensor=continuous_trajectory,
+            source_surface="reasoner_hidden_consensus",
+            target_surface="reasoner_hidden_consensus",
+            model_id=str(cfg.agent_a_model),
+            diagnostics={
+                "dynamics_mode": dynamics_mode,
+                "latent_trajectory_steps": effective_latent_steps,
+            },
         )
-    aligned_continuous_trajectory = apply_orthogonal_mapping(
+    )
+    aligned_continuous_trajectory = apply_alignment(
         continuous_trajectory,
-        procrustes_q,
+        alignment_state,
     )
     current_latent_step = continuous_trajectory[-1]
 
-    simulated_time_space = _build_integration_time_space(
-        effective_simulated_steps,
-        device=current_latent_step.device,
-        dtype=torch.float32,
+    integration_duration = _time_simulated_integration(
+        dynamics_mode=dynamics_mode,
+        dynamics=dynamics,
+        current_latent_step=current_latent_step,
+        point_count=effective_simulated_steps,
     )
-    _sync_if_cuda(current_latent_step.device)
-    integration_start = time.perf_counter()
-    with torch.no_grad():
-        _ = odeint_adjoint(
-            dynamics,
-            current_latent_step,
-            simulated_time_space,
-            method="rk4",
-        )
-    _sync_if_cuda(current_latent_step.device)
-    integration_duration = time.perf_counter() - integration_start
 
     agent_b_embed_dtype = agent_b.get_input_embeddings().weight.dtype
     agent_b_embed_dim = agent_b.get_input_embeddings().weight.shape[-1]
-    aligned_handoff_step = apply_orthogonal_mapping(current_latent_step, procrustes_q)
+    aligned_handoff_step = apply_alignment(current_latent_step, alignment_state)
+    handoff_status = "ok"
+    handoff_surface = state.get("handoff_surface", _alignment_handoff_target(cfg))
     if aligned_handoff_step.shape[-1] != agent_b_embed_dim:
+        handoff_status = "dimension_mismatch"
         raise ValueError(
             "Consensus latent handoff dimension "
             f"{aligned_handoff_step.shape[-1]} does not match Agent B input dimension "
             f"{agent_b_embed_dim}"
         )
+    trace_events.append(
+        _trace_tensor_event(
+            operation="handoff_alignment",
+            tensor=aligned_handoff_step,
+            source_surface="reasoner_hidden_consensus",
+            target_surface=handoff_surface,
+            model_id=f"{cfg.agent_a_model} -> {cfg.agent_b_model}",
+            diagnostics={
+                "alignment_strategy": alignment_state.get("alignment_strategy", alignment_mode),
+                "residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+                "bias_norm": alignment_state.get("bias_norm"),
+            },
+        )
+    )
+    calibration_bias_norm = 0.0
+    receiver_reference_handoff_cpu: Optional[torch.Tensor] = None
+    receiver_reference_handoff_for_metrics: Optional[torch.Tensor] = None
+    if prompt_calibration_enabled or collect_alignment_metrics:
+        receiver_reference_handoff = _compute_receiver_reference_handoff(
+            prompt=prompt,
+            state=state,
+            reasoning_layer_indices=reasoning_layer_indices,
+            reasoning_layer_weights=reasoning_layer_weights,
+        ).to(device=agent_b_device, dtype=aligned_handoff_step.dtype)
+        receiver_reference_handoff_for_metrics = receiver_reference_handoff
+        receiver_reference_handoff_cpu = receiver_reference_handoff.detach().cpu()
+        if prompt_calibration_enabled:
+            aligned_handoff_step, calibration_bias_norm = _apply_prompt_calibration(
+                aligned_handoff_step,
+                receiver_reference_handoff,
+                strength=prompt_calibration_strength,
+                max_norm_ratio=prompt_calibration_max_norm,
+            )
     handoff_step = aligned_handoff_step.to(
         device=agent_b_device,
         dtype=agent_b_embed_dtype,
     )
-    outputs_b, attention_mask_b, kv_cache_transferred = _run_actor_handoff(
-        agent_b=agent_b,
+    prefix_state = prepare_latent_prefix_state(
+        model=agent_b,
         handoff_step=handoff_step,
-        kv_cache_a=kv_cache_a,
-        agent_b_device=agent_b_device,
+        kv_cache=kv_cache_a,
     )
+    outputs_b = prefix_state["outputs"]
+    kv_cache_transferred = bool(prefix_state["kv_cache_transferred"])
+    kv_cache_status = str(prefix_state.get("kv_cache_status", "transferred" if kv_cache_transferred else "unsupported"))
+    kv_cache_reason = str(prefix_state.get("kv_cache_reason", ""))
     raw_handoff_entropy = float(
         _compute_logits_entropy(outputs_b.logits[:, -1, :]).mean().detach().cpu().item()
     )
@@ -976,111 +1608,130 @@ def run_hybrid_pipeline(
             extra_discrete_steps=extra_discrete_steps,
         )
         executed_discrete_fallback_steps = len(fallback_token_ids)
-        aligned_handoff_step = apply_orthogonal_mapping(current_latent_step, procrustes_q)
+        aligned_handoff_step = apply_alignment(current_latent_step, alignment_state)
         if aligned_handoff_step.shape[-1] != agent_b_embed_dim:
             raise ValueError(
                 "Fallback handoff dimension "
                 f"{aligned_handoff_step.shape[-1]} does not match Agent B input dimension "
                 f"{agent_b_embed_dim}"
             )
+        if prompt_calibration_enabled and receiver_reference_handoff_for_metrics is not None:
+            aligned_handoff_step, calibration_bias_norm = _apply_prompt_calibration(
+                aligned_handoff_step,
+                receiver_reference_handoff_for_metrics,
+                strength=prompt_calibration_strength,
+                max_norm_ratio=prompt_calibration_max_norm,
+            )
         handoff_step = aligned_handoff_step.to(device=agent_b_device, dtype=agent_b_embed_dtype)
-        outputs_b, attention_mask_b, kv_cache_transferred = _run_actor_handoff(
-            agent_b=agent_b,
+        prefix_state = prepare_latent_prefix_state(
+            model=agent_b,
             handoff_step=handoff_step,
-            kv_cache_a=kv_cache_a,
-            agent_b_device=agent_b_device,
+            kv_cache=kv_cache_a,
         )
+        outputs_b = prefix_state["outputs"]
+        kv_cache_transferred = bool(prefix_state["kv_cache_transferred"])
+        kv_cache_status = str(prefix_state.get("kv_cache_status", kv_cache_status))
+        kv_cache_reason = str(prefix_state.get("kv_cache_reason", kv_cache_reason))
 
     total_reasoning_steps = effective_latent_steps + executed_discrete_fallback_steps
-    receiver_reference_handoff_cpu: Optional[torch.Tensor] = None
     pre_alignment_l2_distance: Optional[float] = None
     pre_alignment_cosine_distance: Optional[float] = None
     post_alignment_l2_distance: Optional[float] = None
     post_alignment_cosine_distance: Optional[float] = None
 
     if collect_alignment_metrics:
-        receiver_reference_handoff = _compute_receiver_reference_handoff(
-            prompt=prompt,
-            state=state,
-            reasoning_layer_indices=reasoning_layer_indices,
-            reasoning_layer_weights=reasoning_layer_weights,
-        ).to(device=agent_b_device, dtype=handoff_step.dtype)
-        receiver_reference_in_sender = apply_orthogonal_mapping(
-            receiver_reference_handoff.to(
-                device=current_latent_step.device,
-                dtype=current_latent_step.dtype,
-            ),
-            procrustes_q.transpose(0, 1),
+        if receiver_reference_handoff_for_metrics is None:
+            receiver_reference_handoff_for_metrics = _compute_receiver_reference_handoff(
+                prompt=prompt,
+                state=state,
+                reasoning_layer_indices=reasoning_layer_indices,
+                reasoning_layer_weights=reasoning_layer_weights,
+            ).to(device=agent_b_device, dtype=handoff_step.dtype)
+            receiver_reference_handoff_cpu = receiver_reference_handoff_for_metrics.detach().cpu()
+        backbone_mapping = alignment_state.get(
+            "orthogonal_q",
+            alignment_state.get("mapping_matrix"),
+        )
+        backbone_alignment_state = {
+            "mapping_matrix": backbone_mapping,
+        }
+        backbone_handoff_step = apply_alignment(current_latent_step, backbone_alignment_state).to(
+            device=agent_b_device,
+            dtype=handoff_step.dtype,
         )
         pre_alignment_l2_distance = float(
-            _normalized_l2_distance(current_latent_step, receiver_reference_in_sender)
+            _normalized_l2_distance(backbone_handoff_step, receiver_reference_handoff_for_metrics)
             .mean()
             .detach()
             .cpu()
             .item()
         )
         pre_alignment_cosine_distance = float(
-            _cosine_distance(current_latent_step, receiver_reference_in_sender)
+            _cosine_distance(backbone_handoff_step, receiver_reference_handoff_for_metrics)
             .mean()
             .detach()
             .cpu()
             .item()
         )
         post_alignment_l2_distance = float(
-            _normalized_l2_distance(handoff_step, receiver_reference_handoff)
+            _normalized_l2_distance(handoff_step, receiver_reference_handoff_for_metrics)
             .mean()
             .detach()
             .cpu()
             .item()
         )
         post_alignment_cosine_distance = float(
-            _cosine_distance(handoff_step, receiver_reference_handoff)
+            _cosine_distance(handoff_step, receiver_reference_handoff_for_metrics)
             .mean()
             .detach()
             .cpu()
             .item()
         )
-        receiver_reference_handoff_cpu = receiver_reference_handoff.detach().cpu()
 
-    generated_token_ids: list[int] = []
-    eos_token_id = tokenizer_b.eos_token_id
-
-    for _ in range(cfg.max_new_tokens):
-        next_token = torch.argmax(outputs_b.logits[:, -1, :], dim=-1)
-        next_token_id = int(next_token.item())
-        if eos_token_id is not None and next_token_id == eos_token_id:
-            break
-        generated_token_ids.append(next_token_id)
-
-        kv_cache_b = _normalize_kv_cache(outputs_b.past_key_values)
-        attention_mask_b = torch.cat(
-            [
-                attention_mask_b,
-                torch.ones(
-                    (attention_mask_b.shape[0], 1),
-                    dtype=attention_mask_b.dtype,
-                    device=attention_mask_b.device,
-                ),
-            ],
-            dim=1,
+    answer_metrics = compute_answer_metrics_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        answer_text=target_answer_text,
+    )
+    decode_metrics = greedy_decode_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        max_new_tokens=int(cfg.max_new_tokens),
+    )
+    decoded_text = str(decode_metrics["decoded_text"])
+    decode_status = "decoded" if decoded_text.strip() else "empty_decode"
+    trace_events.append(
+        _trace_tensor_event(
+            operation="actor_decode",
+            tensor=handoff_step,
+            source_surface=handoff_surface,
+            target_surface="text",
+            model_id=str(cfg.agent_b_model),
+            kv_cache_status=kv_cache_status,
+            decode_status=decode_status,
+            diagnostics={
+                "kv_cache_status": kv_cache_status,
+                "kv_cache_reason": kv_cache_reason,
+                "decode_status": decode_status,
+                "generated_tokens": int(decode_metrics["generated_tokens"]),
+            },
         )
-        position_ids_b = _build_position_ids(attention_mask_b)[:, -1:]
-
-        with torch.no_grad():
-            outputs_b = agent_b(
-                input_ids=next_token.unsqueeze(-1),
-                past_key_values=kv_cache_b,
-                attention_mask=attention_mask_b,
-                position_ids=position_ids_b,
-                use_cache=True,
-                return_dict=True,
-            )
-
-    decoded_text = tokenizer_b.decode(generated_token_ids, skip_special_tokens=True)
+    )
     return {
         "decoded_text": decoded_text,
+        "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "decode_status": decode_status,
+        "handoff_status": handoff_status,
+        "handoff_surface": handoff_surface,
+        "kv_cache_status": kv_cache_status,
+        "kv_cache_reason": kv_cache_reason,
+        "trace_events": trace_events,
         "complexity_factor": complexity_factor,
-        "alignment_mode": state["alignment_mode"],
+        "dynamics_mode": dynamics_mode,
+        "alignment_mode": alignment_mode,
+        "alignment_strategy": alignment_state.get("alignment_strategy", alignment_mode),
         "semantic_anchor_count": int(state["semantic_anchor_count"]),
         "semantic_anchor_preview": semantic_anchor_strings[:10],
         "reasoning_layer_weights": reasoning_layer_weights,
@@ -1098,7 +1749,15 @@ def run_hybrid_pipeline(
         "consensus_latent_shape": tuple(consensus_hidden_states.shape),
         "final_latent_shape": tuple(current_latent_step.shape),
         "final_latent_dtype": str(current_latent_step.dtype),
-        "procrustes_q_shape": tuple(procrustes_q.shape),
+        "procrustes_q_shape": tuple(state["global_alignment_q"].shape),
+        "handoff_q_shape": tuple(
+            state.get("handoff_alignment_q", state["global_alignment_q"]).shape
+        ),
+        "alignment_bias_shape": tuple(state["global_alignment_bias"].shape),
+        "alignment_residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+        "alignment_bias_norm": alignment_state.get("bias_norm"),
+        "prompt_calibration_enabled": prompt_calibration_enabled,
+        "prompt_calibration_bias_norm": calibration_bias_norm,
         "pre_alignment_handoff": current_latent_step.detach().cpu(),
         "post_alignment_handoff": handoff_step.detach().cpu(),
         "aligned_continuous_trajectory": aligned_continuous_trajectory.detach().cpu(),
@@ -1108,12 +1767,16 @@ def run_hybrid_pipeline(
         "pre_alignment_cosine_distance": pre_alignment_cosine_distance,
         "post_alignment_l2_distance": post_alignment_l2_distance,
         "post_alignment_cosine_distance": post_alignment_cosine_distance,
+        "answer_token_count": answer_metrics["answer_token_count"],
+        "answer_nll": answer_metrics["answer_nll"],
+        "answer_perplexity": answer_metrics["answer_perplexity"],
         "kv_cache_length": _kv_cache_layer_count(kv_cache_a),
         "kv_cache_transferred": kv_cache_transferred,
         "continuous_integration_seconds": integration_duration,
         "continuous_integration_50_steps_seconds": integration_duration,
         "global_alignment_cache_hit": bool(state["global_alignment_cache_hit"]),
         "global_alignment_cache_path": str(state["global_alignment_cache_path"]),
+        "alignment_override_applied": alignment_q_override is not None,
     }
 
 
@@ -1126,9 +1789,15 @@ def main(cfg: DictConfig) -> None:
     print(f"Semantic anchor count: {alignment_metadata['semantic_anchor_count']}")
     print(f"Reasoning layer weights: {alignment_metadata['reasoning_layer_weights']}")
     print(f"Global Q shape: {alignment_metadata['q_global_shape']}")
+    print(f"Handoff Q shape: {alignment_metadata['handoff_q_shape']}")
+    print(f"Handoff surface: {alignment_metadata['handoff_surface']}")
     print(f"Global alignment cache hit: {alignment_metadata['global_alignment_cache_hit']}")
     outputs = run_hybrid_pipeline(cfg)
     print(f"Pipeline complexity factor: {outputs['complexity_factor']:.2f}")
+    print(f"Dynamics mode: {outputs['dynamics_mode']}")
+    print(f"Handoff status: {outputs['handoff_status']}")
+    print(f"KV cache status: {outputs['kv_cache_status']} ({outputs['kv_cache_reason']})")
+    print(f"Decode status: {outputs['decode_status']}")
     print(f"Handoff uncertainty: {outputs['handoff_uncertainty']:.4f}")
     print(f"Confidence gate triggered: {outputs['confidence_gate_triggered']}")
     print(f"Fallback discrete reasoning steps: {outputs['fallback_discrete_reasoning_steps']}")

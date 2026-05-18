@@ -3,12 +3,15 @@ from __future__ import annotations
 import torch
 
 from src.utils.alignment import (
+    apply_alignment,
     apply_linear_mapping,
+    compute_alignment_state,
     compute_cross_covariance,
     compute_orthogonal_mapping,
     compute_ridge_mapping,
     get_preferred_semantic_anchors,
     resolve_shared_semantic_anchor_ids,
+    score_anchor_stability,
 )
 
 
@@ -76,6 +79,123 @@ def test_compute_ridge_mapping_matches_identity_for_identical_anchor_spaces() ->
 
     assert mapping.shape == (2, 2)
     assert torch.allclose(transformed, source, atol=1e-4)
+
+
+def test_compute_alignment_state_matches_orthogonal_solver_when_hybrid_features_disabled() -> None:
+    sender = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    receiver = sender.clone()
+
+    orthogonal = compute_orthogonal_mapping(sender, receiver)
+    alignment_state = compute_alignment_state(
+        sender,
+        receiver,
+        strategy="orthogonal",
+        center=False,
+        use_bias=False,
+        adaptive_projection_strength=0.0,
+    )
+
+    assert torch.allclose(alignment_state["mapping_matrix"], orthogonal, atol=1e-6)
+    transformed = apply_alignment(sender, alignment_state)
+    assert torch.allclose(transformed, receiver, atol=1e-6)
+
+
+def test_hybrid_affine_alignment_reduces_mean_shift_error() -> None:
+    sender = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    receiver = (sender * 1.2) + torch.tensor([0.5, -0.25])
+
+    orthogonal_state = compute_alignment_state(
+        sender,
+        receiver,
+        strategy="orthogonal",
+        center=False,
+        use_bias=False,
+        adaptive_projection_strength=0.0,
+    )
+    hybrid_state = compute_alignment_state(
+        sender,
+        receiver,
+        strategy="hybrid_affine",
+        center=True,
+        use_bias=True,
+        regularization=1e-4,
+        residual_alpha=1.0,
+        residual_max_norm_ratio=0.5,
+        adaptive_projection_strength=0.0,
+    )
+
+    orthogonal_error = torch.mean((apply_alignment(sender, orthogonal_state) - receiver) ** 2)
+    hybrid_error = torch.mean((apply_alignment(sender, hybrid_state) - receiver) ** 2)
+
+    assert hybrid_error < orthogonal_error
+
+
+def test_hybrid_affine_residual_norm_cap_is_enforced() -> None:
+    sender = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    receiver = torch.tensor(
+        [
+            [0.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 0.25],
+            [3.0, 0.25],
+        ]
+    )
+    alignment_state = compute_alignment_state(
+        sender,
+        receiver,
+        strategy="hybrid_affine",
+        center=True,
+        use_bias=True,
+        residual_alpha=4.0,
+        residual_max_norm_ratio=0.1,
+        adaptive_projection_strength=0.0,
+    )
+
+    assert alignment_state["residual_norm_ratio"] <= 0.1001
+
+
+def test_score_anchor_stability_returns_cpu_rank_statistics() -> None:
+    sender = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    receiver = sender + torch.tensor([0.2, -0.1])
+
+    stability = score_anchor_stability(
+        sender,
+        receiver,
+        strategy="hybrid_affine",
+        bootstrap_count=2,
+        seed=7,
+    )
+
+    assert stability["combined_score"].device.type == "cpu"
+    assert stability["oob_reconstruction_error"].device.type == "cpu"
+    assert stability["combined_score"].shape == (4,)
 
 
 class _FakeTokenizer:

@@ -10,12 +10,19 @@ import torch
 import torch.nn.functional as F
 import wandb
 from latent_pipeline import load_or_compute_global_alignment_state
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from transformers import AutoModelForCausalLM
 
-from src.models.losses import LatentCompressorLoss
-from src.utils.alignment import apply_orthogonal_mapping
+from src.models.hidden_state import AdaptiveProjection, CurriculumStage, HiddenStateProcessor
+from src.models.losses import (
+    AdaptiveLossBalancer,
+    AdaptiveLossBalancerConfig,
+    LatentCompressorLoss,
+    compute_plan_similarity_loss,
+    compute_random_contrast_loss,
+)
+from src.utils.alignment import apply_alignment
 
 EvaluationFn = Callable[[AutoModelForCausalLM, AutoModelForCausalLM, dict[str, Any]], dict[str, float]]
 
@@ -39,11 +46,31 @@ class CompressionTrainConfig:
     checkpoint_every_n_steps: int = 0
     reasoner_max_length: int = 128
     actor_max_length: int = 128
+    lambda_plan: float = 0.25
+    lambda_contrast: float = 0.1
+    contrast_temperature: float = 0.1
+    curriculum_enabled: bool = True
+    curriculum_stages: tuple[str, ...] = ("identity", "orthogonal", "hybrid_affine")
+    curriculum_boundaries: tuple[float, ...] = (0.33, 0.66, 1.0)
+    adaptive_loss_enabled: bool = True
+    adaptive_loss_ema_beta: float = 0.9
+    adaptive_loss_min_weight: float = 0.25
+    adaptive_loss_max_weight: float = 4.0
+    adaptive_projection_enabled: bool = True
+    adaptive_projection_strength: float = 0.15
+    adaptive_projection_clip_std_multiplier: float = 4.0
+    hidden_state_processor_enabled: bool = False
+    hidden_state_processor_num_heads: int = 4
+    hidden_state_processor_dropout: float = 0.0
 
     @classmethod
     def from_cfg(cls, cfg: DictConfig) -> "CompressionTrainConfig":
         t = cfg.training
         wandb_cfg = getattr(t, "wandb", None)
+        curriculum_cfg = getattr(t, "curriculum", None)
+        adaptive_loss_cfg = getattr(t, "adaptive_loss", None)
+        projection_cfg = getattr(t, "adaptive_projection", None)
+        processor_cfg = getattr(t, "hidden_state_processor", None)
         return cls(
             compressed_steps=t.compressed_steps,
             learning_rate=t.learning_rate,
@@ -62,6 +89,28 @@ class CompressionTrainConfig:
             checkpoint_every_n_steps=int(ckpt_cfg.save_every_n_steps) if ckpt_cfg else 0,
             reasoner_max_length=int(getattr(t, "reasoner_max_length", 128)),
             actor_max_length=int(getattr(t, "actor_max_length", 128)),
+            lambda_plan=float(getattr(t, "lambda_plan", 0.25)),
+            lambda_contrast=float(getattr(t, "lambda_contrast", 0.1)),
+            contrast_temperature=float(getattr(t, "contrast_temperature", 0.1)),
+            curriculum_enabled=bool(getattr(curriculum_cfg, "enabled", True)) if curriculum_cfg else True,
+            curriculum_stages=tuple(
+                str(stage) for stage in getattr(curriculum_cfg, "stages", ("identity", "orthogonal", "hybrid_affine"))
+            ) if curriculum_cfg else ("identity", "orthogonal", "hybrid_affine"),
+            curriculum_boundaries=tuple(
+                float(value) for value in getattr(curriculum_cfg, "boundaries", (0.33, 0.66, 1.0))
+            ) if curriculum_cfg else (0.33, 0.66, 1.0),
+            adaptive_loss_enabled=bool(getattr(adaptive_loss_cfg, "enabled", True)) if adaptive_loss_cfg else True,
+            adaptive_loss_ema_beta=float(getattr(adaptive_loss_cfg, "ema_beta", 0.9)) if adaptive_loss_cfg else 0.9,
+            adaptive_loss_min_weight=float(getattr(adaptive_loss_cfg, "min_weight", 0.25)) if adaptive_loss_cfg else 0.25,
+            adaptive_loss_max_weight=float(getattr(adaptive_loss_cfg, "max_weight", 4.0)) if adaptive_loss_cfg else 4.0,
+            adaptive_projection_enabled=bool(getattr(projection_cfg, "enabled", True)) if projection_cfg else True,
+            adaptive_projection_strength=float(getattr(projection_cfg, "strength", 0.15)) if projection_cfg else 0.15,
+            adaptive_projection_clip_std_multiplier=float(
+                getattr(projection_cfg, "clip_std_multiplier", 4.0)
+            ) if projection_cfg else 4.0,
+            hidden_state_processor_enabled=bool(getattr(processor_cfg, "enabled", False)) if processor_cfg else False,
+            hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
+            hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
         )
 
 def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int) -> torch.Tensor:
@@ -129,6 +178,54 @@ def _tokenize_text_batch(
     }
 
 
+def _curriculum_schedule(config: CompressionTrainConfig) -> tuple[CurriculumStage, ...]:
+    stage_specs: list[CurriculumStage] = []
+    for stage_name, upper_bound in zip(config.curriculum_stages, config.curriculum_boundaries):
+        normalized_name = str(stage_name).strip().lower()
+        if normalized_name == "identity":
+            stage_specs.append(
+                CurriculumStage(
+                    name="identity",
+                    progress_upper_bound=float(upper_bound),
+                    alignment_strategy="identity",
+                    prompt_calibration_enabled=False,
+                )
+            )
+        elif normalized_name == "orthogonal":
+            stage_specs.append(
+                CurriculumStage(
+                    name="orthogonal",
+                    progress_upper_bound=float(upper_bound),
+                    alignment_strategy="orthogonal",
+                    prompt_calibration_enabled=False,
+                )
+            )
+        elif normalized_name == "hybrid_affine":
+            stage_specs.append(
+                CurriculumStage(
+                    name="hybrid_affine",
+                    progress_upper_bound=float(upper_bound),
+                    alignment_strategy="hybrid_affine",
+                    prompt_calibration_enabled=True,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported curriculum stage {stage_name!r}")
+    if not stage_specs:
+        raise ValueError("At least one curriculum stage is required")
+    return tuple(stage_specs)
+
+
+def _resolve_curriculum_stage(
+    stages: Sequence[CurriculumStage],
+    progress_ratio: float,
+) -> CurriculumStage:
+    for stage in stages:
+        if progress_ratio <= stage.progress_upper_bound:
+            return stage
+    return stages[-1]
+
+
 def _identity_alignment_mapping(
     reasoner_model: AutoModelForCausalLM,
     actor_model: AutoModelForCausalLM,
@@ -142,6 +239,18 @@ def _identity_alignment_mapping(
     return torch.eye(reasoner_dim, dtype=torch.float32)
 
 
+def _identity_alignment_state(
+    reasoner_model: AutoModelForCausalLM,
+    actor_model: AutoModelForCausalLM,
+) -> dict[str, Any]:
+    identity = _identity_alignment_mapping(reasoner_model, actor_model)
+    return {
+        "mapping_matrix": identity,
+        "mapping_bias": torch.zeros((1, identity.shape[-1]), dtype=torch.float32),
+        "alignment_strategy": "identity",
+    }
+
+
 def _supports_cached_alignment(model: AutoModelForCausalLM) -> bool:
     return hasattr(model, "model") and hasattr(model.model, "layers")
 
@@ -153,34 +262,98 @@ def resolve_training_alignment_context(
     reasoner_tokenizer: Any,
     actor_tokenizer: Any,
     alignment_cfg: Optional[DictConfig],
+    strategy_override: Optional[str] = None,
+    prompt_calibration_enabled: Optional[bool] = None,
 ) -> dict[str, Any]:
+    effective_cfg = alignment_cfg
+    if alignment_cfg is not None and (strategy_override is not None or prompt_calibration_enabled is not None):
+        effective_cfg = OmegaConf.create(OmegaConf.to_container(alignment_cfg, resolve=True))
+        if strategy_override is not None:
+            effective_cfg.alignment.strategy = str(strategy_override)
+        if prompt_calibration_enabled is not None:
+            effective_cfg.alignment.prompt_calibration.enabled = bool(prompt_calibration_enabled)
     if (
-        alignment_cfg is not None
+        effective_cfg is not None
         and reasoner_tokenizer is not None
         and actor_tokenizer is not None
         and _supports_cached_alignment(reasoner_model)
         and _supports_cached_alignment(actor_model)
     ):
         alignment_state = load_or_compute_global_alignment_state(
-            alignment_cfg,
+            effective_cfg,
             tokenizer_a=reasoner_tokenizer,
             tokenizer_b=actor_tokenizer,
             agent_a=reasoner_model,
             agent_b=actor_model,
         )
+        handoff_mapping = alignment_state.get(
+            "handoff_alignment_q",
+            alignment_state["global_alignment_q"],
+        )
+        handoff_bias = alignment_state.get(
+            "handoff_alignment_bias",
+            alignment_state.get("global_alignment_bias"),
+        )
         return {
-            "alignment_q": alignment_state["global_alignment_q"],
+            "alignment_q": handoff_mapping,
+            "alignment_state": {
+                "mapping_matrix": handoff_mapping,
+                "mapping_bias": handoff_bias,
+                "pre_projection_state": alignment_state.get(
+                    "handoff_pre_projection_state",
+                    alignment_state.get("pre_projection_state"),
+                ),
+                "post_projection_state": alignment_state.get(
+                    "handoff_post_projection_state",
+                    alignment_state.get("post_projection_state"),
+                ),
+                "alignment_strategy": alignment_state.get("alignment_strategy", alignment_state["alignment_mode"]),
+                "orthogonal_q": alignment_state.get(
+                    "handoff_alignment_backbone_q",
+                    alignment_state.get("global_alignment_backbone_q"),
+                ),
+                "residual_matrix": alignment_state.get("handoff_alignment_residual"),
+                "residual_norm_ratio": alignment_state.get(
+                    "handoff_residual_norm_ratio",
+                    alignment_state.get("residual_norm_ratio"),
+                ),
+                "bias_norm": alignment_state.get("handoff_bias_norm", alignment_state.get("bias_norm")),
+            },
+            "diagnostic_alignment_state": {
+                "mapping_matrix": alignment_state["global_alignment_q"],
+                "mapping_bias": alignment_state.get("global_alignment_bias"),
+                "pre_projection_state": alignment_state.get("pre_projection_state"),
+                "post_projection_state": alignment_state.get("post_projection_state"),
+                "alignment_strategy": alignment_state.get("alignment_strategy", alignment_state["alignment_mode"]),
+                "orthogonal_q": alignment_state.get("global_alignment_backbone_q"),
+                "residual_matrix": alignment_state.get("global_alignment_residual"),
+                "residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+                "bias_norm": alignment_state.get("bias_norm"),
+            },
             "alignment_mode": alignment_state["alignment_mode"],
+            "handoff_surface": alignment_state.get("handoff_surface", "input_embedding"),
+            "diagnostic_surface": alignment_state.get("diagnostic_surface", "hidden_consensus"),
             "global_alignment_cache_key": alignment_state["global_alignment_cache_key"],
             "global_alignment_cache_hit": bool(alignment_state["global_alignment_cache_hit"]),
             "global_alignment_cache_path": str(alignment_state["global_alignment_cache_path"]),
             "reasoning_layer_indices": tuple(alignment_state["global_reasoning_layer_indices"]),
             "reasoning_layer_weights": tuple(alignment_state["global_reasoning_layer_weights"]),
             "semantic_anchor_count": int(alignment_state["semantic_anchor_count"]),
+            "selected_anchor_indices": tuple(alignment_state.get("selected_anchor_indices", ())),
+            "alignment_strategy": alignment_state.get("alignment_strategy", alignment_state["alignment_mode"]),
+            "anchor_reconstruction_mse": alignment_state.get(
+                "handoff_anchor_reconstruction_mse",
+                alignment_state.get("anchor_reconstruction_mse"),
+            ),
+            "anchor_pairwise_distance_distortion": alignment_state.get(
+                "handoff_anchor_pairwise_distance_distortion",
+                alignment_state.get("anchor_pairwise_distance_distortion"),
+            ),
         }
 
     return {
         "alignment_q": _identity_alignment_mapping(reasoner_model, actor_model),
+        "alignment_state": _identity_alignment_state(reasoner_model, actor_model),
         "alignment_mode": "identity_fallback",
         "global_alignment_cache_key": None,
         "global_alignment_cache_hit": False,
@@ -188,6 +361,10 @@ def resolve_training_alignment_context(
         "reasoning_layer_indices": (),
         "reasoning_layer_weights": (),
         "semantic_anchor_count": 0,
+        "selected_anchor_indices": (),
+        "alignment_strategy": "identity",
+        "anchor_reconstruction_mse": None,
+        "anchor_pairwise_distance_distortion": None,
     }
 
 
@@ -229,8 +406,31 @@ def train_reasoner_stage2(
         lambda_geom=config.lambda_geom,
         eps=config.eps,
     )
+    adaptive_projection = (
+        AdaptiveProjection(
+            strength=config.adaptive_projection_strength,
+            clip_std_multiplier=config.adaptive_projection_clip_std_multiplier,
+        )
+        if config.adaptive_projection_enabled
+        else None
+    )
+    actor_hidden_size = int(actor_model.get_input_embeddings().weight.shape[-1])
+    hidden_state_processor = (
+        HiddenStateProcessor(
+            actor_hidden_size,
+            num_heads=config.hidden_state_processor_num_heads,
+            dropout=config.hidden_state_processor_dropout,
+        )
+        if config.hidden_state_processor_enabled
+        else None
+    )
+    if hidden_state_processor is not None:
+        hidden_state_processor.train()
     optimizer = torch.optim.AdamW(
-        (p for p in reasoner_model.parameters() if p.requires_grad),
+        (
+            list(p for p in reasoner_model.parameters() if p.requires_grad)
+            + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
+        ),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -238,20 +438,67 @@ def train_reasoner_stage2(
     reasoner_device = _model_device(reasoner_model)
     actor_device = _model_device(actor_model)
     reasoner_backbone = _model_backbone(reasoner_model)
-    alignment_context = resolve_training_alignment_context(
-        reasoner_model=reasoner_model,
-        actor_model=actor_model,
-        reasoner_tokenizer=reasoner_tokenizer,
-        actor_tokenizer=actor_tokenizer,
-        alignment_cfg=alignment_cfg,
+    if hidden_state_processor is not None:
+        hidden_state_processor.to(reasoner_device)
+    curriculum_stages = _curriculum_schedule(config) if config.curriculum_enabled else (
+        CurriculumStage(
+            name="default",
+            progress_upper_bound=1.0,
+            alignment_strategy=str(getattr(getattr(alignment_cfg, "alignment", None), "strategy", "hybrid_affine")),
+            prompt_calibration_enabled=False,
+        ),
     )
-    procrustes_q = alignment_context["alignment_q"].to(
-        device=reasoner_device,
-        dtype=reasoner_model.get_input_embeddings().weight.dtype,
+    alignment_context_cache: dict[str, dict[str, Any]] = {}
+    for stage in curriculum_stages:
+        if stage.alignment_strategy == "identity":
+            try:
+                alignment_context_cache[stage.name] = resolve_training_alignment_context(
+                    reasoner_model=reasoner_model,
+                    actor_model=actor_model,
+                    reasoner_tokenizer=reasoner_tokenizer,
+                    actor_tokenizer=actor_tokenizer,
+                    alignment_cfg=None,
+                )
+            except ValueError:
+                alignment_context_cache[stage.name] = resolve_training_alignment_context(
+                    reasoner_model=reasoner_model,
+                    actor_model=actor_model,
+                    reasoner_tokenizer=reasoner_tokenizer,
+                    actor_tokenizer=actor_tokenizer,
+                    alignment_cfg=alignment_cfg,
+                    strategy_override="orthogonal",
+                    prompt_calibration_enabled=False,
+                )
+            continue
+        alignment_context_cache[stage.name] = resolve_training_alignment_context(
+            reasoner_model=reasoner_model,
+            actor_model=actor_model,
+            reasoner_tokenizer=reasoner_tokenizer,
+            actor_tokenizer=actor_tokenizer,
+            alignment_cfg=alignment_cfg,
+            strategy_override=stage.alignment_strategy,
+            prompt_calibration_enabled=stage.prompt_calibration_enabled,
+        )
+    latest_alignment_context = alignment_context_cache[curriculum_stages[-1].name]
+    loss_balancer = AdaptiveLossBalancer(
+        {
+            "l_task": config.lambda_task,
+            "l_pref": config.lambda_pref,
+            "l_geom": config.lambda_geom,
+            "l_plan": config.lambda_plan,
+            "l_contrast": config.lambda_contrast,
+        },
+        config=AdaptiveLossBalancerConfig(
+            enabled=config.adaptive_loss_enabled,
+            ema_beta=config.adaptive_loss_ema_beta,
+            min_weight=config.adaptive_loss_min_weight,
+            max_weight=config.adaptive_loss_max_weight,
+        ),
     )
 
     history: list[dict[str, float]] = []
     global_step = 0
+    total_training_steps = max(1, int(config.num_epochs) * max(1, len(train_dataloader)))
 
     if config.checkpoint_enabled:
         ckpt_dir = Path(config.checkpoint_dir)
@@ -259,6 +506,14 @@ def train_reasoner_stage2(
 
     for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
+            progress_ratio = min(
+                1.0,
+                float(global_step + 1) / float(total_training_steps),
+            )
+            stage = _resolve_curriculum_stage(curriculum_stages, progress_ratio)
+            alignment_context = alignment_context_cache[stage.name]
+            latest_alignment_context = alignment_context
+            alignment_state = alignment_context["alignment_state"]
             texts = _extract_text_batch(batch)
             reasoner_batch = _tokenize_text_batch(
                 reasoner_tokenizer,
@@ -290,8 +545,20 @@ def train_reasoner_stage2(
             )
 
             # Apply alignment mapping to transfer to Actor's space
-            full_latents_aligned = apply_orthogonal_mapping(full_latents, procrustes_q)
-            compressed_latents_aligned = apply_orthogonal_mapping(compressed_latents, procrustes_q)
+            full_latents_aligned = apply_alignment(full_latents, alignment_state)
+            compressed_latents_aligned = apply_alignment(compressed_latents, alignment_state)
+            projection_metrics = {
+                "projection_scale_mean": 1.0,
+                "projection_scale_std": 0.0,
+                "projection_clip_fraction": 0.0,
+            }
+            if adaptive_projection is not None:
+                compressed_latents_aligned, projection_metrics = adaptive_projection(
+                    compressed_latents_aligned,
+                    full_latents_aligned.detach(),
+                )
+            if hidden_state_processor is not None:
+                compressed_latents_aligned = hidden_state_processor(compressed_latents_aligned)
 
             full_attention = torch.ones(
                 (full_latents.size(0), full_latents.size(1)),
@@ -332,19 +599,52 @@ def train_reasoner_stage2(
                 compressed_latents=compressed_latents,
                 actor_labels=actor_labels,
             )
+            l_plan = compute_plan_similarity_loss(
+                full_latents_aligned.detach(),
+                compressed_latents_aligned,
+            )
+            l_contrast = compute_random_contrast_loss(
+                full_latents_aligned.detach(),
+                compressed_latents_aligned,
+                temperature=config.contrast_temperature,
+            )
+            total_loss, effective_weights = loss_balancer.combine(
+                {
+                    "l_task": loss_outputs["l_task"],
+                    "l_pref": loss_outputs["l_pref"],
+                    "l_geom": loss_outputs["l_geom"],
+                    "l_plan": l_plan,
+                    "l_contrast": l_contrast,
+                }
+            )
 
             optimizer.zero_grad(set_to_none=True)
-            loss_outputs["loss"].backward()
+            total_loss.backward()
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
+            if hidden_state_processor is not None:
+                nn.utils.clip_grad_norm_(hidden_state_processor.parameters(), config.max_grad_norm)
             optimizer.step()
 
             metrics = {
                 "epoch": float(epoch),
                 "step": float(step),
-                "loss": float(loss_outputs["loss"].detach().cpu().item()),
+                "loss": float(total_loss.detach().cpu().item()),
                 "l_task": float(loss_outputs["l_task"].detach().cpu().item()),
                 "l_pref": float(loss_outputs["l_pref"].detach().cpu().item()),
                 "l_geom": float(loss_outputs["l_geom"].detach().cpu().item()),
+                "l_plan": float(l_plan.detach().cpu().item()),
+                "l_contrast": float(l_contrast.detach().cpu().item()),
+                "effective_weight_task": effective_weights["l_task"],
+                "effective_weight_pref": effective_weights["l_pref"],
+                "effective_weight_geom": effective_weights["l_geom"],
+                "effective_weight_plan": effective_weights["l_plan"],
+                "effective_weight_contrast": effective_weights["l_contrast"],
+                "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
+                "projection_scale_mean": projection_metrics["projection_scale_mean"],
+                "projection_scale_std": projection_metrics["projection_scale_std"],
+                "projection_clip_fraction": projection_metrics["projection_clip_fraction"],
+                "alignment_residual_norm_ratio": float(alignment_context.get("alignment_state", {}).get("residual_norm_ratio", 0.0) or 0.0),
+                "alignment_anchor_reconstruction_mse": float(alignment_context.get("anchor_reconstruction_mse") or 0.0),
                 "pref_avg_entropy": float(loss_outputs["pref_avg_entropy"].detach().cpu().item()),
                 "pref_avg_weight": float(loss_outputs["pref_avg_weight"].detach().cpu().item()),
                 "pref_first_token_entropy": float(
@@ -381,6 +681,18 @@ def train_reasoner_stage2(
                         "l_task": metrics["l_task"],
                         "l_pref": metrics["l_pref"],
                         "l_geom": metrics["l_geom"],
+                        "l_plan": metrics["l_plan"],
+                        "l_contrast": metrics["l_contrast"],
+                        "effective_weight_task": metrics["effective_weight_task"],
+                        "effective_weight_pref": metrics["effective_weight_pref"],
+                        "effective_weight_geom": metrics["effective_weight_geom"],
+                        "effective_weight_plan": metrics["effective_weight_plan"],
+                        "effective_weight_contrast": metrics["effective_weight_contrast"],
+                        "projection_scale_mean": metrics["projection_scale_mean"],
+                        "projection_scale_std": metrics["projection_scale_std"],
+                        "projection_clip_fraction": metrics["projection_clip_fraction"],
+                        "alignment_residual_norm_ratio": metrics["alignment_residual_norm_ratio"],
+                        "alignment_anchor_reconstruction_mse": metrics["alignment_anchor_reconstruction_mse"],
                         "pref_avg_entropy": metrics["pref_avg_entropy"],
                         "pref_avg_weight": metrics["pref_avg_weight"],
                         "pref_first_token_entropy": metrics["pref_first_token_entropy"],
@@ -397,7 +709,21 @@ def train_reasoner_stage2(
             if config.checkpoint_enabled and config.checkpoint_every_n_steps > 0:
                 if global_step % config.checkpoint_every_n_steps == 0:
                     step_path = ckpt_dir / f"step_{global_step}.pt"
-                    torch.save(reasoner_model.state_dict(), step_path)
+                    torch.save(
+                        {
+                            "reasoner_state_dict": reasoner_model.state_dict(),
+                            "hidden_state_processor_state_dict": None
+                            if hidden_state_processor is None
+                            else hidden_state_processor.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "training_config": dataclasses.asdict(config),
+                            "alignment_context": alignment_context,
+                            "curriculum_stage": stage.name,
+                            "global_step": global_step,
+                            "history_tail": history[-10:],
+                        },
+                        step_path,
+                    )
                     print(f"Saved checkpoint: {step_path}")
 
             global_step += 1
@@ -405,7 +731,7 @@ def train_reasoner_stage2(
         if evaluation_fn is not None:
             evaluation_metrics = {
                 key: float(value)
-                for key, value in evaluation_fn(reasoner_model, actor_model, alignment_context).items()
+                for key, value in evaluation_fn(reasoner_model, actor_model, latest_alignment_context).items()
             }
             eval_history_entry = {
                 "epoch": float(epoch),
@@ -418,7 +744,22 @@ def train_reasoner_stage2(
 
         if config.checkpoint_enabled:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"
-            torch.save(reasoner_model.state_dict(), epoch_path)
+            torch.save(
+                {
+                    "reasoner_state_dict": reasoner_model.state_dict(),
+                    "hidden_state_processor_state_dict": None
+                    if hidden_state_processor is None
+                    else hidden_state_processor.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "training_config": dataclasses.asdict(config),
+                    "alignment_context": latest_alignment_context,
+                    "curriculum_stages": [dataclasses.asdict(stage) for stage in curriculum_stages],
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "history_tail": history[-25:],
+                },
+                epoch_path,
+            )
             print(f"Saved checkpoint: {epoch_path}")
 
     if config.wandb_enabled:

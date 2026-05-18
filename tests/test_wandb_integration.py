@@ -66,7 +66,7 @@ class _TinyTokenizer:
 
 def test_wandb_config_fields_parsed_from_yaml() -> None:
     config = CompressionTrainConfig.from_cfg(_CFG)
-    assert config.wandb_enabled is True
+    assert config.wandb_enabled is False
     assert config.wandb_project == "lxp-stage2"
     assert config.wandb_entity is None
     assert config.reasoner_max_length == 96
@@ -388,9 +388,11 @@ def test_epoch_checkpoint_saved(mock_wandb) -> None:
 
         assert (Path(tmp) / "epoch_0.pt").exists()
         assert (Path(tmp) / "epoch_1.pt").exists()
-        state = torch.load(Path(tmp) / "epoch_1.pt", weights_only=True)
+        state = torch.load(Path(tmp) / "epoch_1.pt")
         assert isinstance(state, dict)
-        assert len(state) > 0
+        assert "reasoner_state_dict" in state
+        assert "optimizer_state_dict" in state
+        assert "alignment_context" in state
 
 
 @patch("train_compressor.wandb")

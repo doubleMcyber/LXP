@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+REPORT_SCHEMA_VERSION = 2
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
+    "report_schema_version",
     "evaluation_surface",
     "suite",
     "method",
     "dataset",
+    "dataset_split",
     "repetition",
+    "seed",
     "sample_index",
     "agent_a_model",
     "agent_b_model",
@@ -21,18 +26,31 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "semantic_anchor_count",
     "reasoning_layer_weights",
     "alignment_mode",
+    "alignment_strategy",
+    "handoff_status",
+    "handoff_surface",
     "kv_cache_transferred",
+    "kv_cache_status",
+    "kv_cache_reason",
+    "decode_status",
     "prompt",
     "target_answer",
     "predicted_answer",
     "decoded_text",
     "generated_tokens",
+    "answer_token_count",
+    "answer_nll",
+    "answer_perplexity",
     "correct",
     "latency_seconds",
     "pre_alignment_l2_distance",
     "pre_alignment_cosine_distance",
     "post_alignment_l2_distance",
     "post_alignment_cosine_distance",
+    "alignment_residual_norm_ratio",
+    "alignment_bias_norm",
+    "prompt_calibration_enabled",
+    "prompt_calibration_bias_norm",
     "raw_handoff_entropy",
     "handoff_uncertainty",
     "confidence_gate_triggered",
@@ -40,21 +58,31 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "latent_trajectory_steps",
     "total_reasoning_steps",
     "continuous_integration_seconds",
+    "global_alignment_cache_hit",
     "error",
 ]
 STANDARD_SUMMARY_FIELDS: list[str] = [
+    "report_schema_version",
     "evaluation_surface",
     "suite",
     "method",
     "dataset",
+    "dataset_split",
     "agent_a_model",
     "agent_b_model",
     "model_pair",
     "torch_dtype",
+    "seed",
     "compression_steps",
     "semantic_anchor_count",
     "reasoning_layer_weights",
     "alignment_mode",
+    "alignment_strategy",
+    "handoff_status",
+    "handoff_surface",
+    "kv_cache_status",
+    "kv_cache_reason",
+    "decode_status",
     "repetition_count",
     "sample_count",
     "accuracy_percentage",
@@ -62,14 +90,25 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "average_latency_seconds",
     "total_generated_tokens",
     "tokens_per_second",
+    "total_answer_tokens",
+    "mean_answer_nll",
+    "answer_perplexity",
     "mean_pre_alignment_l2_distance",
     "mean_pre_alignment_cosine_distance",
     "mean_post_alignment_l2_distance",
     "mean_post_alignment_cosine_distance",
+    "mean_alignment_residual_norm_ratio",
+    "mean_alignment_bias_norm",
+    "prompt_calibration_rate_percentage",
+    "mean_prompt_calibration_bias_norm",
     "mean_raw_handoff_entropy",
     "mean_handoff_uncertainty",
     "confidence_gate_trigger_rate_percentage",
     "cache_transfer_rate_percentage",
+    "global_alignment_cache_hit_rate_percentage",
+    "explicit_status_rate_percentage",
+    "handoff_ok_rate_percentage",
+    "empty_decode_rate_percentage",
     "non_empty_decoded_rate_percentage",
     "failure_rate_percentage",
     "error_count",
@@ -100,11 +139,14 @@ def build_standard_row_base(
     suite: str,
     method: str,
     dataset: str,
+    dataset_split: str,
     repetition: int,
     compression_steps: Optional[int] = None,
     alignment_mode: Optional[str] = None,
+    alignment_strategy: Optional[str] = None,
     semantic_anchor_count: Optional[int] = None,
     reasoning_layer_weights: Optional[Sequence[float] | str] = None,
+    seed: Optional[int] = None,
 ) -> dict[str, Any]:
     if compression_steps is None:
         compression_steps = int(
@@ -114,15 +156,20 @@ def build_standard_row_base(
         semantic_anchor_count = int(_cfg_value(cfg, "alignment.semantic_anchor_count", 0))
     if reasoning_layer_weights is None:
         reasoning_layer_weights = _cfg_value(cfg, "alignment.reasoning_layer_weights", ())
+    if seed is None:
+        seed = int(_cfg_value(cfg, "seed", 0))
 
     agent_a_model = str(_cfg_value(cfg, "agent_a_model", ""))
     agent_b_model = str(_cfg_value(cfg, "agent_b_model", ""))
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "evaluation_surface": evaluation_surface,
         "suite": suite,
         "method": method,
         "dataset": dataset,
+        "dataset_split": dataset_split,
         "repetition": int(repetition),
+        "seed": int(seed),
         "agent_a_model": agent_a_model,
         "agent_b_model": agent_b_model,
         "model_pair": f"{agent_a_model} -> {agent_b_model}",
@@ -131,6 +178,7 @@ def build_standard_row_base(
         "semantic_anchor_count": int(semantic_anchor_count),
         "reasoning_layer_weights": serialize_reasoning_layer_weights(reasoning_layer_weights),
         "alignment_mode": "" if alignment_mode is None else str(alignment_mode),
+        "alignment_strategy": "" if alignment_strategy is None else str(alignment_strategy),
     }
 
 
@@ -145,6 +193,17 @@ def _mean_or_none(rows: Sequence[dict[str, Any]], field: str) -> Optional[float]
     return sum(values) / len(values)
 
 
+def _unique_join(rows: Sequence[dict[str, Any]], field: str) -> str:
+    values = sorted(
+        {
+            str(row.get(field))
+            for row in rows
+            if row.get(field) is not None and row.get(field) != ""
+        }
+    )
+    return ",".join(values)
+
+
 def aggregate_standard_rows(
     rows: Sequence[dict[str, Any]],
     *,
@@ -152,18 +211,22 @@ def aggregate_standard_rows(
 ) -> list[dict[str, Any]]:
     if group_fields is None:
         group_fields = (
+            "report_schema_version",
             "evaluation_surface",
             "suite",
             "method",
             "dataset",
+            "dataset_split",
             "agent_a_model",
             "agent_b_model",
             "model_pair",
             "torch_dtype",
+            "seed",
             "compression_steps",
             "semantic_anchor_count",
             "reasoning_layer_weights",
             "alignment_mode",
+            "alignment_strategy",
         )
 
     grouped_rows: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -178,15 +241,45 @@ def aggregate_standard_rows(
         error_count = sum(1 for row in group_rows if bool(row.get("error")))
         total_latency_seconds = sum(float(row.get("latency_seconds", 0.0)) for row in group_rows)
         total_generated_tokens = sum(int(row.get("generated_tokens", 0) or 0) for row in group_rows)
+        total_answer_tokens = sum(int(row.get("answer_token_count", 0) or 0) for row in group_rows)
+        total_answer_nll = sum(
+            float(row["answer_nll"]) * int(row.get("answer_token_count", 0) or 0)
+            for row in group_rows
+            if row.get("answer_nll") is not None and row.get("answer_nll") != ""
+        )
         kv_transfer_rows = [
             bool(row["kv_cache_transferred"])
             for row in group_rows
             if row.get("kv_cache_transferred") is not None and row.get("kv_cache_transferred") != ""
         ]
+        global_alignment_cache_rows = [
+            bool(row["global_alignment_cache_hit"])
+            for row in group_rows
+            if row.get("global_alignment_cache_hit") is not None and row.get("global_alignment_cache_hit") != ""
+        ]
         confidence_gate_rows = [
             bool(row["confidence_gate_triggered"])
             for row in group_rows
             if row.get("confidence_gate_triggered") is not None and row.get("confidence_gate_triggered") != ""
+        ]
+        prompt_calibration_rows = [
+            bool(row["prompt_calibration_enabled"])
+            for row in group_rows
+            if row.get("prompt_calibration_enabled") is not None and row.get("prompt_calibration_enabled") != ""
+        ]
+        explicit_status_rows = [
+            row for row in group_rows
+            if row.get("handoff_status") not in (None, "")
+            and row.get("kv_cache_status") not in (None, "")
+            and row.get("decode_status") not in (None, "")
+        ]
+        handoff_status_rows = [
+            str(row.get("handoff_status"))
+            for row in group_rows
+            if row.get("handoff_status") not in (None, "")
+        ]
+        empty_decode_rows = [
+            row for row in group_rows if str(row.get("decode_status", "")) == "empty_decode"
         ]
         non_empty_rows = [
             1 for row in group_rows if str(row.get("decoded_text", "")).strip()
@@ -196,6 +289,11 @@ def aggregate_standard_rows(
         summary_rows.append(
             {
                 **row_template,
+                "handoff_status": _unique_join(group_rows, "handoff_status"),
+                "handoff_surface": _unique_join(group_rows, "handoff_surface"),
+                "kv_cache_status": _unique_join(group_rows, "kv_cache_status"),
+                "kv_cache_reason": _unique_join(group_rows, "kv_cache_reason"),
+                "decode_status": _unique_join(group_rows, "decode_status"),
                 "repetition_count": len(repetitions),
                 "sample_count": sample_count,
                 "accuracy_percentage": (100.0 * correct_count / sample_count) if sample_count else 0.0,
@@ -205,10 +303,27 @@ def aggregate_standard_rows(
                 "tokens_per_second": (
                     total_generated_tokens / total_latency_seconds if total_latency_seconds > 0 else 0.0
                 ),
+                "total_answer_tokens": total_answer_tokens,
+                "mean_answer_nll": (
+                    total_answer_nll / total_answer_tokens if total_answer_tokens > 0 else None
+                ),
+                "answer_perplexity": (
+                    math.exp(total_answer_nll / total_answer_tokens)
+                    if total_answer_tokens > 0
+                    else None
+                ),
                 "mean_pre_alignment_l2_distance": _mean_or_none(group_rows, "pre_alignment_l2_distance"),
                 "mean_pre_alignment_cosine_distance": _mean_or_none(group_rows, "pre_alignment_cosine_distance"),
                 "mean_post_alignment_l2_distance": _mean_or_none(group_rows, "post_alignment_l2_distance"),
                 "mean_post_alignment_cosine_distance": _mean_or_none(group_rows, "post_alignment_cosine_distance"),
+                "mean_alignment_residual_norm_ratio": _mean_or_none(group_rows, "alignment_residual_norm_ratio"),
+                "mean_alignment_bias_norm": _mean_or_none(group_rows, "alignment_bias_norm"),
+                "prompt_calibration_rate_percentage": (
+                    100.0 * sum(1 for item in prompt_calibration_rows if item) / len(prompt_calibration_rows)
+                    if prompt_calibration_rows
+                    else None
+                ),
+                "mean_prompt_calibration_bias_norm": _mean_or_none(group_rows, "prompt_calibration_bias_norm"),
                 "mean_raw_handoff_entropy": _mean_or_none(group_rows, "raw_handoff_entropy"),
                 "mean_handoff_uncertainty": _mean_or_none(group_rows, "handoff_uncertainty"),
                 "confidence_gate_trigger_rate_percentage": (
@@ -220,6 +335,22 @@ def aggregate_standard_rows(
                     100.0 * sum(1 for item in kv_transfer_rows if item) / len(kv_transfer_rows)
                     if kv_transfer_rows
                     else None
+                ),
+                "global_alignment_cache_hit_rate_percentage": (
+                    100.0 * sum(1 for item in global_alignment_cache_rows if item) / len(global_alignment_cache_rows)
+                    if global_alignment_cache_rows
+                    else None
+                ),
+                "explicit_status_rate_percentage": (
+                    100.0 * len(explicit_status_rows) / sample_count if sample_count else 0.0
+                ),
+                "handoff_ok_rate_percentage": (
+                    100.0 * sum(1 for item in handoff_status_rows if item == "ok") / len(handoff_status_rows)
+                    if handoff_status_rows
+                    else None
+                ),
+                "empty_decode_rate_percentage": (
+                    100.0 * len(empty_decode_rows) / sample_count if sample_count else 0.0
                 ),
                 "non_empty_decoded_rate_percentage": (
                     100.0 * len(non_empty_rows) / sample_count if sample_count else 0.0
@@ -237,6 +368,7 @@ def aggregate_standard_rows(
 def write_csv(path: Path, rows: Sequence[dict[str, Any]], fieldnames: Sequence[str]) -> None:
     if not rows:
         raise ValueError("Cannot write an empty CSV")
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=list(fieldnames))
         writer.writeheader()
@@ -244,7 +376,45 @@ def write_csv(path: Path, rows: Sequence[dict[str, Any]], fieldnames: Sequence[s
 
 
 def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2))
+
+
+def build_runtime_smoke_report(
+    rows: Sequence[dict[str, Any]],
+    *,
+    max_error_count: int = 0,
+    require_explicit_statuses: bool = True,
+) -> dict[str, Any]:
+    error_count = sum(1 for row in rows if bool(row.get("error")))
+    missing_status_count = sum(
+        1
+        for row in rows
+        if row.get("handoff_status") in (None, "")
+        or row.get("kv_cache_status") in (None, "")
+        or row.get("decode_status") in (None, "")
+    )
+    missing_requirements: list[str] = []
+    if error_count > max_error_count:
+        missing_requirements.append(
+            f"Observed error count {error_count} exceeds allowed {max_error_count}."
+        )
+    if require_explicit_statuses and missing_status_count > 0:
+        missing_requirements.append(
+            f"{missing_status_count} rows are missing explicit runtime status fields."
+        )
+
+    return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "phase": "runtime_smoke",
+        "passed": not missing_requirements,
+        "sample_count": len(rows),
+        "max_error_count": max_error_count,
+        "observed_error_count": error_count,
+        "missing_status_count": missing_status_count,
+        "require_explicit_statuses": require_explicit_statuses,
+        "missing_requirements": missing_requirements,
+    }
 
 
 def build_phase1_gate_report(
@@ -316,38 +486,128 @@ def build_phase3_gate_report(
     summary_rows: Sequence[dict[str, Any]],
     *,
     require_q_global_beats_prompt_local: bool,
+    min_hybrid_accuracy_gain_over_text_text: float = 3.0,
+    max_accuracy_gap_for_perplexity_tie: float = 1.0,
+    min_perplexity_improvement_ratio: float = 0.10,
 ) -> dict[str, Any]:
-    summary_by_method = {str(row["method"]): row for row in summary_rows}
-    prompt_local = summary_by_method.get("prompt_local_latent")
-    global_anchor = summary_by_method.get("global_anchor_latent")
-    hybrid = summary_by_method.get("hybrid_hl_mas")
+    def _best_row(method_name: str) -> Optional[dict[str, Any]]:
+        candidates = [row for row in summary_rows if str(row.get("method")) == method_name]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda row: (
+                -float(row["accuracy_percentage"]),
+                float(row.get("average_latency_seconds", 0.0)),
+                float(row.get("answer_perplexity", float("inf")) or float("inf")),
+            ),
+        )
+
+    prompt_local = _best_row("prompt_local_latent")
+    global_anchor_orthogonal = _best_row("global_anchor_orthogonal")
+    global_anchor_hybrid = _best_row("global_anchor_hybrid_affine_plus_calibration")
+    if global_anchor_hybrid is None:
+        global_anchor_hybrid = _best_row("global_anchor_hybrid_affine")
+    hybrid = _best_row("hybrid_hl_mas")
+    text_text_hybrid = _best_row("text_text_hybrid")
     missing_requirements: list[str] = []
 
-    if prompt_local is None or global_anchor is None:
+    if prompt_local is None or global_anchor_orthogonal is None:
         missing_requirements.append(
-            "Prompt-local and global-anchor latent baselines are both required for phase 3 comparison."
+            "Prompt-local and global-anchor orthogonal baselines are both required for phase 3 comparison."
         )
 
     q_global_beats_prompt_local: Optional[bool] = None
-    if prompt_local is not None and global_anchor is not None:
-        q_global_beats_prompt_local = float(global_anchor["accuracy_percentage"]) >= float(
+    if prompt_local is not None and global_anchor_orthogonal is not None:
+        q_global_beats_prompt_local = float(global_anchor_orthogonal["accuracy_percentage"]) >= float(
             prompt_local["accuracy_percentage"]
         )
         if require_q_global_beats_prompt_local and not q_global_beats_prompt_local:
             missing_requirements.append("Global semantic-anchor alignment does not beat prompt-local alignment.")
 
+    hybrid_affine_beats_orthogonal: Optional[bool] = None
+    if global_anchor_hybrid is None or global_anchor_orthogonal is None:
+        missing_requirements.append(
+            "Orthogonal and hybrid-affine global-anchor baselines are both required for phase 3 comparison."
+        )
+    else:
+        hybrid_affine_accuracy = float(global_anchor_hybrid["accuracy_percentage"])
+        orthogonal_accuracy = float(global_anchor_orthogonal["accuracy_percentage"])
+        hybrid_affine_perplexity = global_anchor_hybrid.get("answer_perplexity")
+        orthogonal_perplexity = global_anchor_orthogonal.get("answer_perplexity")
+        hybrid_affine_beats_orthogonal = (
+            hybrid_affine_accuracy >= orthogonal_accuracy
+            and (
+                hybrid_affine_perplexity is None
+                or orthogonal_perplexity is None
+                or float(hybrid_affine_perplexity) <= float(orthogonal_perplexity)
+            )
+        )
+        if not hybrid_affine_beats_orthogonal:
+            missing_requirements.append(
+                "Hybrid-affine global alignment does not beat or match the orthogonal global baseline."
+            )
+
     hybrid_available = hybrid is not None
     if not hybrid_available:
         missing_requirements.append("Hybrid ODE benchmark row is missing.")
+
+    hybrid_beats_text_text: Optional[bool] = None
+    if hybrid is None or text_text_hybrid is None:
+        missing_requirements.append("Text-text hybrid and latent ODE rows are both required for phase 3 comparison.")
+    else:
+        hybrid_accuracy = float(hybrid["accuracy_percentage"])
+        text_hybrid_accuracy = float(text_text_hybrid["accuracy_percentage"])
+        hybrid_perplexity = hybrid.get("answer_perplexity")
+        text_hybrid_perplexity = text_text_hybrid.get("answer_perplexity")
+        accuracy_gain = hybrid_accuracy - text_hybrid_accuracy
+        perplexity_improvement_ratio = None
+        if (
+            hybrid_perplexity is not None
+            and text_hybrid_perplexity is not None
+            and float(text_hybrid_perplexity) > 0.0
+        ):
+            perplexity_improvement_ratio = (
+                float(text_hybrid_perplexity) - float(hybrid_perplexity)
+            ) / float(text_hybrid_perplexity)
+        hybrid_beats_text_text = (
+            accuracy_gain >= min_hybrid_accuracy_gain_over_text_text
+            or (
+                accuracy_gain >= -max_accuracy_gap_for_perplexity_tie
+                and perplexity_improvement_ratio is not None
+                and perplexity_improvement_ratio >= min_perplexity_improvement_ratio
+            )
+        )
+        if not hybrid_beats_text_text:
+            missing_requirements.append(
+                "Hybrid latent transfer does not clear the required text-text hybrid comparison thresholds."
+            )
 
     return {
         "phase": "phase_3",
         "passed": not missing_requirements,
         "require_q_global_beats_prompt_local": require_q_global_beats_prompt_local,
+        "min_hybrid_accuracy_gain_over_text_text": min_hybrid_accuracy_gain_over_text_text,
+        "max_accuracy_gap_for_perplexity_tie": max_accuracy_gap_for_perplexity_tie,
+        "min_perplexity_improvement_ratio": min_perplexity_improvement_ratio,
         "q_global_beats_prompt_local": q_global_beats_prompt_local,
+        "hybrid_affine_beats_orthogonal": hybrid_affine_beats_orthogonal,
+        "hybrid_beats_text_text": hybrid_beats_text_text,
         "prompt_local_accuracy_percentage": None if prompt_local is None else float(prompt_local["accuracy_percentage"]),
-        "global_anchor_accuracy_percentage": None if global_anchor is None else float(global_anchor["accuracy_percentage"]),
+        "global_anchor_orthogonal_accuracy_percentage": (
+            None if global_anchor_orthogonal is None else float(global_anchor_orthogonal["accuracy_percentage"])
+        ),
+        "global_anchor_hybrid_affine_accuracy_percentage": (
+            None if global_anchor_hybrid is None else float(global_anchor_hybrid["accuracy_percentage"])
+        ),
+        "text_text_hybrid_accuracy_percentage": (
+            None if text_text_hybrid is None else float(text_text_hybrid["accuracy_percentage"])
+        ),
+        "text_text_hybrid_answer_perplexity": (
+            None if text_text_hybrid is None else text_text_hybrid.get("answer_perplexity")
+        ),
         "hybrid_accuracy_percentage": None if hybrid is None else float(hybrid["accuracy_percentage"]),
+        "hybrid_answer_perplexity": None if hybrid is None else hybrid.get("answer_perplexity"),
         "missing_requirements": missing_requirements,
     }
 
@@ -401,6 +661,9 @@ def build_training_phase2_report(
 ) -> dict[str, Any]:
     heldout_entries = [entry for entry in history if "heldout_exact_match_accuracy" in entry]
     final_heldout_accuracy = None if not heldout_entries else float(heldout_entries[-1]["heldout_exact_match_accuracy"])
+    final_heldout_answer_perplexity = (
+        None if not heldout_entries else heldout_entries[-1].get("heldout_answer_perplexity")
+    )
     accuracy_retention_ratio = None
     if baseline_accuracy_percentage is not None and baseline_accuracy_percentage > 0 and final_heldout_accuracy is not None:
         accuracy_retention_ratio = final_heldout_accuracy / float(baseline_accuracy_percentage)
@@ -430,12 +693,14 @@ def build_training_phase2_report(
         "agent_a_model": str(_cfg_value(cfg, "agent_a_model", "")),
         "agent_b_model": str(_cfg_value(cfg, "agent_b_model", "")),
         "torch_dtype": str(_cfg_value(cfg, "torch_dtype", "")),
+        "seed": int(_cfg_value(cfg, "seed", 0)),
         "compression_steps": int(_cfg_value(cfg, "training.compressed_steps", 0)),
         "seed_count": seed_count,
         "required_seed_count": required_seed_count,
         "min_accuracy_retention_ratio": min_accuracy_retention_ratio,
         "baseline_accuracy_percentage": baseline_accuracy_percentage,
         "final_heldout_exact_match_accuracy": final_heldout_accuracy,
+        "final_heldout_answer_perplexity": final_heldout_answer_perplexity,
         "accuracy_retention_ratio": accuracy_retention_ratio,
         "alignment_mode": alignment_context.get("alignment_mode"),
         "semantic_anchor_count": alignment_context.get("semantic_anchor_count"),
@@ -444,4 +709,57 @@ def build_training_phase2_report(
         ),
         "model_pair": f"{_cfg_value(cfg, 'agent_a_model', '')} -> {_cfg_value(cfg, 'agent_b_model', '')}",
         "missing_requirements": missing_requirements,
+    }
+
+
+def build_ode_scaling_report(
+    summary_rows: Sequence[dict[str, Any]],
+    *,
+    method: str = "hybrid_hl_mas",
+    accuracy_tolerance: float = 1.0,
+) -> dict[str, Any]:
+    relevant_rows = [
+        row for row in summary_rows if str(row.get("method")) == method
+    ]
+    if len(relevant_rows) < 2:
+        return {
+            "method": method,
+            "available": False,
+            "missing_requirements": ["Need at least two latent-step settings to build an ODE scaling report."],
+        }
+
+    ordered_rows = sorted(relevant_rows, key=lambda row: int(row["compression_steps"]))
+    x_values = [math.log2(max(1, int(row["compression_steps"]))) for row in ordered_rows]
+    y_values = [float(row["accuracy_percentage"]) for row in ordered_rows]
+    x_mean = sum(x_values) / len(x_values)
+    y_mean = sum(y_values) / len(y_values)
+    variance = sum((x - x_mean) ** 2 for x in x_values)
+    slope = 0.0 if variance == 0 else sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values)) / variance
+    best_accuracy = max(y_values)
+    best_row = max(ordered_rows, key=lambda row: float(row["accuracy_percentage"]))
+    near_optimal_row = min(
+        (
+            row for row in ordered_rows
+            if best_accuracy - float(row["accuracy_percentage"]) <= accuracy_tolerance
+        ),
+        key=lambda row: int(row["compression_steps"]),
+    )
+    return {
+        "method": method,
+        "available": True,
+        "slope_accuracy_vs_log2_steps": slope,
+        "best_accuracy_percentage": float(best_row["accuracy_percentage"]),
+        "best_answer_perplexity": best_row.get("answer_perplexity"),
+        "best_step_count": int(best_row["compression_steps"]),
+        "near_optimal_step_count": int(near_optimal_row["compression_steps"]),
+        "near_optimal_answer_perplexity": near_optimal_row.get("answer_perplexity"),
+        "rows": [
+            {
+                "compression_steps": int(row["compression_steps"]),
+                "accuracy_percentage": float(row["accuracy_percentage"]),
+                "answer_perplexity": row.get("answer_perplexity"),
+                "average_latency_seconds": float(row["average_latency_seconds"]),
+            }
+            for row in ordered_rows
+        ],
     }

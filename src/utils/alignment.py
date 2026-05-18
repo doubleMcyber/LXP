@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 import re
+from typing import Any, Optional
 
 import torch
 
 
 HiddenStateInput = torch.Tensor | Sequence[torch.Tensor]
 LayerWeightInput = Sequence[float] | torch.Tensor | None
+AlignmentState = dict[str, Any]
 _ALNUM_ANCHOR_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 _SIMPLE_SYMBOL_ANCHOR_PATTERN = re.compile(r"^[+\-*/=<>()[\]{}.,:;?!%^_]+$")
 _MIXED_SEMANTIC_ANCHOR_PATTERN = re.compile(r"^[A-Za-z0-9+\-*/=<>()[\]{}.,:;?!%^_]+$")
@@ -291,12 +294,18 @@ def _pair_anchor_states(
     return sender[:pair_count], receiver[:pair_count]
 
 
-def compute_cross_covariance(
+def _prepare_alignment_layers(
     sender_hidden_states: HiddenStateInput,
     receiver_hidden_states: HiddenStateInput,
     *,
     layer_weights: LayerWeightInput = None,
-) -> torch.Tensor:
+    center: bool = False,
+) -> tuple[
+    tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     sender_layers = _normalize_hidden_state_layers(
         sender_hidden_states, name="sender_hidden_states"
     )
@@ -307,18 +316,70 @@ def compute_cross_covariance(
         raise ValueError("sender and receiver must provide the same number of layers")
 
     normalized_weights = _normalize_layer_weights(len(sender_layers), layer_weights)
-    mean_cross_covariance: torch.Tensor | None = None
-    for layer_index, (sender_layer, receiver_layer) in enumerate(
-        zip(sender_layers, receiver_layers)
-    ):
-        sender, receiver = _pair_anchor_states(sender_layer, receiver_layer)
-        layer_cross_covariance = sender.transpose(0, 1) @ receiver
+    paired_layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+    sender_means: list[torch.Tensor] = []
+    receiver_means: list[torch.Tensor] = []
 
+    for sender_layer, receiver_layer in zip(sender_layers, receiver_layers):
+        sender, receiver = _pair_anchor_states(sender_layer, receiver_layer)
+        if paired_layers and sender.shape[-1] != paired_layers[0][0].shape[-1]:
+            raise ValueError("all sender layers must share the same hidden dimension")
+        if paired_layers and receiver.shape[-1] != paired_layers[0][1].shape[-1]:
+            raise ValueError("all receiver layers must share the same hidden dimension")
+        sender_mean = sender.mean(dim=0, keepdim=True)
+        receiver_mean = receiver.mean(dim=0, keepdim=True)
+        sender_means.append(sender_mean)
+        receiver_means.append(receiver_mean)
+        if center:
+            paired_layers.append((sender - sender_mean, receiver - receiver_mean))
+        else:
+            paired_layers.append((sender, receiver))
+
+    sender_anchor_mean = torch.zeros_like(sender_means[0])
+    receiver_anchor_mean = torch.zeros_like(receiver_means[0])
+    for weight, sender_mean, receiver_mean in zip(
+        normalized_weights, sender_means, receiver_means
+    ):
+        sender_anchor_mean = sender_anchor_mean + (sender_mean * float(weight.item()))
+        receiver_anchor_mean = receiver_anchor_mean + (
+            receiver_mean * float(weight.item())
+        )
+
+    return (
+        tuple(paired_layers),
+        normalized_weights,
+        sender_anchor_mean,
+        receiver_anchor_mean,
+    )
+
+
+def _stack_weighted_alignment_rows(
+    paired_layers: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    normalized_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weighted_sender_rows: list[torch.Tensor] = []
+    weighted_receiver_rows: list[torch.Tensor] = []
+    for layer_index, (sender_layer, receiver_layer) in enumerate(paired_layers):
+        weight_scale = math.sqrt(float(normalized_weights[layer_index].item()))
+        weighted_sender_rows.append(sender_layer * weight_scale)
+        weighted_receiver_rows.append(receiver_layer * weight_scale)
+    return (
+        torch.cat(weighted_sender_rows, dim=0),
+        torch.cat(weighted_receiver_rows, dim=0),
+    )
+
+
+def _compute_cross_covariance_from_pairs(
+    paired_layers: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    normalized_weights: torch.Tensor,
+) -> torch.Tensor:
+    mean_cross_covariance: torch.Tensor | None = None
+    for layer_index, (sender_layer, receiver_layer) in enumerate(paired_layers):
+        layer_cross_covariance = sender_layer.transpose(0, 1) @ receiver_layer
         if mean_cross_covariance is None:
             mean_cross_covariance = torch.zeros_like(layer_cross_covariance)
         elif layer_cross_covariance.shape != mean_cross_covariance.shape:
             raise ValueError("all layer pairs must share the same hidden dimensions")
-
         mean_cross_covariance = mean_cross_covariance + (
             layer_cross_covariance
             * float(normalized_weights[layer_index].item())
@@ -328,6 +389,138 @@ def compute_cross_covariance(
         raise ValueError("sender and receiver hidden states are empty")
 
     return mean_cross_covariance
+
+
+def _safe_svd(
+    matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if matrix.device.type != "mps":
+        return torch.linalg.svd(matrix, full_matrices=False)
+
+    cpu_matrix = matrix.detach().float().cpu()
+    u_cpu, singular_values_cpu, vh_cpu = torch.linalg.svd(
+        cpu_matrix,
+        full_matrices=False,
+    )
+    return (
+        u_cpu.to(device=matrix.device, dtype=matrix.dtype),
+        singular_values_cpu.to(device=matrix.device, dtype=matrix.dtype),
+        vh_cpu.to(device=matrix.device, dtype=matrix.dtype),
+    )
+
+
+def _pairwise_distance_distortion(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> float:
+    # Keep diagnostic geometry metrics backend-safe by running them on CPU.
+    # MPS does not currently implement torch.pdist, and these summaries are
+    # inexpensive relative to the alignment solve itself.
+    left_rows = left.detach().float().reshape(left.shape[0], -1).cpu()
+    right_rows = right.detach().float().reshape(right.shape[0], -1).cpu()
+    pair_count = min(left_rows.shape[0], right_rows.shape[0])
+    if pair_count < 2:
+        return 0.0
+    left_distances = torch.pdist(left_rows[:pair_count], p=2)
+    right_distances = torch.pdist(right_rows[:pair_count], p=2)
+    denominator = right_distances.abs().clamp_min(1e-6)
+    return float(((left_distances - right_distances).abs() / denominator).mean().item())
+
+
+def _cosine_structure_error(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    max_rows: int = 128,
+) -> float:
+    left_rows = left.detach().float().reshape(left.shape[0], -1).cpu()
+    right_rows = right.detach().float().reshape(right.shape[0], -1).cpu()
+    pair_count = min(left_rows.shape[0], right_rows.shape[0], max_rows)
+    if pair_count < 2:
+        return 0.0
+    left_rows = torch.nn.functional.normalize(left_rows[:pair_count], dim=-1)
+    right_rows = torch.nn.functional.normalize(right_rows[:pair_count], dim=-1)
+    left_gram = left_rows @ left_rows.transpose(0, 1)
+    right_gram = right_rows @ right_rows.transpose(0, 1)
+    return float((left_gram - right_gram).abs().mean().item())
+
+
+def build_adaptive_projection_state(
+    source_hidden_states: torch.Tensor,
+    target_hidden_states: torch.Tensor,
+    *,
+    strength: float = 0.15,
+    clip_std_multiplier: float = 4.0,
+) -> AlignmentState:
+    source = _flatten_hidden_states(source_hidden_states).float()
+    target = _flatten_hidden_states(target_hidden_states).float().to(source.device)
+    source_mean = source.mean(dim=0, keepdim=True)
+    source_std = source.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    target_mean = target.mean(dim=0, keepdim=True)
+    target_std = target.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    if strength <= 0.0:
+        scale = torch.ones_like(source_std)
+    else:
+        raw_ratio = (target_std / source_std).clamp(0.5, 2.0)
+        scale = 1.0 + (strength * (raw_ratio - 1.0))
+    return {
+        "enabled": True,
+        "strength": float(strength),
+        "clip_std_multiplier": float(clip_std_multiplier),
+        "source_mean": source_mean.detach().cpu(),
+        "source_std": source_std.detach().cpu(),
+        "target_mean": target_mean.detach().cpu(),
+        "target_std": target_std.detach().cpu(),
+        "scale": scale.detach().cpu(),
+    }
+
+
+def apply_adaptive_projection(
+    hidden_states: torch.Tensor,
+    projection_state: Optional[AlignmentState],
+) -> torch.Tensor:
+    if not projection_state or not bool(projection_state.get("enabled", False)):
+        return hidden_states
+
+    source_mean = projection_state["source_mean"].to(
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    target_mean = projection_state["target_mean"].to(
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    target_std = projection_state["target_std"].to(
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    scale = projection_state["scale"].to(
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    clip_std_multiplier = float(projection_state.get("clip_std_multiplier", 4.0))
+
+    projected = hidden_states.float()
+    projected = (projected - source_mean) * scale + source_mean
+    clip_low = target_mean - (clip_std_multiplier * target_std)
+    clip_high = target_mean + (clip_std_multiplier * target_std)
+    projected = torch.maximum(torch.minimum(projected, clip_high), clip_low)
+    return projected.to(dtype=hidden_states.dtype)
+
+
+def compute_cross_covariance(
+    sender_hidden_states: HiddenStateInput,
+    receiver_hidden_states: HiddenStateInput,
+    *,
+    layer_weights: LayerWeightInput = None,
+) -> torch.Tensor:
+    paired_layers, normalized_weights, _, _ = _prepare_alignment_layers(
+        sender_hidden_states,
+        receiver_hidden_states,
+        layer_weights=layer_weights,
+        center=False,
+    )
+    return _compute_cross_covariance_from_pairs(paired_layers, normalized_weights)
 
 
 def compute_orthogonal_mapping(
@@ -341,30 +534,288 @@ def compute_orthogonal_mapping(
         receiver_hidden_states,
         layer_weights=layer_weights,
     )
-    u, _, vh = torch.linalg.svd(cross_covariance, full_matrices=False)
+    u, _, vh = _safe_svd(cross_covariance)
     return u @ vh
 
 
 def compute_ridge_mapping(
-    source_hidden_states: torch.Tensor,
-    target_hidden_states: torch.Tensor,
+    source_hidden_states: HiddenStateInput,
+    target_hidden_states: HiddenStateInput,
     *,
     regularization: float = 1e-4,
+    layer_weights: LayerWeightInput = None,
 ) -> torch.Tensor:
     if regularization < 0:
         raise ValueError("regularization must be non-negative")
 
-    source = _flatten_hidden_states(source_hidden_states).to(torch.float32)
-    target = _flatten_hidden_states(target_hidden_states).to(torch.float32).to(source.device)
-    if source.shape[0] != target.shape[0]:
-        raise ValueError(
-            "source and target must provide the same number of anchor rows for ridge mapping"
-        )
+    paired_layers, normalized_weights, _, _ = _prepare_alignment_layers(
+        source_hidden_states,
+        target_hidden_states,
+        layer_weights=layer_weights,
+        center=False,
+    )
+    source, target = _stack_weighted_alignment_rows(paired_layers, normalized_weights)
 
     gram = source.transpose(0, 1) @ source
     rhs = source.transpose(0, 1) @ target
     identity = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
     return torch.linalg.solve(gram + (regularization * identity), rhs)
+
+def compute_alignment_state(
+    sender_hidden_states: HiddenStateInput,
+    receiver_hidden_states: HiddenStateInput,
+    *,
+    layer_weights: LayerWeightInput = None,
+    strategy: str = "orthogonal",
+    center: bool = False,
+    use_bias: bool = False,
+    regularization: float = 1e-4,
+    residual_alpha: float = 1.0,
+    residual_max_norm_ratio: Optional[float] = None,
+    adaptive_projection_strength: float = 0.0,
+    adaptive_projection_clip_std_multiplier: float = 4.0,
+) -> AlignmentState:
+    normalized_strategy = str(strategy).strip().lower()
+    if normalized_strategy not in {"orthogonal", "ridge", "hybrid_affine"}:
+        raise ValueError(
+            f"Unsupported alignment strategy {strategy!r}. "
+            "Expected 'orthogonal', 'ridge', or 'hybrid_affine'."
+        )
+
+    paired_layers, normalized_weights, sender_anchor_mean, receiver_anchor_mean = (
+        _prepare_alignment_layers(
+            sender_hidden_states,
+            receiver_hidden_states,
+            layer_weights=layer_weights,
+            center=center,
+        )
+    )
+    sender_rows, receiver_rows = _stack_weighted_alignment_rows(
+        paired_layers,
+        normalized_weights,
+    )
+    sender_rows = sender_rows.float()
+    receiver_rows = receiver_rows.float().to(sender_rows.device)
+
+    cross_covariance = _compute_cross_covariance_from_pairs(
+        paired_layers,
+        normalized_weights,
+    )
+    u, singular_values, vh = _safe_svd(cross_covariance)
+    orthogonal_q = u @ vh
+
+    residual_matrix = torch.zeros(
+        (sender_rows.shape[-1], receiver_rows.shape[-1]),
+        device=sender_rows.device,
+        dtype=torch.float32,
+    )
+    mapping_matrix = orthogonal_q
+
+    if normalized_strategy == "ridge":
+        mapping_matrix = compute_ridge_mapping(
+            sender_rows,
+            receiver_rows,
+            regularization=regularization,
+        )
+        orthogonal_q = mapping_matrix
+    elif normalized_strategy == "hybrid_affine":
+        residual_target = receiver_rows - (sender_rows @ orthogonal_q)
+        residual_matrix = compute_ridge_mapping(
+            sender_rows,
+            residual_target,
+            regularization=regularization,
+        )
+        scaled_residual = residual_matrix * float(residual_alpha)
+        orthogonal_norm = float(torch.linalg.matrix_norm(orthogonal_q).item())
+        residual_norm = float(torch.linalg.matrix_norm(scaled_residual).item())
+        if (
+            residual_max_norm_ratio is not None
+            and residual_max_norm_ratio > 0.0
+            and orthogonal_norm > 0.0
+            and residual_norm > orthogonal_norm * float(residual_max_norm_ratio)
+        ):
+            cap = orthogonal_norm * float(residual_max_norm_ratio)
+            scaled_residual = scaled_residual * (cap / max(residual_norm, 1e-8))
+        residual_matrix = scaled_residual
+        mapping_matrix = orthogonal_q + residual_matrix
+
+    bias_vector = torch.zeros(
+        (1, receiver_rows.shape[-1]),
+        device=sender_rows.device,
+        dtype=torch.float32,
+    )
+    if use_bias:
+        sender_anchor_mean = sender_anchor_mean.to(sender_rows.device, dtype=torch.float32)
+        receiver_anchor_mean = receiver_anchor_mean.to(
+            sender_rows.device, dtype=torch.float32
+        )
+        bias_vector = receiver_anchor_mean - (sender_anchor_mean @ mapping_matrix)
+
+    mapped_sender_rows = (sender_rows @ mapping_matrix) + bias_vector
+    sender_unweighted_rows, receiver_unweighted_rows = _stack_weighted_alignment_rows(
+        _prepare_alignment_layers(
+            sender_hidden_states,
+            receiver_hidden_states,
+            layer_weights=layer_weights,
+            center=False,
+        )[0],
+        normalized_weights,
+    )
+    sender_unweighted_rows = sender_unweighted_rows.float()
+    receiver_unweighted_rows = receiver_unweighted_rows.float().to(sender_unweighted_rows.device)
+    mapped_sender_unweighted = (sender_unweighted_rows @ mapping_matrix) + bias_vector
+
+    pre_projection_state = build_adaptive_projection_state(
+        sender_unweighted_rows,
+        sender_unweighted_rows,
+        strength=adaptive_projection_strength,
+        clip_std_multiplier=adaptive_projection_clip_std_multiplier,
+    )
+    post_projection_state = build_adaptive_projection_state(
+        mapped_sender_unweighted,
+        receiver_unweighted_rows,
+        strength=adaptive_projection_strength,
+        clip_std_multiplier=adaptive_projection_clip_std_multiplier,
+    )
+    adapted_sender_unweighted = apply_adaptive_projection(
+        mapped_sender_unweighted.to(dtype=torch.float32),
+        post_projection_state,
+    )
+
+    orthogonal_norm = float(torch.linalg.matrix_norm(orthogonal_q).item())
+    residual_norm = float(torch.linalg.matrix_norm(residual_matrix).item())
+    residual_norm_ratio = 0.0 if orthogonal_norm <= 0.0 else residual_norm / orthogonal_norm
+    bias_norm = float(torch.linalg.vector_norm(bias_vector.reshape(-1)).item())
+
+    return {
+        "alignment_strategy": normalized_strategy,
+        "mapping_matrix": mapping_matrix.detach().cpu(),
+        "mapping_bias": bias_vector.detach().cpu(),
+        "orthogonal_q": orthogonal_q.detach().cpu(),
+        "residual_matrix": residual_matrix.detach().cpu(),
+        "center_anchors": bool(center),
+        "use_bias": bool(use_bias),
+        "regularization": float(regularization),
+        "residual_alpha": float(residual_alpha),
+        "residual_max_norm_ratio": None
+        if residual_max_norm_ratio is None
+        else float(residual_max_norm_ratio),
+        "sender_anchor_mean": sender_anchor_mean.detach().cpu(),
+        "receiver_anchor_mean": receiver_anchor_mean.detach().cpu(),
+        "alignment_singular_values": singular_values.detach().cpu(),
+        "pre_projection_state": pre_projection_state,
+        "post_projection_state": post_projection_state,
+        "anchor_reconstruction_mse": float(
+            torch.mean((adapted_sender_unweighted - receiver_unweighted_rows) ** 2).item()
+        ),
+        "anchor_pairwise_distance_distortion": _pairwise_distance_distortion(
+            adapted_sender_unweighted,
+            receiver_unweighted_rows,
+        ),
+        "anchor_cosine_structure_error": _cosine_structure_error(
+            adapted_sender_unweighted,
+            receiver_unweighted_rows,
+        ),
+        "residual_norm_ratio": residual_norm_ratio,
+        "bias_norm": bias_norm,
+    }
+
+
+def score_anchor_stability(
+    sender_hidden_states: torch.Tensor,
+    receiver_hidden_states: torch.Tensor,
+    *,
+    strategy: str = "hybrid_affine",
+    regularization: float = 1e-3,
+    residual_alpha: float = 1.0,
+    residual_max_norm_ratio: Optional[float] = 0.25,
+    center: bool = True,
+    use_bias: bool = True,
+    bootstrap_count: int = 3,
+    bootstrap_ratio: float = 0.8,
+    bootstrap_weight: float = 0.5,
+    seed: int = 0,
+) -> AlignmentState:
+    sender = _flatten_hidden_states(sender_hidden_states).float()
+    receiver = _flatten_hidden_states(receiver_hidden_states).float().to(sender.device)
+    if sender.shape[0] != receiver.shape[0]:
+        raise ValueError("sender and receiver must provide the same number of anchor rows")
+    if sender.shape[0] < 2:
+        raise ValueError("Need at least two anchors to score anchor stability")
+
+    base_state = compute_alignment_state(
+        sender,
+        receiver,
+        strategy=strategy,
+        center=center,
+        use_bias=use_bias,
+        regularization=regularization,
+        residual_alpha=residual_alpha,
+        residual_max_norm_ratio=residual_max_norm_ratio,
+    )
+    base_mapped = apply_alignment(sender, base_state).float()
+    base_errors = torch.linalg.vector_norm(base_mapped - receiver, dim=-1) / math.sqrt(receiver.shape[-1])
+    base_errors_cpu = base_errors.detach().cpu()
+
+    oob_error_sum = torch.zeros_like(base_errors_cpu)
+    oob_error_sq_sum = torch.zeros_like(base_errors_cpu)
+    oob_count = torch.zeros_like(base_errors_cpu)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    subset_size = min(sender.shape[0] - 1, max(2, int(round(sender.shape[0] * bootstrap_ratio))))
+
+    for _ in range(max(0, bootstrap_count)):
+        permutation = torch.randperm(sender.shape[0], generator=generator)
+        train_indices = permutation[:subset_size]
+        oob_indices = permutation[subset_size:]
+        if oob_indices.numel() == 0:
+            continue
+        bootstrap_state = compute_alignment_state(
+            sender.index_select(0, train_indices.to(sender.device)),
+            receiver.index_select(0, train_indices.to(receiver.device)),
+            strategy=strategy,
+            center=center,
+            use_bias=use_bias,
+            regularization=regularization,
+            residual_alpha=residual_alpha,
+            residual_max_norm_ratio=residual_max_norm_ratio,
+        )
+        bootstrap_mapped = apply_alignment(
+            sender.index_select(0, oob_indices.to(sender.device)),
+            bootstrap_state,
+        ).float()
+        bootstrap_errors = torch.linalg.vector_norm(
+            bootstrap_mapped - receiver.index_select(0, oob_indices.to(receiver.device)),
+            dim=-1,
+        ) / math.sqrt(receiver.shape[-1])
+        bootstrap_errors_cpu = bootstrap_errors.detach().cpu()
+        oob_error_sum[oob_indices] += bootstrap_errors_cpu
+        oob_error_sq_sum[oob_indices] += bootstrap_errors_cpu**2
+        oob_count[oob_indices] += 1
+
+    fallback_counts = oob_count.clamp_min(1.0)
+    oob_mean = torch.where(
+        oob_count > 0,
+        oob_error_sum / fallback_counts,
+        base_errors_cpu,
+    )
+    oob_variance = torch.where(
+        oob_count > 0,
+        (oob_error_sq_sum / fallback_counts) - (oob_mean**2),
+        torch.zeros_like(base_errors_cpu),
+    ).clamp_min(0.0)
+    oob_std = torch.sqrt(oob_variance)
+    combined_score = base_errors_cpu + (float(bootstrap_weight) * oob_mean) + (0.5 * oob_std)
+
+    return {
+        "base_reconstruction_error": base_errors_cpu,
+        "oob_reconstruction_error": oob_mean.detach().cpu(),
+        "oob_reconstruction_std": oob_std.detach().cpu(),
+        "combined_score": combined_score.detach().cpu(),
+        "bootstrap_count": int(bootstrap_count),
+        "bootstrap_ratio": float(bootstrap_ratio),
+        "bootstrap_weight": float(bootstrap_weight),
+    }
 
 
 def apply_linear_mapping(hidden_states: torch.Tensor, mapping_matrix: torch.Tensor) -> torch.Tensor:
@@ -376,3 +827,27 @@ def apply_linear_mapping(hidden_states: torch.Tensor, mapping_matrix: torch.Tens
 
 def apply_orthogonal_mapping(hidden_states: torch.Tensor, mapping_q: torch.Tensor) -> torch.Tensor:
     return apply_linear_mapping(hidden_states, mapping_q)
+
+
+def apply_alignment(
+    hidden_states: torch.Tensor,
+    alignment: torch.Tensor | AlignmentState,
+) -> torch.Tensor:
+    if isinstance(alignment, torch.Tensor):
+        return apply_linear_mapping(hidden_states, alignment)
+
+    pre_projection_state = alignment.get("pre_projection_state")
+    post_projection_state = alignment.get("post_projection_state")
+    mapping_matrix = alignment.get("mapping_matrix", alignment.get("global_alignment_q"))
+    if mapping_matrix is None:
+        raise ValueError("alignment state is missing a mapping_matrix")
+    mapped = apply_adaptive_projection(hidden_states, pre_projection_state)
+    mapped = apply_linear_mapping(mapped, mapping_matrix)
+    mapping_bias = alignment.get("mapping_bias", alignment.get("global_alignment_bias"))
+    if mapping_bias is not None:
+        mapped = mapped + mapping_bias.to(
+            device=mapped.device,
+            dtype=mapped.dtype,
+        )
+    mapped = apply_adaptive_projection(mapped, post_projection_state)
+    return mapped

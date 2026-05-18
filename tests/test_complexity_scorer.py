@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 import torch
 
 from latent_pipeline import (
+    _build_latent_trajectory,
     _build_integration_time_space,
     _compute_logits_entropy,
     _confidence_gate_settings,
@@ -62,9 +63,28 @@ def test_estimate_problem_complexity_clamps_to_supported_range() -> None:
 
 
 def test_scale_integration_points_tracks_complexity_factor() -> None:
+    assert _scale_integration_points(1, 1.0) == 1
     assert _scale_integration_points(10, 0.75) == 8
     assert _scale_integration_points(10, 1.0) == 10
     assert _scale_integration_points(10, 1.3) == 13
+
+
+def test_single_step_latent_trajectory_does_not_call_ode_dynamics() -> None:
+    class ExplodingDynamics(torch.nn.Module):
+        def forward(self, t, hidden_states):
+            raise AssertionError("single-step trajectories should not invoke ODE dynamics")
+
+    current = torch.randn(1, 1, 4)
+    trajectory, time_space = _build_latent_trajectory(
+        dynamics_mode="ode",
+        dynamics=ExplodingDynamics(),
+        current_latent_step=current,
+        point_count=1,
+    )
+
+    assert trajectory.shape == (1, 1, 1, 4)
+    assert torch.allclose(trajectory[0], current)
+    assert time_space.shape == (1,)
 
 
 def test_build_integration_time_space_keeps_fixed_time_horizon() -> None:

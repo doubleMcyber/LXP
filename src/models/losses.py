@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from src.models.hidden_state import build_plan_summary
 
 
 def _sample_steps(sequence: torch.Tensor, target_steps: int) -> torch.Tensor:
@@ -110,3 +115,83 @@ class LatentCompressorLoss(nn.Module):
             "l_geom": l_geom,
             **pref_diagnostics,
         }
+
+
+def compute_plan_similarity_loss(
+    full_latents: torch.Tensor,
+    compressed_latents: torch.Tensor,
+) -> torch.Tensor:
+    full_summary = build_plan_summary(full_latents).detach()
+    compressed_summary = build_plan_summary(compressed_latents)
+    return 1.0 - F.cosine_similarity(compressed_summary, full_summary, dim=-1).mean()
+
+
+def compute_random_contrast_loss(
+    full_latents: torch.Tensor,
+    compressed_latents: torch.Tensor,
+    *,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    if compressed_latents.size(0) < 2:
+        return compressed_latents.sum() * 0.0
+    full_summary = F.normalize(build_plan_summary(full_latents).detach(), dim=-1)
+    compressed_summary = F.normalize(build_plan_summary(compressed_latents), dim=-1)
+    logits = (compressed_summary @ full_summary.transpose(0, 1)) / max(float(temperature), 1e-6)
+    targets = torch.arange(logits.size(0), device=logits.device)
+    return F.cross_entropy(logits, targets)
+
+
+@dataclass
+class AdaptiveLossBalancerConfig:
+    enabled: bool = False
+    ema_beta: float = 0.9
+    min_weight: float = 0.25
+    max_weight: float = 4.0
+
+
+class AdaptiveLossBalancer:
+    def __init__(
+        self,
+        base_weights: dict[str, float],
+        *,
+        config: Optional[AdaptiveLossBalancerConfig] = None,
+    ) -> None:
+        self.base_weights = {key: float(value) for key, value in base_weights.items()}
+        self.config = config or AdaptiveLossBalancerConfig()
+        self._ema_values: dict[str, float] = {}
+
+    def combine(self, losses: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+        effective_weights: dict[str, float] = {}
+        if not self.config.enabled:
+            total = sum(losses[name] * self.base_weights.get(name, 1.0) for name in losses)
+            return total, {name: self.base_weights.get(name, 1.0) for name in losses}
+
+        detached_values = {
+            name: float(loss.detach().cpu().item())
+            for name, loss in losses.items()
+        }
+        for name, value in detached_values.items():
+            previous = self._ema_values.get(name, value)
+            self._ema_values[name] = (
+                (self.config.ema_beta * previous)
+                + ((1.0 - self.config.ema_beta) * value)
+            )
+
+        reference = sum(self._ema_values.values()) / max(len(self._ema_values), 1)
+        total = None
+        for name, loss in losses.items():
+            base_weight = self.base_weights.get(name, 1.0)
+            ema_value = max(self._ema_values.get(name, detached_values[name]), 1e-8)
+            adaptive_scale = reference / ema_value
+            adaptive_scale = min(
+                self.config.max_weight,
+                max(self.config.min_weight, adaptive_scale),
+            )
+            effective_weight = float(base_weight) * adaptive_scale
+            effective_weights[name] = effective_weight
+            contribution = loss * effective_weight
+            total = contribution if total is None else total + contribution
+
+        if total is None:
+            raise ValueError("At least one loss tensor is required")
+        return total, effective_weights

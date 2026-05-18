@@ -21,7 +21,7 @@ from src.utils.metrics import (
     normalize_answer,
 )
 
-RESULTS_PATH = Path("results.json")
+RESULTS_PATH = Path("outputs/results.json")
 
 
 def _load_cfg():
@@ -96,6 +96,7 @@ def evaluate(limit: int = 100, cfg=None) -> dict:
 
 def main() -> None:
     results = evaluate(limit=100)
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULTS_PATH.write_text(json.dumps(results, indent=2))
     print(f"Wrote evaluation results to {RESULTS_PATH}")
     print(f"Accuracy: {results['accuracy_percentage']:.2f}%")

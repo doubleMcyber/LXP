@@ -16,7 +16,7 @@ from src.utils.metrics import EvalSampleResult, calculate_latency_stats, normali
 
 DEFAULT_LATENT_STEPS = [1, 2, 4, 8, 16, 32, 64]
 DEFAULT_LIMIT = 10
-DEFAULT_OUTPUT_PATH = Path("scaling_results.csv")
+DEFAULT_OUTPUT_PATH = Path("outputs/scaling_results.csv")
 GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
@@ -155,6 +155,7 @@ def run_sweep(
         }
         rows.append(row)
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
         writer.writeheader()

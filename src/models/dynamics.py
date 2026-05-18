@@ -67,29 +67,53 @@ def _move_kv_cache_to_device(kv_cache: Any, device: torch.device) -> Any:
 
 
 def _is_kv_cache_compatible(kv_cache: Any, actor_model: AutoModelForCausalLM) -> bool:
+    status, _ = _kv_cache_compatibility_status(kv_cache, actor_model)
+    return status == "transferred"
+
+
+def _kv_cache_compatibility_status(
+    kv_cache: Any, actor_model: AutoModelForCausalLM
+) -> tuple[str, str]:
     if kv_cache is None:
-        return False
+        return "not_provided", "no_cache_provided"
     if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) == 0:
-        # Unknown cache object: keep it if it comes from the same architecture.
-        return False
+        return "unsupported_cache_type", type(kv_cache).__name__
 
     cfg = actor_model.config
     expected_layers = getattr(cfg, "num_hidden_layers", None)
     if isinstance(expected_layers, int) and len(kv_cache) != expected_layers:
-        return False
+        return (
+            "unsupported_architecture_mismatch",
+            f"layer_count_mismatch: expected {expected_layers}, got {len(kv_cache)}",
+        )
 
     first_layer = kv_cache[0]
-    if not isinstance(first_layer, (tuple, list)) or len(first_layer) == 0:
-        return False
-    key_tensor = first_layer[0]
-    if not torch.is_tensor(key_tensor) or key_tensor.dim() < 4:
-        return False
+    if not isinstance(first_layer, (tuple, list)) or len(first_layer) < 2:
+        return "invalid_cache", "first_layer_missing_key_value_tensors"
+    first_key_tensor = first_layer[0]
+    first_value_tensor = first_layer[1]
+    if (
+        not torch.is_tensor(first_key_tensor)
+        or not torch.is_tensor(first_value_tensor)
+        or first_key_tensor.dim() < 4
+        or first_value_tensor.dim() < 4
+    ):
+        return "invalid_cache", "first_layer_key_value_missing_or_rank_too_low"
+    if first_key_tensor.shape != first_value_tensor.shape:
+        return (
+            "invalid_cache",
+            f"first_layer_key_value_shape_mismatch: key={tuple(first_key_tensor.shape)}, "
+            f"value={tuple(first_value_tensor.shape)}",
+        )
 
     expected_heads = getattr(cfg, "num_key_value_heads", None)
     if expected_heads is None:
         expected_heads = getattr(cfg, "num_attention_heads", None)
-    if isinstance(expected_heads, int) and key_tensor.shape[1] != expected_heads:
-        return False
+    if isinstance(expected_heads, int) and first_key_tensor.shape[1] != expected_heads:
+        return (
+            "unsupported_architecture_mismatch",
+            f"key_value_head_mismatch: expected {expected_heads}, got {first_key_tensor.shape[1]}",
+        )
 
     expected_head_dim = getattr(cfg, "head_dim", None)
     if expected_head_dim is None:
@@ -97,10 +121,38 @@ def _is_kv_cache_compatible(kv_cache: Any, actor_model: AutoModelForCausalLM) ->
         num_heads = getattr(cfg, "num_attention_heads", None)
         if isinstance(hidden_size, int) and isinstance(num_heads, int) and num_heads > 0:
             expected_head_dim = hidden_size // num_heads
-    if isinstance(expected_head_dim, int) and key_tensor.shape[-1] != expected_head_dim:
-        return False
+    if isinstance(expected_head_dim, int) and first_key_tensor.shape[-1] != expected_head_dim:
+        return (
+            "unsupported_architecture_mismatch",
+            f"head_dim_mismatch: expected {expected_head_dim}, got {first_key_tensor.shape[-1]}",
+        )
 
-    return True
+    first_shape = tuple(first_key_tensor.shape)
+    for layer_index, layer_cache in enumerate(kv_cache[1:], start=1):
+        if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
+            return "invalid_cache", f"layer_{layer_index}_missing_key_value_tensors"
+        key_tensor = layer_cache[0]
+        value_tensor = layer_cache[1]
+        if (
+            not torch.is_tensor(key_tensor)
+            or not torch.is_tensor(value_tensor)
+            or key_tensor.dim() < 4
+            or value_tensor.dim() < 4
+        ):
+            return "invalid_cache", f"layer_{layer_index}_key_value_missing_or_rank_too_low"
+        if key_tensor.shape != value_tensor.shape:
+            return (
+                "invalid_cache",
+                f"layer_{layer_index}_key_value_shape_mismatch: key={tuple(key_tensor.shape)}, "
+                f"value={tuple(value_tensor.shape)}",
+            )
+        if tuple(key_tensor.shape) != first_shape:
+            return (
+                "unsupported_architecture_mismatch",
+                f"layer_{layer_index}_shape_mismatch: expected {first_shape}, got {tuple(key_tensor.shape)}",
+            )
+
+    return "transferred", "compatible"
 
 
 def _sync_if_cuda(device: torch.device) -> None:

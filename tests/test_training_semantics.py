@@ -203,9 +203,25 @@ def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> 
             "agent_b_model": "actor-b",
             "torch_dtype": "bfloat16",
             "alignment": {
+                "strategy": "hybrid_affine",
                 "semantic_anchor_count": 250,
                 "cache_dir": ".cache/alignment",
                 "reasoning_layer_weights": [0.2, 0.3, 0.5],
+                "center_anchors": True,
+                "use_bias": True,
+                "residual_lambda": 1.0e-3,
+                "residual_alpha": 1.0,
+                "residual_max_norm_ratio": 0.25,
+                "adaptive_projection": {
+                    "enabled": True,
+                    "strength": 0.15,
+                    "clip_std_multiplier": 4.0,
+                },
+                "prompt_calibration": {
+                    "enabled": True,
+                    "strength": 0.2,
+                    "max_norm_ratio": 0.15,
+                },
             },
         }
     )
@@ -216,10 +232,25 @@ def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> 
         semantic_anchor_count=250,
         reasoning_layer_indices=(12, 16, 20),
         reasoning_layer_weights=(0.2, 0.3, 0.5),
+        alignment_strategy="hybrid_affine",
+        center_anchors=True,
+        use_bias=True,
+        residual_lambda=1.0e-3,
+        residual_alpha=1.0,
+        residual_max_norm_ratio=0.25,
+        adaptive_projection_enabled=True,
+        adaptive_projection_strength=0.15,
+        adaptive_projection_clip_std_multiplier=4.0,
+        handoff_target="input_embedding",
+        diagnostic_target="hidden_consensus",
     )
     reasoner, actor = _make_tiny_models(with_layers=True)
     fake_state = {
         "global_alignment_q": torch.eye(16),
+        "global_alignment_bias": torch.zeros(1, 16),
+        "global_alignment_backbone_q": torch.eye(16),
+        "global_alignment_residual": torch.zeros(16, 16),
+        "alignment_strategy": "hybrid_affine",
         "alignment_mode": "semantic_anchor_global",
         "global_alignment_cache_key": expected_cache_key,
         "global_alignment_cache_hit": True,
@@ -227,6 +258,11 @@ def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> 
         "global_reasoning_layer_indices": (12, 16, 20),
         "global_reasoning_layer_weights": (0.2, 0.3, 0.5),
         "semantic_anchor_count": 250,
+        "selected_anchor_indices": tuple(range(10)),
+        "pre_projection_state": None,
+        "post_projection_state": None,
+        "anchor_reconstruction_mse": 0.0,
+        "anchor_pairwise_distance_distortion": 0.0,
     }
 
     with patch("train_compressor.load_or_compute_global_alignment_state", return_value=fake_state):
@@ -241,3 +277,81 @@ def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> 
     assert context["alignment_mode"] == "semantic_anchor_global"
     assert context["global_alignment_cache_key"] == expected_cache_key
     assert context["semantic_anchor_count"] == 250
+    assert context["alignment_strategy"] == "hybrid_affine"
+
+
+def test_resolve_training_alignment_context_prefers_handoff_alignment_for_actor_inputs() -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "reasoner-a",
+            "agent_b_model": "actor-b",
+            "torch_dtype": "bfloat16",
+            "alignment": {
+                "strategy": "hybrid_affine",
+                "semantic_anchor_count": 4,
+                "cache_dir": ".cache/alignment",
+                "reasoning_layer_weights": [0.2, 0.3, 0.5],
+                "center_anchors": True,
+                "use_bias": True,
+                "residual_lambda": 1.0e-3,
+                "residual_alpha": 1.0,
+                "residual_max_norm_ratio": 0.25,
+                "adaptive_projection": {
+                    "enabled": False,
+                    "strength": 0.0,
+                    "clip_std_multiplier": 4.0,
+                },
+                "prompt_calibration": {
+                    "enabled": False,
+                },
+            },
+        }
+    )
+    reasoner, actor = _make_tiny_models(with_layers=True)
+    diagnostic_q = torch.zeros(16, 16)
+    handoff_q = torch.eye(16) * 2.0
+    fake_state = {
+        "global_alignment_q": diagnostic_q,
+        "global_alignment_bias": torch.zeros(1, 16),
+        "global_alignment_backbone_q": diagnostic_q,
+        "global_alignment_residual": torch.zeros(16, 16),
+        "handoff_alignment_q": handoff_q,
+        "handoff_alignment_bias": torch.ones(1, 16),
+        "handoff_alignment_backbone_q": handoff_q,
+        "handoff_alignment_residual": torch.zeros(16, 16),
+        "handoff_pre_projection_state": None,
+        "handoff_post_projection_state": None,
+        "handoff_residual_norm_ratio": 0.0,
+        "handoff_bias_norm": 4.0,
+        "alignment_strategy": "hybrid_affine",
+        "alignment_mode": "semantic_anchor_global",
+        "global_alignment_cache_key": ("fake",),
+        "global_alignment_cache_hit": False,
+        "global_alignment_cache_path": ".cache/alignment/fake.pt",
+        "global_reasoning_layer_indices": (1, 2, 3),
+        "global_reasoning_layer_weights": (0.2, 0.3, 0.5),
+        "semantic_anchor_count": 4,
+        "selected_anchor_indices": (),
+        "pre_projection_state": None,
+        "post_projection_state": None,
+        "anchor_reconstruction_mse": 0.0,
+        "anchor_pairwise_distance_distortion": 0.0,
+        "handoff_anchor_reconstruction_mse": 0.0,
+        "handoff_anchor_pairwise_distance_distortion": 0.0,
+        "handoff_surface": "input_embedding",
+        "diagnostic_surface": "hidden_consensus",
+    }
+
+    with patch("train_compressor.load_or_compute_global_alignment_state", return_value=fake_state):
+        context = resolve_training_alignment_context(
+            reasoner_model=reasoner,
+            actor_model=actor,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=7),
+            alignment_cfg=cfg,
+        )
+
+    assert torch.equal(context["alignment_state"]["mapping_matrix"], handoff_q)
+    assert context["alignment_state"]["mapping_matrix"].shape[-1] == actor.get_input_embeddings().weight.shape[-1]
+    assert torch.equal(context["diagnostic_alignment_state"]["mapping_matrix"], diagnostic_q)
+    assert context["handoff_surface"] == "input_embedding"
