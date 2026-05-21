@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import re
 import time
 from pathlib import Path
@@ -96,10 +97,13 @@ DEFAULT_MVP_SMOKE_BASELINE_METHODS = (
 DEFAULT_MVP_SMOKE_LATENT_METHODS = (
     "homogeneous_orthogonal_latent",
 )
+DEFAULT_HETERO_SMOKE_AGENT_A_MODEL = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+DEFAULT_HETERO_SMOKE_AGENT_B_MODEL = "Qwen/Qwen3.5-0.8B"
 DEFAULT_HETERO_SMOKE_SAMPLE_INDICES = (0, 2, 3)
 DEFAULT_HETERO_SMOKE_METHODS = (
     "pure_text_cot",
     "text_text_hybrid",
+    "guarded_latent_transfer",
     "prompt_local_latent",
     "global_anchor_hybrid_affine_plus_calibration",
     "hybrid_hl_mas",
@@ -109,6 +113,7 @@ DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
     "text_text_hybrid",
 )
 DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
+    "guarded_latent_transfer",
     "prompt_local_latent",
     "global_anchor_hybrid_affine_plus_calibration",
     "hybrid_hl_mas",
@@ -1111,6 +1116,69 @@ def run_hybrid(
     }
 
 
+def _decoded_answer_is_obvious_degenerate(decoded_text: str) -> bool:
+    predicted_answer = _extract_gsm8k_predicted_answer(decoded_text)
+    if predicted_answer is None:
+        return True
+    stripped_answer = predicted_answer.strip().replace(",", "")
+    if not stripped_answer:
+        return True
+    try:
+        if Decimal(stripped_answer) == 0:
+            return True
+    except InvalidOperation:
+        pass
+    if set(stripped_answer) == {"0"}:
+        return True
+    return False
+
+
+def run_guarded_latent_transfer(
+    prompt: str,
+    target_answer_text: Optional[str],
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    latent_result = run_global_anchor_hybrid_affine_plus_calibration(
+        prompt,
+        target_answer_text,
+        cfg,
+        state,
+    )
+    if not _decoded_answer_is_obvious_degenerate(str(latent_result.get("decoded_text", ""))):
+        return {
+            **latent_result,
+            "alignment_mode": "guarded_latent_transfer",
+            "selection_source": "latent",
+            "selection_reason": "latent_answer_not_degenerate",
+        }
+
+    text_result = run_text_text_hybrid(prompt, target_answer_text, cfg, state)
+    return {
+        **latent_result,
+        "decoded_text": text_result["decoded_text"],
+        "generated_tokens": text_result["generated_tokens"],
+        "decode_status": text_result["decode_status"],
+        "answer_token_count": text_result["answer_token_count"],
+        "answer_nll": text_result["answer_nll"],
+        "answer_perplexity": text_result["answer_perplexity"],
+        "alignment_mode": "guarded_latent_transfer",
+        "selection_source": "text_text_fallback",
+        "selection_reason": "latent_answer_degenerate",
+    }
+
+
+def run_same_family_guarded_latent(
+    prompt: str,
+    target_answer_text: Optional[str],
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    result = run_guarded_latent_transfer(prompt, target_answer_text, cfg, state)
+    result["alignment_mode"] = "same_family_guarded_latent"
+    return result
+
+
 def run_homogeneous_ridge_latent(
     prompt: str,
     target_answer_text: Optional[str],
@@ -1277,6 +1345,8 @@ def _methods_for_suite(
                 "global_anchor_hybrid_affine_plus_calibration",
                 run_global_anchor_hybrid_affine_plus_calibration,
             ),
+            ("guarded_latent_transfer", run_guarded_latent_transfer),
+            ("same_family_guarded_latent", run_same_family_guarded_latent),
             ("hybrid_hl_mas", run_hybrid),
             ("homogeneous_orthogonal_latent", run_homogeneous_orthogonal_control),
         ]
@@ -1323,6 +1393,24 @@ def _coerce_sample_indices(values: Optional[Sequence[Any]]) -> Optional[list[int
     return [int(value) for value in values]
 
 
+def _apply_model_profile_defaults(
+    cfg: Any,
+    *,
+    agent_a_model: Optional[str],
+    agent_b_model: Optional[str],
+    hetero_smoke: bool,
+) -> None:
+    if hetero_smoke:
+        if agent_a_model is None:
+            cfg.agent_a_model = DEFAULT_HETERO_SMOKE_AGENT_A_MODEL
+        if agent_b_model is None:
+            cfg.agent_b_model = DEFAULT_HETERO_SMOKE_AGENT_B_MODEL
+    if agent_a_model is not None:
+        cfg.agent_a_model = str(agent_a_model)
+    if agent_b_model is not None:
+        cfg.agent_b_model = str(agent_b_model)
+
+
 def run_benchmark(
     *,
     suite_name: str,
@@ -1352,10 +1440,12 @@ def run_benchmark(
     answer_only_final: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     base_cfg = _load_cfg()
-    if agent_a_model is not None:
-        base_cfg.agent_a_model = str(agent_a_model)
-    if agent_b_model is not None:
-        base_cfg.agent_b_model = str(agent_b_model)
+    _apply_model_profile_defaults(
+        base_cfg,
+        agent_a_model=agent_a_model,
+        agent_b_model=agent_b_model,
+        hetero_smoke=hetero_smoke,
+    )
     if latent_pooling is not None:
         base_cfg.handoff.latent_pooling = str(latent_pooling)
     if receiver_context_mode is not None:
@@ -1513,6 +1603,14 @@ def run_benchmark(
                         if method_name in {"pure_text_cot", "text_text_hybrid"}
                         else "unknown",
                     )
+                    selection_source = row_result.get(
+                        "selection_source",
+                        "not_applicable",
+                    )
+                    selection_reason = row_result.get(
+                        "selection_reason",
+                        "not_applicable",
+                    )
                     receiver_context_status = row_result.get(
                         "receiver_context_status",
                         "not_applicable" if method_name in {"pure_text_cot", "text_text_hybrid"} else "not_used",
@@ -1541,6 +1639,8 @@ def run_benchmark(
                             "active_kv_cache_status": active_kv_cache_status,
                             "active_kv_cache_reason": active_kv_cache_reason,
                             "active_kv_cache_source": active_kv_cache_source,
+                            "selection_source": selection_source,
+                            "selection_reason": selection_reason,
                             "receiver_context_status": receiver_context_status,
                             "receiver_context_reason": receiver_context_reason,
                             "receiver_context_token_count": receiver_context_token_count,
@@ -1861,8 +1961,9 @@ def main() -> None:
         "--hetero-smoke",
         action="store_true",
         help=(
-            "Use a heterogeneous handoff experiment profile: selected stable GSM8K validation "
-            "samples, text baselines, prompt-local latent, global-anchor calibrated, and hybrid."
+            "Use a heterogeneous handoff experiment profile. Defaults to "
+            f"{DEFAULT_HETERO_SMOKE_AGENT_A_MODEL} -> {DEFAULT_HETERO_SMOKE_AGENT_B_MODEL} "
+            "unless model overrides are supplied."
         ),
     )
     parser.add_argument(

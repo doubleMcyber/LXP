@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 8
+REPORT_SCHEMA_VERSION = 9
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -39,6 +39,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "active_kv_cache_status",
     "active_kv_cache_reason",
     "active_kv_cache_source",
+    "selection_source",
+    "selection_reason",
     "receiver_context_status",
     "receiver_context_reason",
     "receiver_context_token_count",
@@ -99,6 +101,8 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "active_kv_cache_status",
     "active_kv_cache_reason",
     "active_kv_cache_source",
+    "selection_source",
+    "selection_reason",
     "receiver_context_status",
     "receiver_context_reason",
     "receiver_context_latent_position",
@@ -325,6 +329,8 @@ def aggregate_standard_rows(
                 "active_kv_cache_status": _unique_join(group_rows, "active_kv_cache_status"),
                 "active_kv_cache_reason": _unique_join(group_rows, "active_kv_cache_reason"),
                 "active_kv_cache_source": _unique_join(group_rows, "active_kv_cache_source"),
+                "selection_source": _unique_join(group_rows, "selection_source"),
+                "selection_reason": _unique_join(group_rows, "selection_reason"),
                 "receiver_context_status": _unique_join(group_rows, "receiver_context_status"),
                 "receiver_context_reason": _unique_join(group_rows, "receiver_context_reason"),
                 "receiver_context_latent_position": _unique_join(group_rows, "receiver_context_latent_position"),
@@ -725,6 +731,8 @@ def _semantic_row_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
         "kv_cache_status": row.get("kv_cache_status"),
         "active_kv_cache_status": row.get("active_kv_cache_status"),
         "active_kv_cache_source": row.get("active_kv_cache_source"),
+        "selection_source": row.get("selection_source"),
+        "selection_reason": row.get("selection_reason"),
         "receiver_context_status": row.get("receiver_context_status"),
         "receiver_context_reason": row.get("receiver_context_reason"),
         "receiver_context_latent_position": row.get("receiver_context_latent_position"),

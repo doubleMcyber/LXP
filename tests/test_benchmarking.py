@@ -3,7 +3,14 @@ from __future__ import annotations
 from omegaconf import OmegaConf
 import pytest
 
-from benchmark_all import _methods_for_suite, _predicted_answer
+from benchmark_all import (
+    DEFAULT_HETERO_SMOKE_AGENT_A_MODEL,
+    DEFAULT_HETERO_SMOKE_AGENT_B_MODEL,
+    _apply_model_profile_defaults,
+    _decoded_answer_is_obvious_degenerate,
+    _methods_for_suite,
+    _predicted_answer,
+)
 from src.utils.benchmarking import (
     REPORT_SCHEMA_VERSION,
     aggregate_standard_rows,
@@ -315,6 +322,58 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
     assert _predicted_answer("gsm8k", decoded) == "42"
 
 
+def test_guarded_latent_methods_are_available_for_standard_suite() -> None:
+    standard_methods = [name for name, _ in _methods_for_suite("standard")]
+
+    assert "guarded_latent_transfer" in standard_methods
+    assert "same_family_guarded_latent" in standard_methods
+
+
+@pytest.mark.parametrize(
+    "decoded_text",
+    [
+        "",
+        "Final answer: 000",
+        "Final answer: 0.00",
+        "Final answer: -0",
+    ],
+)
+def test_decoded_answer_degenerate_guard_catches_zero_forms(decoded_text: str) -> None:
+    assert _decoded_answer_is_obvious_degenerate(decoded_text) is True
+
+
+def test_decoded_answer_degenerate_guard_allows_nonzero_answer() -> None:
+    assert _decoded_answer_is_obvious_degenerate("Final answer: 28") is False
+
+
+def test_hetero_smoke_uses_cross_family_default_models() -> None:
+    cfg = _make_cfg()
+
+    _apply_model_profile_defaults(
+        cfg,
+        agent_a_model=None,
+        agent_b_model=None,
+        hetero_smoke=True,
+    )
+
+    assert cfg.agent_a_model == DEFAULT_HETERO_SMOKE_AGENT_A_MODEL
+    assert cfg.agent_b_model == DEFAULT_HETERO_SMOKE_AGENT_B_MODEL
+
+
+def test_hetero_smoke_model_overrides_win() -> None:
+    cfg = _make_cfg()
+
+    _apply_model_profile_defaults(
+        cfg,
+        agent_a_model="custom-a",
+        agent_b_model="custom-b",
+        hetero_smoke=True,
+    )
+
+    assert cfg.agent_a_model == "custom-a"
+    assert cfg.agent_b_model == "custom-b"
+
+
 def test_build_phase1_gate_report_passes_when_thresholds_are_met() -> None:
     summary_rows = [
         {
@@ -446,6 +505,8 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert "global_anchor_ridge" in standard_methods
     assert "global_anchor_hybrid_affine" in standard_methods
     assert "global_anchor_hybrid_affine_plus_calibration" in standard_methods
+    assert "guarded_latent_transfer" in standard_methods
+    assert "same_family_guarded_latent" in standard_methods
     assert "hybrid_hl_mas" in standard_methods
     assert "homogeneous_orthogonal_latent" in standard_methods
 
