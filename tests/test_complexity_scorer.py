@@ -8,6 +8,7 @@ from latent_pipeline import (
     _build_integration_time_space,
     _compute_logits_entropy,
     _confidence_gate_settings,
+    _latent_prefix_mode,
     _latent_pooling_mode,
     _pool_latent_handoff_step,
     _receiver_context_latent_position,
@@ -116,6 +117,7 @@ def test_prompt_mean_latent_pooling_uses_attention_mask() -> None:
 def test_handoff_config_defaults_to_auto_context_and_last_token_pooling() -> None:
     cfg = OmegaConf.create({})
 
+    assert _latent_prefix_mode(cfg) == "sequence"
     assert _latent_pooling_mode(cfg) == "last_token"
     assert _receiver_context_mode(cfg) == "auto"
     assert _receiver_context_latent_position(cfg) == "after_context"

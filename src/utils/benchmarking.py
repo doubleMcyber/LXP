@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 9
+REPORT_SCHEMA_VERSION = 10
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -39,8 +39,6 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "active_kv_cache_status",
     "active_kv_cache_reason",
     "active_kv_cache_source",
-    "selection_source",
-    "selection_reason",
     "receiver_context_status",
     "receiver_context_reason",
     "receiver_context_token_count",
@@ -101,8 +99,6 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "active_kv_cache_status",
     "active_kv_cache_reason",
     "active_kv_cache_source",
-    "selection_source",
-    "selection_reason",
     "receiver_context_status",
     "receiver_context_reason",
     "receiver_context_latent_position",
@@ -329,8 +325,6 @@ def aggregate_standard_rows(
                 "active_kv_cache_status": _unique_join(group_rows, "active_kv_cache_status"),
                 "active_kv_cache_reason": _unique_join(group_rows, "active_kv_cache_reason"),
                 "active_kv_cache_source": _unique_join(group_rows, "active_kv_cache_source"),
-                "selection_source": _unique_join(group_rows, "selection_source"),
-                "selection_reason": _unique_join(group_rows, "selection_reason"),
                 "receiver_context_status": _unique_join(group_rows, "receiver_context_status"),
                 "receiver_context_reason": _unique_join(group_rows, "receiver_context_reason"),
                 "receiver_context_latent_position": _unique_join(group_rows, "receiver_context_latent_position"),
@@ -502,6 +496,7 @@ def build_semantic_smoke_report(
         row
         for row in latent_rows
         if row.get("kv_cache_transferred") is not None and row.get("kv_cache_transferred") != ""
+        and str(row.get("kv_cache_status") or "") != "not_provided"
     ]
     compatible_cache_rows = [
         row for row in latent_kv_rows if bool(row.get("kv_cache_transferred"))
@@ -557,7 +552,7 @@ def build_semantic_smoke_report(
         else None
     )
     compatibility = model_pair_compatibility or {}
-    cache_transfer_required = bool(compatibility.get("kv_cache_compatible", False))
+    cache_transfer_required = bool(compatibility.get("kv_cache_compatible", False)) and bool(latent_kv_rows)
 
     missing_requirements: list[str] = []
     if not baseline_rows:
@@ -731,8 +726,6 @@ def _semantic_row_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
         "kv_cache_status": row.get("kv_cache_status"),
         "active_kv_cache_status": row.get("active_kv_cache_status"),
         "active_kv_cache_source": row.get("active_kv_cache_source"),
-        "selection_source": row.get("selection_source"),
-        "selection_reason": row.get("selection_reason"),
         "receiver_context_status": row.get("receiver_context_status"),
         "receiver_context_reason": row.get("receiver_context_reason"),
         "receiver_context_latent_position": row.get("receiver_context_latent_position"),

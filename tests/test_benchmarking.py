@@ -6,8 +6,8 @@ import pytest
 from benchmark_all import (
     DEFAULT_HETERO_SMOKE_AGENT_A_MODEL,
     DEFAULT_HETERO_SMOKE_AGENT_B_MODEL,
+    FINAL_ANSWER_COMPLETE_REGEX,
     _apply_model_profile_defaults,
-    _decoded_answer_is_obvious_degenerate,
     _methods_for_suite,
     _predicted_answer,
 )
@@ -241,6 +241,44 @@ def test_semantic_smoke_report_checks_baseline_decode_cache_and_perplexity() -> 
     assert report["degenerate_decode_count"] == 0
 
 
+def test_semantic_smoke_report_does_not_require_kv_for_soft_prefix_rows() -> None:
+    rows = [
+        {
+            "method": "pure_text_cot",
+            "predicted_answer": "42",
+            "target_answer": "42",
+            "correct": True,
+            "decoded_text": "Final answer: 42",
+            "answer_perplexity": 2.0,
+        },
+        {
+            "method": "hybrid_hl_mas",
+            "predicted_answer": "42",
+            "target_answer": "42",
+            "correct": True,
+            "decoded_text": "Final answer: 42",
+            "kv_cache_transferred": False,
+            "kv_cache_status": "not_provided",
+            "answer_perplexity": 3.0,
+        },
+    ]
+
+    report = build_semantic_smoke_report(
+        rows,
+        baseline_methods=("pure_text_cot",),
+        latent_methods=("hybrid_hl_mas",),
+        model_pair_compatibility={
+            "kv_cache_compatible": True,
+            "status": "predicted_compatible",
+            "reason": "matching_cache_topology",
+        },
+    )
+
+    assert report["passed"] is True
+    assert report["cache_transfer_required"] is False
+    assert report["compatible_cache_transfer_rate_percentage"] is None
+
+
 def test_semantic_smoke_report_flags_degenerate_decode_and_high_perplexity() -> None:
     report = build_semantic_smoke_report(
         [
@@ -322,28 +360,17 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
     assert _predicted_answer("gsm8k", decoded) == "42"
 
 
-def test_guarded_latent_methods_are_available_for_standard_suite() -> None:
+def test_final_answer_stop_regex_waits_for_numeric_delimiter() -> None:
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9") is None
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9800 ") is not None
+
+
+def test_raw_latent_methods_are_available_for_standard_suite() -> None:
     standard_methods = [name for name, _ in _methods_for_suite("standard")]
 
-    assert "guarded_latent_transfer" in standard_methods
-    assert "same_family_guarded_latent" in standard_methods
-
-
-@pytest.mark.parametrize(
-    "decoded_text",
-    [
-        "",
-        "Final answer: 000",
-        "Final answer: 0.00",
-        "Final answer: -0",
-    ],
-)
-def test_decoded_answer_degenerate_guard_catches_zero_forms(decoded_text: str) -> None:
-    assert _decoded_answer_is_obvious_degenerate(decoded_text) is True
-
-
-def test_decoded_answer_degenerate_guard_allows_nonzero_answer() -> None:
-    assert _decoded_answer_is_obvious_degenerate("Final answer: 28") is False
+    assert "prompt_local_latent" in standard_methods
+    assert "global_anchor_hybrid_affine_plus_calibration" in standard_methods
+    assert "hybrid_hl_mas" in standard_methods
 
 
 def test_hetero_smoke_uses_cross_family_default_models() -> None:
@@ -505,8 +532,7 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert "global_anchor_ridge" in standard_methods
     assert "global_anchor_hybrid_affine" in standard_methods
     assert "global_anchor_hybrid_affine_plus_calibration" in standard_methods
-    assert "guarded_latent_transfer" in standard_methods
-    assert "same_family_guarded_latent" in standard_methods
+    assert "prompt_local_latent" in standard_methods
     assert "hybrid_hl_mas" in standard_methods
     assert "homogeneous_orthogonal_latent" in standard_methods
 

@@ -44,11 +44,12 @@ alignment:
     clip_std_multiplier: 4.0
   prompt_calibration:
     enabled: true
-    strength: 0.2
-    max_norm_ratio: 0.15
+    strength: 1.0
+    max_norm_ratio: 0.0
 
 handoff:
   latent_pooling: "last_token"
+  latent_prefix_mode: "sequence"
   receiver_context:
     mode: "auto"
     latent_position: "after_context"

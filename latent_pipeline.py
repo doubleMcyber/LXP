@@ -29,6 +29,7 @@ from src.models.dynamics import (
 )
 from src.utils.alignment import (
     apply_alignment,
+    apply_linear_mapping,
     compute_cross_covariance,
     compute_alignment_state,
     compute_orthogonal_mapping,
@@ -36,6 +37,7 @@ from src.utils.alignment import (
     resolve_shared_semantic_anchor_ids,
 )
 from src.utils.lm_eval import (
+    append_text_to_prefix_state,
     compute_answer_metrics_from_prefix,
     greedy_decode_from_prefix,
     prepare_latent_prefix_state,
@@ -57,9 +59,14 @@ _ALIGNMENT_CACHE_VERSION = 4
 _SUPPORTED_HANDOFF_TARGETS: frozenset[str] = frozenset({"input_embedding"})
 _SUPPORTED_DIAGNOSTIC_TARGETS: frozenset[str] = frozenset({"hidden_consensus"})
 _SUPPORTED_LATENT_POOLING_MODES: frozenset[str] = frozenset({"last_token", "mean", "prompt_mean"})
+_SUPPORTED_LATENT_PREFIX_MODES: frozenset[str] = frozenset({"scalar", "sequence"})
 _SUPPORTED_RECEIVER_CONTEXT_MODES: frozenset[str] = frozenset({"none", "auto", "prompt_prefix"})
 _SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS: frozenset[str] = frozenset(
     {"after_context", "before_context"}
+)
+_FINAL_ANSWER_COMPLETE_REGEX = re.compile(
+    r"final\s+answer\s*[:=]\s*\$?\s*-?\d[\d,]*(?:\.\d+)?(?:\s|[^\d,.])",
+    re.IGNORECASE,
 )
 _MATH_COMPLEXITY_PATTERNS: tuple[str, ...] = (
     "solve",
@@ -233,6 +240,14 @@ def _latent_pooling_mode(cfg: Optional[DictConfig]) -> str:
     return "mean" if mode == "prompt_mean" else mode
 
 
+def _latent_prefix_mode(cfg: Optional[DictConfig]) -> str:
+    mode = str(getattr(_handoff_cfg(cfg), "latent_prefix_mode", "sequence")).strip().lower()
+    if mode not in _SUPPORTED_LATENT_PREFIX_MODES:
+        supported = ", ".join(sorted(_SUPPORTED_LATENT_PREFIX_MODES))
+        raise ValueError(f"handoff.latent_prefix_mode must be one of: {supported}")
+    return mode
+
+
 def _receiver_context_mode(cfg: Optional[DictConfig]) -> str:
     context_cfg = getattr(_handoff_cfg(cfg), "receiver_context", None)
     mode = str(getattr(context_cfg, "mode", "auto")).strip().lower()
@@ -276,6 +291,10 @@ def _answer_only_final_enabled(cfg: Optional[DictConfig]) -> bool:
     return bool(getattr(getattr(cfg, "benchmark", None), "answer_only_final", False))
 
 
+def _decode_stop_regex(cfg: Optional[DictConfig]) -> Optional[re.Pattern[str]]:
+    return _FINAL_ANSWER_COMPLETE_REGEX if _answer_only_final_enabled(cfg) else None
+
+
 def _format_receiver_context_prompt(prompt: str, tokenizer: Any = None, cfg: Optional[DictConfig] = None) -> str:
     instruction = (
         "Use the latent reasoning signal that follows. Return only the final answer "
@@ -291,6 +310,59 @@ def _format_receiver_context_answer_suffix(cfg: Optional[DictConfig] = None) -> 
     if not _answer_only_final_enabled(cfg):
         return ""
     return "\n\nFinal answer:"
+
+
+def _resample_sequence(reference: torch.Tensor, target_steps: int) -> torch.Tensor:
+    if reference.dim() != 3:
+        raise ValueError("reference must have shape [batch, steps, dim]")
+    if target_steps <= 0:
+        raise ValueError("target_steps must be positive")
+    if target_steps == 1:
+        return reference[:, -1:, :]
+    if int(reference.shape[1]) == target_steps:
+        return reference
+    resized = F.interpolate(
+        reference.float().transpose(1, 2),
+        size=int(target_steps),
+        mode="linear",
+        align_corners=True,
+    )
+    return resized.transpose(1, 2).to(dtype=reference.dtype)
+
+
+def _compute_receiver_reference_handoff_sequence(
+    *,
+    prompt: str,
+    state: dict[str, Any],
+    target_steps: int,
+) -> torch.Tensor:
+    tokenizer_b = state["tokenizer_b"]
+    agent_b = state["agent_b"]
+    agent_b_device = next(agent_b.parameters()).device
+    encoded_b = tokenizer_b(prompt, return_tensors="pt")
+    input_ids_b = encoded_b["input_ids"].to(agent_b_device)
+    with torch.no_grad():
+        receiver_input_embeddings = agent_b.get_input_embeddings()(input_ids_b)
+    return _resample_sequence(receiver_input_embeddings, target_steps)
+
+
+def _maybe_append_answer_suffix_to_prefix_state(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    cfg: Optional[DictConfig],
+    prefix_state: dict[str, Any],
+) -> dict[str, Any]:
+    suffix_text = _format_receiver_context_answer_suffix(cfg)
+    if not suffix_text.strip():
+        return prefix_state
+    return append_text_to_prefix_state(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_state=prefix_state,
+        suffix_text=suffix_text,
+        decoded_text_prefix="Final answer:",
+    )
 
 
 def _pool_latent_handoff_step(
@@ -1359,6 +1431,44 @@ def _apply_prompt_calibration(
     return calibrated, correction_norm
 
 
+def _apply_local_sequence_calibration(
+    source_step: torch.Tensor,
+    handoff_step: torch.Tensor,
+    receiver_reference_handoff: torch.Tensor,
+    *,
+    strength: float,
+    max_norm_ratio: float,
+) -> tuple[torch.Tensor, float]:
+    local_q = compute_orthogonal_mapping(
+        source_step.detach().float(),
+        receiver_reference_handoff.detach().float().to(handoff_step.device),
+    ).to(device=handoff_step.device, dtype=handoff_step.dtype)
+    locally_aligned = apply_linear_mapping(
+        source_step.to(device=handoff_step.device, dtype=handoff_step.dtype),
+        local_q,
+    )
+    correction = (locally_aligned - handoff_step).float() * float(strength)
+    correction_norm = float(
+        torch.linalg.vector_norm(correction.reshape(correction.shape[0], -1), dim=-1)
+        .mean()
+        .item()
+    )
+    if max_norm_ratio > 0.0:
+        handoff_norm = torch.linalg.vector_norm(
+            handoff_step.float().reshape(handoff_step.shape[0], -1),
+            dim=-1,
+        ).mean()
+        max_norm = float(handoff_norm.item()) * float(max_norm_ratio)
+        if correction_norm > max_norm > 0.0:
+            correction = correction * (max_norm / max(correction_norm, 1e-8))
+            correction_norm = max_norm
+    calibrated = handoff_step + correction.to(
+        device=handoff_step.device,
+        dtype=handoff_step.dtype,
+    )
+    return calibrated, correction_norm
+
+
 def get_global_alignment_metadata(cfg: DictConfig) -> dict[str, Any]:
     state = _get_pipeline_state(cfg)
     return {
@@ -1518,6 +1628,8 @@ def run_hybrid_pipeline(
     )
     dynamics_mode = _dynamics_mode(cfg)
     latent_pooling_mode = _latent_pooling_mode(cfg)
+    latent_prefix_mode = _latent_prefix_mode(cfg)
+    sequence_prefix = latent_prefix_mode == "sequence"
     receiver_context_mode = _receiver_context_mode(cfg)
     receiver_context_latent_position = _receiver_context_latent_position(cfg)
     trace_events: list[dict[str, Any]] = []
@@ -1582,16 +1694,24 @@ def run_hybrid_pipeline(
         attention_mask_a,
         pooling_mode=latent_pooling_mode,
     )
+    if sequence_prefix and int(consensus_hidden_states.shape[0]) == 1:
+        valid_tokens = attention_mask_a[0].to(dtype=torch.bool)
+        handoff_latent_source = consensus_hidden_states[:, valid_tokens, :]
+    elif sequence_prefix:
+        handoff_latent_source = consensus_hidden_states
+    else:
+        handoff_latent_source = current_latent_step
     trace_events.append(
         _trace_tensor_event(
             operation="sender_consensus",
-            tensor=current_latent_step,
+            tensor=handoff_latent_source,
             source_surface="reasoner_hidden_consensus",
             target_surface="reasoner_hidden_consensus",
             model_id=str(cfg.agent_a_model),
             diagnostics={
                 "reasoning_layer_indices": reasoning_layer_indices,
                 "latent_pooling": latent_pooling_mode,
+                "latent_prefix_mode": latent_prefix_mode,
             },
         )
     )
@@ -1631,6 +1751,8 @@ def run_hybrid_pipeline(
         alignment_state,
     )
     current_latent_step = continuous_trajectory[-1]
+    if not sequence_prefix:
+        handoff_latent_source = current_latent_step
 
     integration_duration = _time_simulated_integration(
         dynamics_mode=dynamics_mode,
@@ -1641,9 +1763,13 @@ def run_hybrid_pipeline(
 
     agent_b_embed_dtype = agent_b.get_input_embeddings().weight.dtype
     agent_b_embed_dim = agent_b.get_input_embeddings().weight.shape[-1]
-    aligned_handoff_step = apply_alignment(current_latent_step, alignment_state)
+    aligned_handoff_step = apply_alignment(handoff_latent_source, alignment_state)
     handoff_status = "ok"
-    handoff_surface = state.get("handoff_surface", _alignment_handoff_target(cfg))
+    handoff_surface = (
+        "input_embedding_sequence"
+        if sequence_prefix
+        else state.get("handoff_surface", _alignment_handoff_target(cfg))
+    )
     if aligned_handoff_step.shape[-1] != agent_b_embed_dim:
         handoff_status = "dimension_mismatch"
         raise ValueError(
@@ -1669,21 +1795,29 @@ def run_hybrid_pipeline(
     receiver_reference_handoff_cpu: Optional[torch.Tensor] = None
     receiver_reference_handoff_for_metrics: Optional[torch.Tensor] = None
     if prompt_calibration_enabled or collect_alignment_metrics:
-        receiver_reference_handoff = _compute_receiver_reference_handoff(
+        receiver_reference_handoff = _compute_receiver_reference_handoff_sequence(
             prompt=prompt,
             state=state,
-            reasoning_layer_indices=reasoning_layer_indices,
-            reasoning_layer_weights=reasoning_layer_weights,
+            target_steps=int(aligned_handoff_step.shape[1]),
         ).to(device=agent_b_device, dtype=aligned_handoff_step.dtype)
         receiver_reference_handoff_for_metrics = receiver_reference_handoff
         receiver_reference_handoff_cpu = receiver_reference_handoff.detach().cpu()
         if prompt_calibration_enabled:
-            aligned_handoff_step, calibration_bias_norm = _apply_prompt_calibration(
-                aligned_handoff_step,
-                receiver_reference_handoff,
-                strength=prompt_calibration_strength,
-                max_norm_ratio=prompt_calibration_max_norm,
-            )
+            if sequence_prefix:
+                aligned_handoff_step, calibration_bias_norm = _apply_local_sequence_calibration(
+                    handoff_latent_source,
+                    aligned_handoff_step,
+                    receiver_reference_handoff,
+                    strength=prompt_calibration_strength,
+                    max_norm_ratio=prompt_calibration_max_norm,
+                )
+            else:
+                aligned_handoff_step, calibration_bias_norm = _apply_prompt_calibration(
+                    aligned_handoff_step,
+                    receiver_reference_handoff,
+                    strength=prompt_calibration_strength,
+                    max_norm_ratio=prompt_calibration_max_norm,
+                )
     handoff_step = aligned_handoff_step.to(
         device=agent_b_device,
         dtype=agent_b_embed_dtype,
@@ -1691,7 +1825,7 @@ def run_hybrid_pipeline(
     sender_prefix_state = prepare_latent_prefix_state(
         model=agent_b,
         handoff_step=handoff_step,
-        kv_cache=kv_cache_a,
+        kv_cache=None if sequence_prefix else kv_cache_a,
     )
     kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
     kv_cache_status = str(
@@ -1714,7 +1848,7 @@ def run_hybrid_pipeline(
     active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
     active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
 
-    if _should_use_receiver_context(
+    if (not sequence_prefix) and _should_use_receiver_context(
         receiver_context_mode,
         sender_kv_cache_transferred=kv_cache_transferred,
     ):
@@ -1746,6 +1880,13 @@ def run_hybrid_pipeline(
         active_kv_cache_source = str(prefix_state.get("active_kv_cache_source", "receiver_context"))
     else:
         prefix_state = sender_prefix_state
+        if sequence_prefix:
+            prefix_state = _maybe_append_answer_suffix_to_prefix_state(
+                model=agent_b,
+                tokenizer=tokenizer_b,
+                cfg=cfg,
+                prefix_state=prefix_state,
+            )
 
     outputs_b = prefix_state["outputs"]
     raw_handoff_entropy = float(
@@ -1753,7 +1894,8 @@ def run_hybrid_pipeline(
     )
     handoff_uncertainty = raw_handoff_entropy / max(complexity_factor, 1e-8)
     fallback_triggered = (
-        confidence_gate_enabled
+        (not sequence_prefix)
+        and confidence_gate_enabled
         and extra_discrete_steps > 0
         and handoff_uncertainty > uncertainty_threshold
     )
@@ -1843,11 +1985,10 @@ def run_hybrid_pipeline(
 
     if collect_alignment_metrics:
         if receiver_reference_handoff_for_metrics is None:
-            receiver_reference_handoff_for_metrics = _compute_receiver_reference_handoff(
+            receiver_reference_handoff_for_metrics = _compute_receiver_reference_handoff_sequence(
                 prompt=prompt,
                 state=state,
-                reasoning_layer_indices=reasoning_layer_indices,
-                reasoning_layer_weights=reasoning_layer_weights,
+                target_steps=int(handoff_step.shape[1]),
             ).to(device=agent_b_device, dtype=handoff_step.dtype)
             receiver_reference_handoff_cpu = receiver_reference_handoff_for_metrics.detach().cpu()
         backbone_mapping = alignment_state.get(
@@ -1857,7 +1998,7 @@ def run_hybrid_pipeline(
         backbone_alignment_state = {
             "mapping_matrix": backbone_mapping,
         }
-        backbone_handoff_step = apply_alignment(current_latent_step, backbone_alignment_state).to(
+        backbone_handoff_step = apply_alignment(handoff_latent_source, backbone_alignment_state).to(
             device=agent_b_device,
             dtype=handoff_step.dtype,
         )
@@ -1901,6 +2042,7 @@ def run_hybrid_pipeline(
         tokenizer=tokenizer_b,
         prefix_state=prefix_state,
         max_new_tokens=int(cfg.max_new_tokens),
+        stop_regex=_decode_stop_regex(cfg),
     )
     decoded_text = str(decode_metrics["decoded_text"])
     decode_status = "decoded" if decoded_text.strip() else "empty_decode"
@@ -1948,6 +2090,7 @@ def run_hybrid_pipeline(
         "complexity_factor": complexity_factor,
         "dynamics_mode": dynamics_mode,
         "latent_pooling": latent_pooling_mode,
+        "latent_prefix_mode": latent_prefix_mode,
         "receiver_context_mode": receiver_context_mode,
         "receiver_context_latent_position": receiver_context_latent_position,
         "alignment_mode": alignment_mode,
@@ -1967,8 +2110,8 @@ def run_hybrid_pipeline(
         "continuous_integration_steps": effective_simulated_steps,
         "reasoning_layer_indices": reasoning_layer_indices,
         "consensus_latent_shape": tuple(consensus_hidden_states.shape),
-        "final_latent_shape": tuple(current_latent_step.shape),
-        "final_latent_dtype": str(current_latent_step.dtype),
+        "final_latent_shape": tuple(handoff_latent_source.shape),
+        "final_latent_dtype": str(handoff_latent_source.dtype),
         "procrustes_q_shape": tuple(state["global_alignment_q"].shape),
         "handoff_q_shape": tuple(
             state.get("handoff_alignment_q", state["global_alignment_q"]).shape
@@ -1978,7 +2121,7 @@ def run_hybrid_pipeline(
         "alignment_bias_norm": alignment_state.get("bias_norm"),
         "prompt_calibration_enabled": prompt_calibration_enabled,
         "prompt_calibration_bias_norm": calibration_bias_norm,
-        "pre_alignment_handoff": current_latent_step.detach().cpu(),
+        "pre_alignment_handoff": handoff_latent_source.detach().cpu(),
         "post_alignment_handoff": handoff_step.detach().cpu(),
         "aligned_continuous_trajectory": aligned_continuous_trajectory.detach().cpu(),
         "alignment_metrics_collected": collect_alignment_metrics,

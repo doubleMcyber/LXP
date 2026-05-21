@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Optional
 
 import torch
@@ -276,6 +277,7 @@ def greedy_decode_from_prefix(
     tokenizer: Any,
     prefix_state: dict[str, Any],
     max_new_tokens: int,
+    stop_regex: Optional[re.Pattern[str]] = None,
 ) -> dict[str, Any]:
     outputs = prefix_state["outputs"]
     attention_mask = prefix_state["attention_mask"]
@@ -290,6 +292,12 @@ def greedy_decode_from_prefix(
         if eos_token_id is not None and next_token_id == eos_token_id:
             break
         generated_token_ids.append(next_token_id)
+        decoded_text = str(prefix_state.get("decoded_text_prefix", "")) + tokenizer.decode(
+            generated_token_ids,
+            skip_special_tokens=True,
+        )
+        if stop_regex is not None and stop_regex.search(decoded_text) is not None:
+            break
         kv_cache = _normalize_kv_cache(outputs.past_key_values)
         attention_mask = torch.cat(
             [
