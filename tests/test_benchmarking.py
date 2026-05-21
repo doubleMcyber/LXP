@@ -314,6 +314,37 @@ def test_semantic_smoke_report_flags_degenerate_decode_and_high_perplexity() -> 
     assert any("degenerate" in item for item in report["missing_requirements"])
 
 
+def test_semantic_smoke_answer_perplexity_gate_scopes_to_latent_rows() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "pure_text_cot",
+                "predicted_answer": "13",
+                "target_answer": "2",
+                "correct": False,
+                "decoded_text": "Final answer: 13",
+                "answer_perplexity": 20000.0,
+            },
+            {
+                "method": "hybrid_hl_mas",
+                "predicted_answer": "2",
+                "target_answer": "2",
+                "correct": True,
+                "decoded_text": "Final answer: 2",
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 20.0,
+            },
+        ],
+        baseline_methods=("pure_text_cot",),
+        latent_methods=("hybrid_hl_mas",),
+        max_answer_perplexity=10000.0,
+    )
+
+    assert report["max_answer_perplexity"] == 20.0
+    assert report["max_all_answer_perplexity"] == 20000.0
+    assert not any("perplexity" in item for item in report["missing_requirements"])
+
+
 def test_semantic_smoke_report_can_require_accuracy_and_final_answer_markers() -> None:
     report = build_semantic_smoke_report(
         [
@@ -363,6 +394,7 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
 def test_final_answer_stop_regex_waits_for_numeric_delimiter() -> None:
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9") is None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9800 ") is not None
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: **252**") is not None
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:

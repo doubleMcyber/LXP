@@ -27,6 +27,8 @@ from latent_pipeline import (
     _run_actor_handoff,
     _select_hidden_layers,
     _should_use_receiver_context,
+    apply_embedding_manifold_projection,
+    apply_handoff_adapter,
     run_hybrid_pipeline,
 )
 from src.data.loader import get_dataloader, pick_field
@@ -77,11 +79,11 @@ DEFAULT_SEMANTIC_SMOKE_MAX_NEW_TOKENS = 128
 DEFAULT_SEMANTIC_SMOKE_METHODS = (
     "pure_text_cot",
     "text_text_hybrid",
-    "homogeneous_orthogonal_latent",
+    "global_anchor_hybrid_affine",
     "hybrid_hl_mas",
 )
 DEFAULT_SEMANTIC_SMOKE_LATENT_METHODS = (
-    "homogeneous_orthogonal_latent",
+    "global_anchor_hybrid_affine",
     "hybrid_hl_mas",
 )
 DEFAULT_MVP_SMOKE_SAMPLE_INDICES = (0, 2, 3)
@@ -103,8 +105,7 @@ DEFAULT_HETERO_SMOKE_SAMPLE_INDICES = (0, 2, 3)
 DEFAULT_HETERO_SMOKE_METHODS = (
     "pure_text_cot",
     "text_text_hybrid",
-    "prompt_local_latent",
-    "global_anchor_hybrid_affine_plus_calibration",
+    "global_anchor_hybrid_affine",
     "hybrid_hl_mas",
 )
 DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
@@ -112,8 +113,7 @@ DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
     "text_text_hybrid",
 )
 DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
-    "prompt_local_latent",
-    "global_anchor_hybrid_affine_plus_calibration",
+    "global_anchor_hybrid_affine",
     "hybrid_hl_mas",
 )
 GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
@@ -122,7 +122,7 @@ FINAL_ANSWER_MARKER_REGEX = re.compile(
     re.IGNORECASE,
 )
 FINAL_ANSWER_COMPLETE_REGEX = re.compile(
-    r"final\s+answer\s*[:=]\s*\$?\s*-?\d[\d,]*(?:\.\d+)?(?:\s|[^\d,.])",
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.])",
     re.IGNORECASE,
 )
 NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
@@ -733,6 +733,8 @@ def _alignment_distances(
     state: dict[str, Any],
     current_latent_step: torch.Tensor,
     alignment_state: dict[str, Any] | torch.Tensor,
+    cfg: Optional[Any] = None,
+    adapter_state: Optional[dict[str, Any]] = None,
     calibration_strength: float = 0.0,
     calibration_max_norm_ratio: float = 0.0,
 ) -> dict[str, Optional[float]]:
@@ -742,6 +744,10 @@ def _alignment_distances(
         int(current_latent_step.shape[1]),
     ).to(device=current_latent_step.device, dtype=current_latent_step.dtype)
     handoff_step = apply_alignment(current_latent_step, alignment_state)
+    if adapter_state is not None:
+        handoff_step = apply_alignment(handoff_step, adapter_state)
+    if cfg is not None:
+        handoff_step, _ = apply_embedding_manifold_projection(handoff_step, cfg, state)
     if calibration_strength > 0.0:
         correction = (receiver_reference_handoff - handoff_step) * float(calibration_strength)
         correction_norm = torch.linalg.vector_norm(
@@ -1033,6 +1039,15 @@ def _run_global_anchor_variant(
         device=agent_b_device,
         dtype=agent_b.get_input_embeddings().weight.dtype,
     )
+    handoff_step, adapter_metrics = apply_handoff_adapter(
+        handoff_step,
+        variant_state,
+    )
+    handoff_step, manifold_metrics = apply_embedding_manifold_projection(
+        handoff_step,
+        variant_cfg,
+        variant_state,
+    )
     calibration_bias_norm: Optional[float] = None
     if prompt_calibration_enabled:
         receiver_reference_handoff = _receiver_reference_for_handoff(
@@ -1085,6 +1100,10 @@ def _run_global_anchor_variant(
             state=variant_state,
             current_latent_step=handoff_source,
             alignment_state=alignment_state,
+            cfg=variant_cfg,
+            adapter_state=variant_state.get("handoff_adapter_state")
+            if bool(variant_state.get("handoff_adapter_enabled", False))
+            else None,
             calibration_strength=calibration_strength,
             calibration_max_norm_ratio=calibration_max_norm_ratio,
         ),
@@ -1110,6 +1129,35 @@ def _run_global_anchor_variant(
         ),
         "prompt_calibration_enabled": bool(prompt_calibration_enabled),
         "prompt_calibration_bias_norm": calibration_bias_norm,
+        "handoff_adapter_enabled": bool(variant_state.get("handoff_adapter_enabled", False)),
+        "handoff_adapter_status": variant_state.get("handoff_adapter_status"),
+        "handoff_adapter_applied": adapter_metrics["handoff_adapter_applied"],
+        "handoff_adapter_delta_norm": adapter_metrics["handoff_adapter_delta_norm"],
+        "handoff_adapter_cache_hit": variant_state.get("handoff_adapter_cache_hit"),
+        "handoff_adapter_cache_path": variant_state.get("handoff_adapter_cache_path"),
+        "handoff_adapter_training_prompt_count": variant_state.get(
+            "handoff_adapter_training_prompt_count"
+        ),
+        "handoff_adapter_training_token_count": variant_state.get(
+            "handoff_adapter_training_token_count"
+        ),
+        "handoff_adapter_training_reconstruction_mse": variant_state.get(
+            "handoff_adapter_training_reconstruction_mse"
+        ),
+        "handoff_adapter_training_mean_cosine_similarity": variant_state.get(
+            "handoff_adapter_training_mean_cosine_similarity"
+        ),
+        "embedding_manifold_enabled": bool(
+            getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
+        ),
+        "embedding_manifold_applied": manifold_metrics["embedding_manifold_applied"],
+        "embedding_manifold_delta_norm": manifold_metrics["embedding_manifold_delta_norm"],
+        "embedding_manifold_mean_top_similarity": manifold_metrics[
+            "embedding_manifold_mean_top_similarity"
+        ],
+        "embedding_manifold_unique_token_count": manifold_metrics[
+            "embedding_manifold_unique_token_count"
+        ],
         "handoff_uncertainty": None,
         "confidence_gate_triggered": False,
         "fallback_discrete_reasoning_steps": 0,
@@ -1241,6 +1289,33 @@ def run_hybrid(
         "alignment_bias_norm": output.get("alignment_bias_norm"),
         "prompt_calibration_enabled": output.get("prompt_calibration_enabled"),
         "prompt_calibration_bias_norm": output.get("prompt_calibration_bias_norm"),
+        "handoff_adapter_enabled": output.get("handoff_adapter_enabled"),
+        "handoff_adapter_status": output.get("handoff_adapter_status"),
+        "handoff_adapter_applied": output.get("handoff_adapter_applied"),
+        "handoff_adapter_delta_norm": output.get("handoff_adapter_delta_norm"),
+        "handoff_adapter_cache_hit": output.get("handoff_adapter_cache_hit"),
+        "handoff_adapter_cache_path": output.get("handoff_adapter_cache_path"),
+        "handoff_adapter_training_prompt_count": output.get(
+            "handoff_adapter_training_prompt_count"
+        ),
+        "handoff_adapter_training_token_count": output.get(
+            "handoff_adapter_training_token_count"
+        ),
+        "handoff_adapter_training_reconstruction_mse": output.get(
+            "handoff_adapter_training_reconstruction_mse"
+        ),
+        "handoff_adapter_training_mean_cosine_similarity": output.get(
+            "handoff_adapter_training_mean_cosine_similarity"
+        ),
+        "embedding_manifold_enabled": output.get("embedding_manifold_enabled"),
+        "embedding_manifold_applied": output.get("embedding_manifold_applied"),
+        "embedding_manifold_delta_norm": output.get("embedding_manifold_delta_norm"),
+        "embedding_manifold_mean_top_similarity": output.get(
+            "embedding_manifold_mean_top_similarity"
+        ),
+        "embedding_manifold_unique_token_count": output.get(
+            "embedding_manifold_unique_token_count"
+        ),
     }
 
 
@@ -1494,6 +1569,12 @@ def run_benchmark(
     prompt_calibration_enabled: Optional[bool] = None,
     prompt_calibration_strength: Optional[float] = None,
     prompt_calibration_max_norm_ratio: Optional[float] = None,
+    handoff_adapter_enabled: Optional[bool] = None,
+    handoff_adapter_train_on_missing: Optional[bool] = None,
+    handoff_adapter_train_limit: Optional[int] = None,
+    embedding_manifold_enabled: Optional[bool] = None,
+    embedding_manifold_top_k: Optional[int] = None,
+    embedding_manifold_blend: Optional[float] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -1521,6 +1602,18 @@ def run_benchmark(
         base_cfg.alignment.prompt_calibration.strength = float(prompt_calibration_strength)
     if prompt_calibration_max_norm_ratio is not None:
         base_cfg.alignment.prompt_calibration.max_norm_ratio = float(prompt_calibration_max_norm_ratio)
+    if handoff_adapter_enabled is not None:
+        base_cfg.handoff.adapter.enabled = bool(handoff_adapter_enabled)
+    if handoff_adapter_train_on_missing is not None:
+        base_cfg.handoff.adapter.train_on_missing = bool(handoff_adapter_train_on_missing)
+    if handoff_adapter_train_limit is not None:
+        base_cfg.handoff.adapter.train_limit = int(handoff_adapter_train_limit)
+    if embedding_manifold_enabled is not None:
+        base_cfg.handoff.embedding_manifold.enabled = bool(embedding_manifold_enabled)
+    if embedding_manifold_top_k is not None:
+        base_cfg.handoff.embedding_manifold.top_k = int(embedding_manifold_top_k)
+    if embedding_manifold_blend is not None:
+        base_cfg.handoff.embedding_manifold.blend = float(embedding_manifold_blend)
     if seed is not None:
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
@@ -1722,6 +1815,35 @@ def run_benchmark(
                             "alignment_bias_norm": row_result.get("alignment_bias_norm"),
                             "prompt_calibration_enabled": row_result.get("prompt_calibration_enabled"),
                             "prompt_calibration_bias_norm": row_result.get("prompt_calibration_bias_norm"),
+                            "handoff_adapter_enabled": row_result.get("handoff_adapter_enabled"),
+                            "handoff_adapter_status": row_result.get("handoff_adapter_status"),
+                            "handoff_adapter_applied": row_result.get("handoff_adapter_applied"),
+                            "handoff_adapter_delta_norm": row_result.get("handoff_adapter_delta_norm"),
+                            "handoff_adapter_cache_hit": row_result.get("handoff_adapter_cache_hit"),
+                            "handoff_adapter_cache_path": row_result.get("handoff_adapter_cache_path"),
+                            "handoff_adapter_training_prompt_count": row_result.get(
+                                "handoff_adapter_training_prompt_count"
+                            ),
+                            "handoff_adapter_training_token_count": row_result.get(
+                                "handoff_adapter_training_token_count"
+                            ),
+                            "handoff_adapter_training_reconstruction_mse": row_result.get(
+                                "handoff_adapter_training_reconstruction_mse"
+                            ),
+                            "handoff_adapter_training_mean_cosine_similarity": row_result.get(
+                                "handoff_adapter_training_mean_cosine_similarity"
+                            ),
+                            "embedding_manifold_enabled": row_result.get("embedding_manifold_enabled"),
+                            "embedding_manifold_applied": row_result.get("embedding_manifold_applied"),
+                            "embedding_manifold_delta_norm": row_result.get(
+                                "embedding_manifold_delta_norm"
+                            ),
+                            "embedding_manifold_mean_top_similarity": row_result.get(
+                                "embedding_manifold_mean_top_similarity"
+                            ),
+                            "embedding_manifold_unique_token_count": row_result.get(
+                                "embedding_manifold_unique_token_count"
+                            ),
                             "raw_handoff_entropy": row_result.get("raw_handoff_entropy"),
                             "handoff_uncertainty": row_result.get("handoff_uncertainty"),
                             "confidence_gate_triggered": row_result.get("confidence_gate_triggered"),
@@ -1857,6 +1979,20 @@ def run_benchmark(
         "latent_pooling": _latent_pooling_mode(base_cfg),
         "receiver_context_mode": _receiver_context_mode(base_cfg),
         "answer_only_final": _answer_only_final_enabled(base_cfg),
+        "handoff_adapter": {
+            "enabled": bool(getattr(getattr(base_cfg.handoff, "adapter", None), "enabled", False)),
+            "train_on_missing": bool(
+                getattr(getattr(base_cfg.handoff, "adapter", None), "train_on_missing", False)
+            ),
+            "train_limit": int(getattr(getattr(base_cfg.handoff, "adapter", None), "train_limit", 0)),
+        },
+        "embedding_manifold": {
+            "enabled": bool(
+                getattr(getattr(base_cfg.handoff, "embedding_manifold", None), "enabled", False)
+            ),
+            "top_k": int(getattr(getattr(base_cfg.handoff, "embedding_manifold", None), "top_k", 0)),
+            "blend": float(getattr(getattr(base_cfg.handoff, "embedding_manifold", None), "blend", 0.0)),
+        },
         "model_pair_compatibility": suite_model_pair_compatibility,
         "model_pair_compatibility_by_pair": list(compatibility_cache.values()),
         "report_schema_version": REPORT_SCHEMA_VERSION,
@@ -1895,7 +2031,7 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        default=DEFAULT_LIMIT,
+        default=None,
         help=f"Number of samples to evaluate (default: {DEFAULT_LIMIT}).",
     )
     parser.add_argument(
@@ -1990,6 +2126,49 @@ def main() -> None:
         help="Optional override for alignment.prompt_calibration.max_norm_ratio.",
     )
     parser.add_argument(
+        "--enable-handoff-adapter",
+        action="store_true",
+        help="Enable the train-split handoff adapter for latent-prefix methods.",
+    )
+    parser.add_argument(
+        "--disable-handoff-adapter",
+        action="store_true",
+        help="Disable the train-split handoff adapter for this benchmark run.",
+    )
+    parser.add_argument(
+        "--handoff-adapter-train-on-missing",
+        action="store_true",
+        help="Fit and cache the handoff adapter if no matching adapter cache exists.",
+    )
+    parser.add_argument(
+        "--handoff-adapter-train-limit",
+        type=int,
+        default=None,
+        help="Optional override for handoff.adapter.train_limit.",
+    )
+    parser.add_argument(
+        "--enable-embedding-manifold",
+        action="store_true",
+        help="Project latent prefix vectors onto the receiver embedding manifold.",
+    )
+    parser.add_argument(
+        "--disable-embedding-manifold",
+        action="store_true",
+        help="Disable receiver embedding-manifold projection for this benchmark run.",
+    )
+    parser.add_argument(
+        "--embedding-manifold-top-k",
+        type=int,
+        default=None,
+        help="Optional override for handoff.embedding_manifold.top_k.",
+    )
+    parser.add_argument(
+        "--embedding-manifold-blend",
+        type=float,
+        default=None,
+        help="Optional override for handoff.embedding_manifold.blend.",
+    )
+    parser.add_argument(
         "--methods",
         default="",
         help="Optional comma-separated method names to run.",
@@ -2032,7 +2211,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.semantic_smoke or args.mvp_smoke or args.hetero_smoke:
-        if args.limit == DEFAULT_LIMIT:
+        if args.limit is None:
             args.limit = DEFAULT_SEMANTIC_SMOKE_LIMIT
         if args.mvp_smoke and not args.sample_indices:
             args.sample_indices = ",".join(str(index) for index in DEFAULT_MVP_SMOKE_SAMPLE_INDICES)
@@ -2052,6 +2231,8 @@ def main() -> None:
             args.methods = ",".join(default_methods)
         if args.receiver_context_mode is None:
             args.receiver_context_mode = "prompt_prefix"
+    if args.limit is None:
+        args.limit = DEFAULT_LIMIT
 
     latent_steps_values = (
         [int(value.strip()) for value in args.latent_steps_values.split(",") if value.strip()]
@@ -2088,6 +2269,24 @@ def main() -> None:
         prompt_calibration_enabled=False if args.disable_prompt_calibration else None,
         prompt_calibration_strength=args.prompt_calibration_strength,
         prompt_calibration_max_norm_ratio=args.prompt_calibration_max_norm_ratio,
+        handoff_adapter_enabled=(
+            False
+            if args.disable_handoff_adapter
+            else True
+            if args.enable_handoff_adapter
+            else None
+        ),
+        handoff_adapter_train_on_missing=True if args.handoff_adapter_train_on_missing else None,
+        handoff_adapter_train_limit=args.handoff_adapter_train_limit,
+        embedding_manifold_enabled=(
+            False
+            if args.disable_embedding_manifold
+            else True
+            if args.enable_embedding_manifold
+            else None
+        ),
+        embedding_manifold_top_k=args.embedding_manifold_top_k,
+        embedding_manifold_blend=args.embedding_manifold_blend,
         seed=args.seed,
         method_names=method_names,
         sample_indices=sample_indices,

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 10
+REPORT_SCHEMA_VERSION = 11
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -62,6 +62,21 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "alignment_bias_norm",
     "prompt_calibration_enabled",
     "prompt_calibration_bias_norm",
+    "handoff_adapter_enabled",
+    "handoff_adapter_status",
+    "handoff_adapter_applied",
+    "handoff_adapter_delta_norm",
+    "handoff_adapter_cache_hit",
+    "handoff_adapter_cache_path",
+    "handoff_adapter_training_prompt_count",
+    "handoff_adapter_training_token_count",
+    "handoff_adapter_training_reconstruction_mse",
+    "handoff_adapter_training_mean_cosine_similarity",
+    "embedding_manifold_enabled",
+    "embedding_manifold_applied",
+    "embedding_manifold_delta_norm",
+    "embedding_manifold_mean_top_similarity",
+    "embedding_manifold_unique_token_count",
     "raw_handoff_entropy",
     "handoff_uncertainty",
     "confidence_gate_triggered",
@@ -121,6 +136,15 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "mean_alignment_bias_norm",
     "prompt_calibration_rate_percentage",
     "mean_prompt_calibration_bias_norm",
+    "handoff_adapter_rate_percentage",
+    "handoff_adapter_cache_hit_rate_percentage",
+    "mean_handoff_adapter_delta_norm",
+    "mean_handoff_adapter_training_reconstruction_mse",
+    "mean_handoff_adapter_training_mean_cosine_similarity",
+    "embedding_manifold_rate_percentage",
+    "mean_embedding_manifold_delta_norm",
+    "mean_embedding_manifold_top_similarity",
+    "mean_embedding_manifold_unique_token_count",
     "mean_raw_handoff_entropy",
     "mean_handoff_uncertainty",
     "confidence_gate_trigger_rate_percentage",
@@ -296,6 +320,22 @@ def aggregate_standard_rows(
             for row in group_rows
             if row.get("prompt_calibration_enabled") is not None and row.get("prompt_calibration_enabled") != ""
         ]
+        handoff_adapter_rows = [
+            bool(row["handoff_adapter_applied"])
+            for row in group_rows
+            if row.get("handoff_adapter_applied") is not None and row.get("handoff_adapter_applied") != ""
+        ]
+        handoff_adapter_cache_rows = [
+            bool(row["handoff_adapter_cache_hit"])
+            for row in group_rows
+            if row.get("handoff_adapter_cache_hit") is not None and row.get("handoff_adapter_cache_hit") != ""
+        ]
+        embedding_manifold_rows = [
+            bool(row["embedding_manifold_applied"])
+            for row in group_rows
+            if row.get("embedding_manifold_applied") is not None
+            and row.get("embedding_manifold_applied") != ""
+        ]
         explicit_status_rows = [
             row for row in group_rows
             if row.get("handoff_status") not in (None, "")
@@ -359,6 +399,44 @@ def aggregate_standard_rows(
                     else None
                 ),
                 "mean_prompt_calibration_bias_norm": _mean_or_none(group_rows, "prompt_calibration_bias_norm"),
+                "handoff_adapter_rate_percentage": (
+                    100.0 * sum(1 for item in handoff_adapter_rows if item) / len(handoff_adapter_rows)
+                    if handoff_adapter_rows
+                    else None
+                ),
+                "handoff_adapter_cache_hit_rate_percentage": (
+                    100.0 * sum(1 for item in handoff_adapter_cache_rows if item)
+                    / len(handoff_adapter_cache_rows)
+                    if handoff_adapter_cache_rows
+                    else None
+                ),
+                "mean_handoff_adapter_delta_norm": _mean_or_none(group_rows, "handoff_adapter_delta_norm"),
+                "mean_handoff_adapter_training_reconstruction_mse": _mean_or_none(
+                    group_rows,
+                    "handoff_adapter_training_reconstruction_mse",
+                ),
+                "mean_handoff_adapter_training_mean_cosine_similarity": _mean_or_none(
+                    group_rows,
+                    "handoff_adapter_training_mean_cosine_similarity",
+                ),
+                "embedding_manifold_rate_percentage": (
+                    100.0 * sum(1 for item in embedding_manifold_rows if item)
+                    / len(embedding_manifold_rows)
+                    if embedding_manifold_rows
+                    else None
+                ),
+                "mean_embedding_manifold_delta_norm": _mean_or_none(
+                    group_rows,
+                    "embedding_manifold_delta_norm",
+                ),
+                "mean_embedding_manifold_top_similarity": _mean_or_none(
+                    group_rows,
+                    "embedding_manifold_mean_top_similarity",
+                ),
+                "mean_embedding_manifold_unique_token_count": _mean_or_none(
+                    group_rows,
+                    "embedding_manifold_unique_token_count",
+                ),
                 "mean_raw_handoff_entropy": _mean_or_none(group_rows, "raw_handoff_entropy"),
                 "mean_handoff_uncertainty": _mean_or_none(group_rows, "handoff_uncertainty"),
                 "confidence_gate_trigger_rate_percentage": (
@@ -511,6 +589,16 @@ def build_semantic_smoke_report(
         for row in perplexity_rows
         if math.isfinite(float(row["answer_perplexity"]))
     ]
+    latent_perplexity_rows = [
+        row
+        for row in latent_rows
+        if row.get("answer_perplexity") is not None and row.get("answer_perplexity") != ""
+    ]
+    finite_latent_perplexity_rows = [
+        row
+        for row in latent_perplexity_rows
+        if math.isfinite(float(row["answer_perplexity"]))
+    ]
     baseline_final_answer_marker_rows = [
         row for row in baseline_rows if "final answer" in str(row.get("decoded_text") or "").casefold()
     ]
@@ -546,9 +634,14 @@ def build_semantic_smoke_report(
     latent_accuracy_rate = _percentage(sum(latent_correct_values), len(latent_correct_values))
     latent_non_empty_rate = _percentage(len(latent_non_empty_rows), len(latent_rows))
     compatible_cache_transfer_rate = _percentage(len(compatible_cache_rows), len(latent_kv_rows))
-    max_observed_perplexity = (
+    max_all_observed_perplexity = (
         max(float(row["answer_perplexity"]) for row in finite_perplexity_rows)
         if finite_perplexity_rows
+        else None
+    )
+    max_observed_perplexity = (
+        max(float(row["answer_perplexity"]) for row in finite_latent_perplexity_rows)
+        if finite_latent_perplexity_rows
         else None
     )
     compatibility = model_pair_compatibility or {}
@@ -616,7 +709,7 @@ def build_semantic_smoke_report(
     if max_answer_perplexity is not None and max_observed_perplexity is not None:
         if max_observed_perplexity > float(max_answer_perplexity):
             missing_requirements.append(
-                f"Observed max answer perplexity {max_observed_perplexity:.4f} "
+                f"Observed max latent answer perplexity {max_observed_perplexity:.4f} "
                 f"exceeds allowed {float(max_answer_perplexity):.4f}."
             )
     if len(degenerate_rows) > int(max_degenerate_decode_count):
@@ -659,6 +752,7 @@ def build_semantic_smoke_report(
         "finite_answer_perplexity_count": len(finite_perplexity_rows),
         "answer_perplexity_count": len(perplexity_rows),
         "max_answer_perplexity": max_observed_perplexity,
+        "max_all_answer_perplexity": max_all_observed_perplexity,
         "max_allowed_answer_perplexity": max_answer_perplexity,
         "degenerate_decode_count": len(degenerate_rows),
         "max_allowed_degenerate_decode_count": int(max_degenerate_decode_count),

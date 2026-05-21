@@ -17,6 +17,7 @@ from omegaconf import DictConfig
 from torchdiffeq import odeint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.data.loader import get_dataloader, pick_field
 from src.models.dynamics import (
     TransformerBlockDynamics,
     _is_kv_cache_compatible,
@@ -26,6 +27,11 @@ from src.models.dynamics import (
     _move_kv_cache_to_device,
     _normalize_kv_cache,
     _sync_if_cuda,
+)
+from src.models.handoff_adapter import (
+    HandoffAdapterFitConfig,
+    fit_handoff_adapter_state,
+    project_to_embedding_manifold,
 )
 from src.utils.alignment import (
     apply_alignment,
@@ -53,9 +59,11 @@ _DTYPE_MAP = {
 _PIPELINE_STATE: Optional[dict[str, Any]] = None
 _PIPELINE_STATE_KEY: Optional[tuple[str, str, str, str]] = None
 _GLOBAL_ALIGNMENT_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_HANDOFF_ADAPTER_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _PREFERRED_REASONING_LAYERS: tuple[int, ...] = (12, 16, 20)
 _DEFAULT_REASONING_LAYER_WEIGHTS: tuple[float, ...] = (0.2, 0.3, 0.5)
 _ALIGNMENT_CACHE_VERSION = 4
+_HANDOFF_ADAPTER_CACHE_VERSION = 1
 _SUPPORTED_HANDOFF_TARGETS: frozenset[str] = frozenset({"input_embedding"})
 _SUPPORTED_DIAGNOSTIC_TARGETS: frozenset[str] = frozenset({"hidden_consensus"})
 _SUPPORTED_LATENT_POOLING_MODES: frozenset[str] = frozenset({"last_token", "mean", "prompt_mean"})
@@ -65,7 +73,7 @@ _SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS: frozenset[str] = frozenset(
     {"after_context", "before_context"}
 )
 _FINAL_ANSWER_COMPLETE_REGEX = re.compile(
-    r"final\s+answer\s*[:=]\s*\$?\s*-?\d[\d,]*(?:\.\d+)?(?:\s|[^\d,.])",
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.])",
     re.IGNORECASE,
 )
 _MATH_COMPLEXITY_PATTERNS: tuple[str, ...] = (
@@ -230,6 +238,102 @@ def _dynamics_mode(cfg: Optional[DictConfig]) -> str:
 
 def _handoff_cfg(cfg: Optional[DictConfig]) -> Any:
     return getattr(cfg, "handoff", None)
+
+
+def _handoff_adapter_cfg(cfg: Optional[DictConfig]) -> Any:
+    return getattr(_handoff_cfg(cfg), "adapter", None)
+
+
+def _handoff_adapter_enabled(cfg: Optional[DictConfig]) -> bool:
+    return bool(getattr(_handoff_adapter_cfg(cfg), "enabled", False))
+
+
+def _handoff_adapter_train_on_missing(cfg: Optional[DictConfig]) -> bool:
+    return bool(getattr(_handoff_adapter_cfg(cfg), "train_on_missing", False))
+
+
+def _handoff_adapter_cache_dir(cfg: Optional[DictConfig]) -> Path:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return Path(str(getattr(adapter_cfg, "cache_dir", ".cache/handoff_adapter")))
+
+
+def _handoff_adapter_dataset_name(cfg: Optional[DictConfig]) -> str:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return str(getattr(adapter_cfg, "dataset_name", "gsm8k"))
+
+
+def _handoff_adapter_train_split(cfg: Optional[DictConfig]) -> str:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return str(getattr(adapter_cfg, "train_split", "train"))
+
+
+def _handoff_adapter_train_limit(cfg: Optional[DictConfig]) -> int:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return int(getattr(adapter_cfg, "train_limit", 32))
+
+
+def _handoff_adapter_max_length(cfg: Optional[DictConfig]) -> int:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return int(getattr(adapter_cfg, "max_length", 96))
+
+
+def _handoff_adapter_strategy(cfg: Optional[DictConfig]) -> str:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return str(getattr(adapter_cfg, "strategy", "hybrid_affine")).strip().lower()
+
+
+def _handoff_adapter_regularization(cfg: Optional[DictConfig]) -> float:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return float(getattr(adapter_cfg, "regularization", 1e-3))
+
+
+def _handoff_adapter_residual_alpha(cfg: Optional[DictConfig]) -> float:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return float(getattr(adapter_cfg, "residual_alpha", 1.0))
+
+
+def _handoff_adapter_residual_max_norm_ratio(cfg: Optional[DictConfig]) -> float:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    value = getattr(adapter_cfg, "residual_max_norm_ratio", 0.5)
+    return 0.0 if value is None else float(value)
+
+
+def _handoff_adapter_center(cfg: Optional[DictConfig]) -> bool:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return bool(getattr(adapter_cfg, "center", True))
+
+
+def _handoff_adapter_use_bias(cfg: Optional[DictConfig]) -> bool:
+    adapter_cfg = _handoff_adapter_cfg(cfg)
+    return bool(getattr(adapter_cfg, "use_bias", True))
+
+
+def _embedding_manifold_cfg(cfg: Optional[DictConfig]) -> Any:
+    return getattr(_handoff_cfg(cfg), "embedding_manifold", None)
+
+
+def _embedding_manifold_enabled(cfg: Optional[DictConfig]) -> bool:
+    return bool(getattr(_embedding_manifold_cfg(cfg), "enabled", False))
+
+
+def _embedding_manifold_top_k(cfg: Optional[DictConfig]) -> int:
+    return int(getattr(_embedding_manifold_cfg(cfg), "top_k", 1))
+
+
+def _embedding_manifold_temperature(cfg: Optional[DictConfig]) -> float:
+    return float(getattr(_embedding_manifold_cfg(cfg), "temperature", 0.05))
+
+
+def _embedding_manifold_blend(cfg: Optional[DictConfig]) -> float:
+    return float(getattr(_embedding_manifold_cfg(cfg), "blend", 1.0))
+
+
+def _embedding_manifold_normalize(cfg: Optional[DictConfig]) -> bool:
+    return bool(getattr(_embedding_manifold_cfg(cfg), "normalize", True))
+
+
+def _embedding_manifold_chunk_size(cfg: Optional[DictConfig]) -> int:
+    return int(getattr(_embedding_manifold_cfg(cfg), "chunk_size", 32))
 
 
 def _latent_pooling_mode(cfg: Optional[DictConfig]) -> str:
@@ -1251,6 +1355,233 @@ def load_or_compute_global_alignment_state(
     }
 
 
+def _dataset_validation_size(cfg: Optional[DictConfig], dataset_name: str) -> Optional[int]:
+    datasets_cfg = getattr(cfg, "datasets", None)
+    dataset_cfg = getattr(datasets_cfg, str(dataset_name).lower(), None)
+    value = getattr(dataset_cfg, "validation_size", None)
+    return None if value is None else int(value)
+
+
+def _build_handoff_adapter_cache_key(
+    cfg: DictConfig,
+    *,
+    alignment_cache_key: Any,
+    reasoning_layer_indices: Sequence[int],
+    reasoning_layer_weights: Sequence[float],
+) -> tuple[Any, ...]:
+    adaptive_projection_enabled, adaptive_projection_strength, adaptive_projection_clip_std = (
+        _alignment_adaptive_projection_settings(cfg)
+    )
+    return (
+        _HANDOFF_ADAPTER_CACHE_VERSION,
+        str(cfg.agent_a_model),
+        str(cfg.agent_b_model),
+        str(cfg.torch_dtype),
+        alignment_cache_key,
+        tuple(int(index) for index in reasoning_layer_indices),
+        tuple(round(float(weight), 8) for weight in reasoning_layer_weights),
+        _handoff_adapter_dataset_name(cfg),
+        _handoff_adapter_train_split(cfg),
+        _handoff_adapter_train_limit(cfg),
+        _handoff_adapter_max_length(cfg),
+        _handoff_adapter_strategy(cfg),
+        round(_handoff_adapter_regularization(cfg), 10),
+        round(_handoff_adapter_residual_alpha(cfg), 8),
+        round(_handoff_adapter_residual_max_norm_ratio(cfg), 8),
+        _handoff_adapter_center(cfg),
+        _handoff_adapter_use_bias(cfg),
+        bool(adaptive_projection_enabled),
+        round(float(adaptive_projection_strength), 8),
+        round(float(adaptive_projection_clip_std), 8),
+    )
+
+
+def _handoff_adapter_cache_path(cache_dir: Path, cache_key: tuple[Any, ...]) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps(cache_key, sort_keys=False, default=list).encode("utf-8")
+    ).hexdigest()
+    return cache_dir / f"handoff_adapter_{digest}.pt"
+
+
+def _load_handoff_adapter_state_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
+    if not cache_path.is_file():
+        return None
+    try:
+        cached_state = torch.load(cache_path, map_location="cpu")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(cached_state, dict):
+        return None
+    if "mapping_matrix" not in cached_state:
+        return None
+    return cached_state
+
+
+def _handoff_adapter_fit_config(cfg: DictConfig) -> HandoffAdapterFitConfig:
+    adaptive_projection_enabled, adaptive_projection_strength, adaptive_projection_clip_std = (
+        _alignment_adaptive_projection_settings(cfg)
+    )
+    return HandoffAdapterFitConfig(
+        strategy=_handoff_adapter_strategy(cfg),
+        regularization=_handoff_adapter_regularization(cfg),
+        residual_alpha=_handoff_adapter_residual_alpha(cfg),
+        residual_max_norm_ratio=_handoff_adapter_residual_max_norm_ratio(cfg),
+        center=_handoff_adapter_center(cfg),
+        use_bias=_handoff_adapter_use_bias(cfg),
+        max_length=_handoff_adapter_max_length(cfg),
+        adaptive_projection_strength=(
+            adaptive_projection_strength if adaptive_projection_enabled else 0.0
+        ),
+        adaptive_projection_clip_std_multiplier=adaptive_projection_clip_std,
+    )
+
+
+def _handoff_adapter_base_alignment_state(state: dict[str, Any]) -> dict[str, Any]:
+    return _handoff_alignment_state_from_pipeline_state(state)
+
+
+def load_or_train_handoff_adapter_state(
+    cfg: DictConfig,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    if not _handoff_adapter_enabled(cfg):
+        return {
+            "handoff_adapter_enabled": False,
+            "handoff_adapter_status": "disabled",
+            "handoff_adapter_cache_hit": None,
+            "handoff_adapter_cache_path": "",
+            "handoff_adapter_state": None,
+        }
+
+    reasoning_layer_indices = tuple(state["global_reasoning_layer_indices"])
+    reasoning_layer_weights = tuple(state["global_reasoning_layer_weights"])
+    cache_key = _build_handoff_adapter_cache_key(
+        cfg,
+        alignment_cache_key=state.get("global_alignment_cache_key"),
+        reasoning_layer_indices=reasoning_layer_indices,
+        reasoning_layer_weights=reasoning_layer_weights,
+    )
+    cache_path = _handoff_adapter_cache_path(_handoff_adapter_cache_dir(cfg), cache_key)
+    cached_state = _HANDOFF_ADAPTER_MEMORY_CACHE.get(cache_key)
+    cache_hit = cached_state is not None
+    if cached_state is None:
+        cached_state = _load_handoff_adapter_state_from_disk(cache_path)
+        cache_hit = cached_state is not None
+
+    if cached_state is None and _handoff_adapter_train_on_missing(cfg):
+        dataset_name = _handoff_adapter_dataset_name(cfg)
+        train_split = _handoff_adapter_train_split(cfg)
+        train_rows = get_dataloader(
+            dataset_name,
+            limit=_handoff_adapter_train_limit(cfg),
+            split=train_split,
+            validation_size=_dataset_validation_size(cfg, dataset_name),
+        )
+        prompts = [pick_field(row, ("question", "problem")) for row in train_rows]
+        cached_state = fit_handoff_adapter_state(
+            prompts=prompts,
+            tokenizer_a=state["tokenizer_a"],
+            tokenizer_b=state["tokenizer_b"],
+            agent_a=state["agent_a"],
+            agent_b=state["agent_b"],
+            base_alignment_state=_handoff_adapter_base_alignment_state(state),
+            reasoning_layer_indices=reasoning_layer_indices,
+            reasoning_layer_weights=reasoning_layer_weights,
+            fit_config=_handoff_adapter_fit_config(cfg),
+        )
+        torch.save(cached_state, cache_path)
+        cache_hit = False
+
+    if cached_state is None:
+        return {
+            "handoff_adapter_enabled": False,
+            "handoff_adapter_status": "missing",
+            "handoff_adapter_cache_hit": False,
+            "handoff_adapter_cache_path": str(cache_path),
+            "handoff_adapter_state": None,
+        }
+
+    _HANDOFF_ADAPTER_MEMORY_CACHE[cache_key] = cached_state
+    return {
+        "handoff_adapter_enabled": True,
+        "handoff_adapter_status": "loaded" if cache_hit else "trained",
+        "handoff_adapter_cache_hit": cache_hit,
+        "handoff_adapter_cache_path": str(cache_path),
+        "handoff_adapter_state": cached_state,
+        "handoff_adapter_training_prompt_count": cached_state.get("training_prompt_count"),
+        "handoff_adapter_training_token_count": cached_state.get("training_token_count"),
+        "handoff_adapter_training_reconstruction_mse": cached_state.get(
+            "training_reconstruction_mse"
+        ),
+        "handoff_adapter_training_mean_cosine_similarity": cached_state.get(
+            "training_mean_cosine_similarity"
+        ),
+    }
+
+
+def apply_handoff_adapter(
+    handoff_step: torch.Tensor,
+    state: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    adapter_state = state.get("handoff_adapter_state")
+    if adapter_state is None or not bool(state.get("handoff_adapter_enabled", False)):
+        return handoff_step, {
+            "handoff_adapter_applied": False,
+            "handoff_adapter_delta_norm": None,
+        }
+    adapted = apply_alignment(handoff_step, adapter_state)
+    delta = adapted.float() - handoff_step.float()
+    delta_norm = float(
+        torch.linalg.vector_norm(delta.reshape(delta.shape[0], -1), dim=-1)
+        .mean()
+        .detach()
+        .cpu()
+        .item()
+    )
+    return adapted.to(dtype=handoff_step.dtype), {
+        "handoff_adapter_applied": True,
+        "handoff_adapter_delta_norm": delta_norm,
+    }
+
+
+def apply_embedding_manifold_projection(
+    handoff_step: torch.Tensor,
+    cfg: DictConfig,
+    state: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if not _embedding_manifold_enabled(cfg):
+        return handoff_step, {
+            "embedding_manifold_applied": False,
+            "embedding_manifold_delta_norm": None,
+            "embedding_manifold_mean_top_similarity": None,
+            "embedding_manifold_unique_token_count": None,
+        }
+    agent_b = state["agent_b"]
+    projected, projection_metrics = project_to_embedding_manifold(
+        handoff_step,
+        agent_b.get_input_embeddings().weight,
+        top_k=_embedding_manifold_top_k(cfg),
+        temperature=_embedding_manifold_temperature(cfg),
+        blend=_embedding_manifold_blend(cfg),
+        normalize=_embedding_manifold_normalize(cfg),
+        chunk_size=_embedding_manifold_chunk_size(cfg),
+    )
+    delta = projected.float() - handoff_step.float()
+    delta_norm = float(
+        torch.linalg.vector_norm(delta.reshape(delta.shape[0], -1), dim=-1)
+        .mean()
+        .detach()
+        .cpu()
+        .item()
+    )
+    return projected.to(dtype=handoff_step.dtype), {
+        "embedding_manifold_applied": True,
+        "embedding_manifold_delta_norm": delta_norm,
+        **projection_metrics,
+    }
+
+
 def attach_latent_forward(agent_model: AutoModelForCausalLM) -> None:
     def latent_forward(
         self,
@@ -1325,9 +1656,17 @@ def _get_pipeline_state(cfg: DictConfig) -> dict[str, Any]:
         agent_a=agent_a,
         agent_b=agent_b,
     )
-    return {
+    state_with_alignment = {
         **_PIPELINE_STATE,
         **cached_alignment_state,
+    }
+    handoff_adapter_state = load_or_train_handoff_adapter_state(
+        cfg,
+        state_with_alignment,
+    )
+    return {
+        **state_with_alignment,
+        **handoff_adapter_state,
     }
 
 
@@ -1764,6 +2103,15 @@ def run_hybrid_pipeline(
     agent_b_embed_dtype = agent_b.get_input_embeddings().weight.dtype
     agent_b_embed_dim = agent_b.get_input_embeddings().weight.shape[-1]
     aligned_handoff_step = apply_alignment(handoff_latent_source, alignment_state)
+    aligned_handoff_step, adapter_metrics = apply_handoff_adapter(
+        aligned_handoff_step,
+        state,
+    )
+    aligned_handoff_step, manifold_metrics = apply_embedding_manifold_projection(
+        aligned_handoff_step,
+        cfg,
+        state,
+    )
     handoff_status = "ok"
     handoff_surface = (
         "input_embedding_sequence"
@@ -1788,6 +2136,10 @@ def run_hybrid_pipeline(
                 "alignment_strategy": alignment_state.get("alignment_strategy", alignment_mode),
                 "residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
                 "bias_norm": alignment_state.get("bias_norm"),
+                "handoff_adapter_applied": adapter_metrics["handoff_adapter_applied"],
+                "handoff_adapter_delta_norm": adapter_metrics["handoff_adapter_delta_norm"],
+                "embedding_manifold_applied": manifold_metrics["embedding_manifold_applied"],
+                "embedding_manifold_delta_norm": manifold_metrics["embedding_manifold_delta_norm"],
             },
         )
     )
@@ -1915,6 +2267,15 @@ def run_hybrid_pipeline(
         )
         executed_discrete_fallback_steps = len(fallback_token_ids)
         aligned_handoff_step = apply_alignment(current_latent_step, alignment_state)
+        aligned_handoff_step, adapter_metrics = apply_handoff_adapter(
+            aligned_handoff_step,
+            state,
+        )
+        aligned_handoff_step, manifold_metrics = apply_embedding_manifold_projection(
+            aligned_handoff_step,
+            cfg,
+            state,
+        )
         if aligned_handoff_step.shape[-1] != agent_b_embed_dim:
             raise ValueError(
                 "Fallback handoff dimension "
@@ -2121,6 +2482,33 @@ def run_hybrid_pipeline(
         "alignment_bias_norm": alignment_state.get("bias_norm"),
         "prompt_calibration_enabled": prompt_calibration_enabled,
         "prompt_calibration_bias_norm": calibration_bias_norm,
+        "handoff_adapter_enabled": bool(state.get("handoff_adapter_enabled", False)),
+        "handoff_adapter_status": state.get("handoff_adapter_status"),
+        "handoff_adapter_applied": adapter_metrics["handoff_adapter_applied"],
+        "handoff_adapter_delta_norm": adapter_metrics["handoff_adapter_delta_norm"],
+        "handoff_adapter_cache_hit": state.get("handoff_adapter_cache_hit"),
+        "handoff_adapter_cache_path": state.get("handoff_adapter_cache_path"),
+        "handoff_adapter_training_prompt_count": state.get(
+            "handoff_adapter_training_prompt_count"
+        ),
+        "handoff_adapter_training_token_count": state.get(
+            "handoff_adapter_training_token_count"
+        ),
+        "handoff_adapter_training_reconstruction_mse": state.get(
+            "handoff_adapter_training_reconstruction_mse"
+        ),
+        "handoff_adapter_training_mean_cosine_similarity": state.get(
+            "handoff_adapter_training_mean_cosine_similarity"
+        ),
+        "embedding_manifold_enabled": _embedding_manifold_enabled(cfg),
+        "embedding_manifold_applied": manifold_metrics["embedding_manifold_applied"],
+        "embedding_manifold_delta_norm": manifold_metrics["embedding_manifold_delta_norm"],
+        "embedding_manifold_mean_top_similarity": manifold_metrics[
+            "embedding_manifold_mean_top_similarity"
+        ],
+        "embedding_manifold_unique_token_count": manifold_metrics[
+            "embedding_manifold_unique_token_count"
+        ],
         "pre_alignment_handoff": handoff_latent_source.detach().cpu(),
         "post_alignment_handoff": handoff_step.detach().cpu(),
         "aligned_continuous_trajectory": aligned_continuous_trajectory.detach().cpu(),
