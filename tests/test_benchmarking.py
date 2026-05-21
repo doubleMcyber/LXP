@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from omegaconf import OmegaConf
+import pytest
 
-from benchmark_all import _methods_for_suite
+from benchmark_all import _methods_for_suite, _predicted_answer
 from src.utils.benchmarking import (
+    REPORT_SCHEMA_VERSION,
     aggregate_standard_rows,
     build_distance_calibration_report,
     build_phase1_gate_report,
     build_phase3_gate_report,
     build_runtime_smoke_report,
+    build_semantic_smoke_report,
     build_standard_row_base,
     build_training_phase2_report,
 )
@@ -60,7 +63,8 @@ def test_build_standard_row_base_uses_cfg_metadata() -> None:
     assert row["semantic_anchor_count"] == 250
     assert row["reasoning_layer_weights"] == "0.200000,0.300000,0.500000"
     assert row["alignment_strategy"] == "hybrid_affine"
-    assert row["report_schema_version"] == 2
+    assert row["report_schema_version"] == REPORT_SCHEMA_VERSION
+    assert row["model_pair_compatibility_status"] == ""
 
 
 def test_aggregate_standard_rows_computes_rates_and_means() -> None:
@@ -184,6 +188,131 @@ def test_runtime_smoke_report_checks_errors_and_statuses() -> None:
 
     assert report["passed"] is True
     assert report["phase"] == "runtime_smoke"
+
+
+def test_semantic_smoke_report_checks_baseline_decode_cache_and_perplexity() -> None:
+    rows = [
+        {
+            "method": "pure_text_cot",
+            "predicted_answer": "42",
+            "target_answer": "42",
+            "correct": True,
+            "decoded_text": "Final answer: 42",
+            "answer_perplexity": 2.0,
+        },
+        {
+            "method": "hybrid_hl_mas",
+            "predicted_answer": "42",
+            "target_answer": "42",
+            "correct": True,
+            "decoded_text": "Final answer: 42",
+            "kv_cache_transferred": True,
+            "answer_perplexity": 3.0,
+        },
+    ]
+
+    report = build_semantic_smoke_report(
+        rows,
+        baseline_methods=("pure_text_cot",),
+        latent_methods=("hybrid_hl_mas",),
+        model_pair_compatibility={
+            "kv_cache_compatible": True,
+            "status": "predicted_compatible",
+            "reason": "matching_cache_topology",
+        },
+    )
+
+    assert report["passed"] is True
+    assert report["baseline_answer_extraction_rate_percentage"] == 100.0
+    assert report["baseline_accuracy_percentage"] == 100.0
+    assert report["latent_accuracy_percentage"] == 100.0
+    assert report["method_accuracy_percentage"]["pure_text_cot"] == 100.0
+    assert report["method_accuracy_percentage"]["hybrid_hl_mas"] == 100.0
+    assert report["latent_non_empty_decoded_rate_percentage"] == 100.0
+    assert report["compatible_cache_transfer_rate_percentage"] == 100.0
+    assert report["max_answer_perplexity"] == 3.0
+    assert report["degenerate_decode_count"] == 0
+
+
+def test_semantic_smoke_report_flags_degenerate_decode_and_high_perplexity() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "pure_text_cot",
+                "predicted_answer": "2",
+                "target_answer": "2",
+                "correct": True,
+                "decoded_text": "Final answer: 2",
+                "answer_perplexity": 2.0,
+            },
+            {
+                "method": "hybrid_hl_mas",
+                "predicted_answer": "2",
+                "target_answer": "1",
+                "correct": False,
+                "decoded_text": " ".join(["2"] * 32),
+                "kv_cache_transferred": True,
+                "answer_perplexity": 20000.0,
+            },
+        ],
+        baseline_methods=("pure_text_cot",),
+        latent_methods=("hybrid_hl_mas",),
+        model_pair_compatibility={"kv_cache_compatible": True},
+        max_answer_perplexity=10000.0,
+    )
+
+    assert report["passed"] is False
+    assert report["degenerate_decode_count"] == 1
+    assert report["wrong_answer_count"] == 1
+    assert report["worst_answer_perplexity_rows"][0]["method"] == "hybrid_hl_mas"
+    assert any("perplexity" in item for item in report["missing_requirements"])
+    assert any("degenerate" in item for item in report["missing_requirements"])
+
+
+def test_semantic_smoke_report_can_require_accuracy_and_final_answer_markers() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "pure_text_cot",
+                "predicted_answer": "2",
+                "target_answer": "2",
+                "correct": True,
+                "decoded_text": "Final answer: 2",
+                "answer_perplexity": 2.0,
+            },
+            {
+                "method": "hybrid_hl_mas",
+                "predicted_answer": "13",
+                "target_answer": "2",
+                "correct": False,
+                "decoded_text": "Reasoning mentions 10 + 3 = 13.",
+                "kv_cache_transferred": True,
+                "answer_perplexity": 10.0,
+            },
+        ],
+        baseline_methods=("pure_text_cot",),
+        latent_methods=("hybrid_hl_mas",),
+        model_pair_compatibility={"kv_cache_compatible": True},
+        min_baseline_accuracy_percentage=1.0,
+        min_latent_accuracy_percentage=1.0,
+        min_method_accuracy_percentage=1.0,
+        require_final_answer_marker_methods=("pure_text_cot", "hybrid_hl_mas"),
+    )
+
+    assert report["passed"] is False
+    assert report["baseline_accuracy_percentage"] == 100.0
+    assert report["latent_accuracy_percentage"] == 0.0
+    assert report["method_accuracy_percentage"]["hybrid_hl_mas"] == 0.0
+    assert report["required_final_answer_marker_rate_percentage"] == 50.0
+    assert any("Latent accuracy" in item for item in report["missing_requirements"])
+    assert any("Method hybrid_hl_mas accuracy" in item for item in report["missing_requirements"])
+    assert any("final-answer marker" in item for item in report["missing_requirements"])
+
+
+def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
+    decoded = "Reasoning mentions 100 and 200. Final answer: 42. Then ignores 9000."
+
+    assert _predicted_answer("gsm8k", decoded) == "42"
 
 
 def test_build_phase1_gate_report_passes_when_thresholds_are_met() -> None:
@@ -319,3 +448,17 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert "global_anchor_hybrid_affine_plus_calibration" in standard_methods
     assert "hybrid_hl_mas" in standard_methods
     assert "homogeneous_orthogonal_latent" in standard_methods
+
+
+def test_methods_for_suite_filters_requested_methods_in_order() -> None:
+    selected_methods = [
+        name
+        for name, _ in _methods_for_suite(
+            "standard",
+            ["hybrid_hl_mas", "pure_text_cot"],
+        )
+    ]
+
+    assert selected_methods == ["hybrid_hl_mas", "pure_text_cot"]
+    with pytest.raises(ValueError, match="Unknown methods"):
+        _methods_for_suite("standard", ["does_not_exist"])

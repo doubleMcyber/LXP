@@ -11,7 +11,7 @@ from latent_pipeline import (
     _move_kv_cache_to_device,
 )
 from src.models.dynamics import _kv_cache_compatibility_status
-from src.utils.lm_eval import prepare_latent_prefix_state
+from src.utils.lm_eval import prepare_latent_prefix_state, prepare_receiver_context_latent_prefix_state
 
 
 class DummyActorModel:
@@ -143,6 +143,7 @@ class TinyPrefixModel(torch.nn.Module):
     def forward(
         self,
         *,
+        input_ids=None,
         inputs_embeds=None,
         past_key_values=None,
         attention_mask=None,
@@ -151,6 +152,13 @@ class TinyPrefixModel(torch.nn.Module):
         return_dict=True,
     ):
         del position_ids, use_cache, return_dict
+        if inputs_embeds is None:
+            inputs_embeds = self.embedding(input_ids)
+        if past_key_values is None:
+            seq_len = int(inputs_embeds.shape[1])
+            key = torch.zeros(inputs_embeds.shape[0], 2, seq_len, 2, device=inputs_embeds.device)
+            value = torch.zeros_like(key)
+            past_key_values = ((key, value),)
         logits = torch.zeros(
             inputs_embeds.shape[0],
             inputs_embeds.shape[1],
@@ -195,6 +203,77 @@ def test_prepare_latent_prefix_state_drops_batch_mismatched_cache() -> None:
     assert prefix_state["kv_cache_status"] == "invalid_cache"
     assert "batch_size_mismatch" in prefix_state["kv_cache_reason"]
     assert prefix_state["attention_mask"].shape == (1, 1)
+
+
+class TinyTokenizer:
+    def __call__(self, text, *, return_tensors=None, add_special_tokens=False):
+        del add_special_tokens
+        token_count = max(1, len(str(text).split()))
+        input_ids = torch.arange(token_count, dtype=torch.long).unsqueeze(0) % 16
+        attention_mask = torch.ones_like(input_ids)
+        if return_tensors == "pt":
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+        return {"input_ids": input_ids.tolist(), "attention_mask": attention_mask.tolist()}
+
+
+def test_prepare_receiver_context_latent_prefix_state_uses_actor_prompt_cache() -> None:
+    model = TinyPrefixModel()
+
+    prefix_state = prepare_receiver_context_latent_prefix_state(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        context_text="What is fifty thousand?",
+        handoff_step=torch.zeros(1, 1, 4),
+    )
+
+    assert prefix_state["kv_cache_transferred"] is True
+    assert prefix_state["kv_cache_status"] == "transferred"
+    assert prefix_state["receiver_context_status"] == "used_prompt_prefix"
+    assert prefix_state["receiver_context_token_count"] == 4
+    assert prefix_state["active_kv_cache_source"] == "receiver_context"
+    assert prefix_state["attention_mask"].shape == (1, 5)
+
+
+def test_prepare_receiver_context_latent_prefix_state_can_append_answer_suffix() -> None:
+    model = TinyPrefixModel()
+
+    prefix_state = prepare_receiver_context_latent_prefix_state(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        context_text="What is fifty thousand?",
+        handoff_step=torch.zeros(1, 1, 4),
+        suffix_text="\n\nFinal answer:",
+        decoded_text_prefix="Final answer:",
+    )
+
+    assert prefix_state["receiver_context_token_count"] == 4
+    assert prefix_state["receiver_context_suffix_token_count"] == 2
+    assert prefix_state["decoded_text_prefix"] == "Final answer:"
+    assert prefix_state["active_kv_cache_source"] == "receiver_context"
+    assert prefix_state["attention_mask"].shape == (1, 7)
+
+
+def test_prepare_receiver_context_latent_prefix_state_can_place_latent_before_context() -> None:
+    model = TinyPrefixModel()
+
+    prefix_state = prepare_receiver_context_latent_prefix_state(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        context_text="What is fifty thousand?",
+        handoff_step=torch.zeros(1, 1, 4),
+        suffix_text="\n\nFinal answer:",
+        decoded_text_prefix="Final answer:",
+        latent_position="before_context",
+    )
+
+    assert prefix_state["kv_cache_transferred"] is False
+    assert prefix_state["kv_cache_status"] == "not_provided"
+    assert prefix_state["receiver_context_latent_position"] == "before_context"
+    assert prefix_state["receiver_context_token_count"] == 4
+    assert prefix_state["receiver_context_suffix_token_count"] == 2
+    assert prefix_state["decoded_text_prefix"] == "Final answer:"
+    assert prefix_state["active_kv_cache_source"] == "latent_then_receiver_context"
+    assert prefix_state["attention_mask"].shape == (1, 7)
 
 
 def test_dynamic_cache_object_supports_seq_len_and_device_move() -> None:

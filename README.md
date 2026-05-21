@@ -14,3 +14,7 @@ Generated benchmark, training, sweep, and visualization outputs default to `outp
 ## Latent Blame
 
 `src/utils/latent_blame.py` contains the first validation harness for git-blame-style latent packet attribution. It records latent packets with sender/receiver/turn/tensor metadata, replays a run through caller-provided replay logic, applies ablation/noise/replacement interventions, ranks packets by causal impact, and emits a concise blame report.
+
+## Cross-Model Handoff
+
+Cross-model cache transfer is only valid for compatible architectures. When sender KV transfer is not compatible, `handoff.receiver_context.mode: "auto"` runs Agent B on the prompt first, then appends the latent handoff step using Agent B's own prompt cache. `handoff.latent_pooling` can be set to `"mean"`/`"prompt_mean"` to compress the full sender prompt into one latent packet instead of using only the last token state.

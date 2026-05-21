@@ -8,6 +8,10 @@ from latent_pipeline import (
     _build_integration_time_space,
     _compute_logits_entropy,
     _confidence_gate_settings,
+    _latent_pooling_mode,
+    _pool_latent_handoff_step,
+    _receiver_context_latent_position,
+    _receiver_context_mode,
     _scale_integration_points,
     estimate_problem_complexity,
 )
@@ -85,6 +89,36 @@ def test_single_step_latent_trajectory_does_not_call_ode_dynamics() -> None:
     assert trajectory.shape == (1, 1, 1, 4)
     assert torch.allclose(trajectory[0], current)
     assert time_space.shape == (1,)
+
+
+def test_prompt_mean_latent_pooling_uses_attention_mask() -> None:
+    hidden_states = torch.tensor(
+        [
+            [
+                [1.0, 1.0],
+                [3.0, 5.0],
+                [100.0, 100.0],
+            ]
+        ]
+    )
+    attention_mask = torch.tensor([[1, 1, 0]])
+
+    pooled = _pool_latent_handoff_step(
+        hidden_states,
+        attention_mask,
+        pooling_mode="mean",
+    )
+
+    assert pooled.shape == (1, 1, 2)
+    assert torch.allclose(pooled, torch.tensor([[[2.0, 3.0]]]))
+
+
+def test_handoff_config_defaults_to_auto_context_and_last_token_pooling() -> None:
+    cfg = OmegaConf.create({})
+
+    assert _latent_pooling_mode(cfg) == "last_token"
+    assert _receiver_context_mode(cfg) == "auto"
+    assert _receiver_context_latent_position(cfg) == "after_context"
 
 
 def test_build_integration_time_space_keeps_fixed_time_horizon() -> None:

@@ -1,7 +1,7 @@
 """Dataset loading abstraction for multiple benchmarks."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from datasets import load_dataset
 
@@ -15,7 +15,23 @@ def pick_field(row: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _select_rows(dataset: Any, limit: Optional[int]) -> Any:
+def _select_rows(
+    dataset: Any,
+    limit: Optional[int],
+    *,
+    sample_indices: Optional[Sequence[int]] = None,
+) -> Any:
+    if sample_indices is not None:
+        indices = [int(index) for index in sample_indices]
+        if not indices:
+            return dataset.select([])
+        out_of_bounds = [index for index in indices if index < 0 or index >= len(dataset)]
+        if out_of_bounds:
+            raise IndexError(
+                "sample_indices out of range for dataset of size "
+                f"{len(dataset)}: {out_of_bounds}"
+            )
+        dataset = dataset.select(indices)
     if limit is None:
         return dataset
     return dataset.select(range(min(int(limit), len(dataset))))
@@ -51,6 +67,7 @@ def load_math_level5(
     split: str = "test",
     *,
     validation_size: Optional[int] = None,
+    sample_indices: Optional[Sequence[int]] = None,
 ):
     """Load MATH Level 5 problems from Hugging Face."""
     dataset_candidates = [
@@ -68,7 +85,7 @@ def load_math_level5(
                 level5 = dataset
             if split in {"train", "validation"}:
                 level5 = _apply_train_validation_split(level5, split, validation_size)
-            return _select_rows(level5, limit)
+            return _select_rows(level5, limit, sample_indices=sample_indices)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
 
@@ -80,6 +97,7 @@ def load_gsm8k(
     split: str = "test",
     *,
     validation_size: Optional[int] = None,
+    sample_indices: Optional[Sequence[int]] = None,
 ):
     """Load GSM8K problems from Hugging Face."""
     dataset_candidates = [
@@ -94,7 +112,7 @@ def load_gsm8k(
             dataset = load_dataset(dataset_name, config, split=dataset_split)
             if split in {"train", "validation"}:
                 dataset = _apply_train_validation_split(dataset, split, validation_size)
-            return _select_rows(dataset, limit)
+            return _select_rows(dataset, limit, sample_indices=sample_indices)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
 
@@ -113,13 +131,24 @@ def get_dataset_split(
     limit: int = 100,
     *,
     validation_size: Optional[int] = None,
+    sample_indices: Optional[Sequence[int]] = None,
 ):
     """Load a benchmark dataset split by name."""
     dataset_name = dataset_name.lower()
     if dataset_name == "math":
-        return load_math_level5(limit=limit, split=split, validation_size=validation_size)
+        return load_math_level5(
+            limit=limit,
+            split=split,
+            validation_size=validation_size,
+            sample_indices=sample_indices,
+        )
     if dataset_name == "gsm8k":
-        return load_gsm8k(limit=limit, split=split, validation_size=validation_size)
+        return load_gsm8k(
+            limit=limit,
+            split=split,
+            validation_size=validation_size,
+            sample_indices=sample_indices,
+        )
     raise ValueError(
         f"Unknown dataset {dataset_name!r}. "
         f"Supported: {', '.join(sorted(_LOADERS))}"
@@ -132,6 +161,7 @@ def get_dataloader(
     *,
     split: str = "test",
     validation_size: Optional[int] = None,
+    sample_indices: Optional[Sequence[int]] = None,
 ):
     """Load a benchmark dataset by name.
 
@@ -142,4 +172,5 @@ def get_dataloader(
         split=split,
         limit=limit,
         validation_size=validation_size,
+        sample_indices=sample_indices,
     )
