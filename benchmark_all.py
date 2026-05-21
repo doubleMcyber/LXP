@@ -96,6 +96,23 @@ DEFAULT_MVP_SMOKE_BASELINE_METHODS = (
 DEFAULT_MVP_SMOKE_LATENT_METHODS = (
     "homogeneous_orthogonal_latent",
 )
+DEFAULT_HETERO_SMOKE_SAMPLE_INDICES = (0, 2, 3)
+DEFAULT_HETERO_SMOKE_METHODS = (
+    "pure_text_cot",
+    "text_text_hybrid",
+    "prompt_local_latent",
+    "global_anchor_hybrid_affine_plus_calibration",
+    "hybrid_hl_mas",
+)
+DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
+    "pure_text_cot",
+    "text_text_hybrid",
+)
+DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
+    "prompt_local_latent",
+    "global_anchor_hybrid_affine_plus_calibration",
+    "hybrid_hl_mas",
+)
 GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 FINAL_ANSWER_MARKER_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)",
@@ -1331,6 +1348,7 @@ def run_benchmark(
     sample_indices: Optional[list[int]] = None,
     semantic_smoke: bool = False,
     mvp_smoke: bool = False,
+    hetero_smoke: bool = False,
     answer_only_final: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     base_cfg = _load_cfg()
@@ -1354,12 +1372,16 @@ def run_benchmark(
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
         base_cfg.max_new_tokens = int(max_new_tokens)
-    if semantic_smoke or mvp_smoke or answer_only_final:
+    if semantic_smoke or mvp_smoke or hetero_smoke or answer_only_final:
         base_cfg.benchmark.answer_only_final = True
     if mvp_smoke:
         base_cfg.reporting.semantic_smoke.baseline_methods = list(DEFAULT_MVP_SMOKE_BASELINE_METHODS)
         base_cfg.reporting.semantic_smoke.latent_methods = list(DEFAULT_MVP_SMOKE_LATENT_METHODS)
         base_cfg.reporting.semantic_smoke.require_final_answer_marker_methods = list(DEFAULT_MVP_SMOKE_METHODS)
+    if hetero_smoke:
+        base_cfg.reporting.semantic_smoke.baseline_methods = list(DEFAULT_HETERO_SMOKE_BASELINE_METHODS)
+        base_cfg.reporting.semantic_smoke.latent_methods = list(DEFAULT_HETERO_SMOKE_LATENT_METHODS)
+        base_cfg.reporting.semantic_smoke.require_final_answer_marker_methods = list(DEFAULT_HETERO_SMOKE_METHODS)
     semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
     if sample_indices is None and semantic_smoke_cfg is not None:
         sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
@@ -1572,7 +1594,7 @@ def run_benchmark(
             getattr(runtime_smoke_cfg, "require_explicit_statuses", True)
         ),
     )
-    if semantic_smoke or mvp_smoke:
+    if semantic_smoke or mvp_smoke or hetero_smoke:
         phase_gate_report = {
             "phase": "phase_1" if suite_name == "phase1_homogeneous" else "phase_3",
             "passed": None,
@@ -1614,7 +1636,7 @@ def run_benchmark(
         )
 
     semantic_smoke_report = None
-    if semantic_smoke or mvp_smoke or bool(getattr(semantic_smoke_cfg, "enabled", False)):
+    if semantic_smoke or mvp_smoke or hetero_smoke or bool(getattr(semantic_smoke_cfg, "enabled", False)):
         baseline_methods = tuple(
             getattr(semantic_smoke_cfg, "baseline_methods", ("pure_text_cot", "text_text_hybrid"))
         )
@@ -1836,6 +1858,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--hetero-smoke",
+        action="store_true",
+        help=(
+            "Use a heterogeneous handoff experiment profile: selected stable GSM8K validation "
+            "samples, text baselines, prompt-local latent, global-anchor calibrated, and hybrid."
+        ),
+    )
+    parser.add_argument(
         "--answer-only-final",
         action="store_true",
         help="Prompt text baselines to return only a final answer.",
@@ -1847,19 +1877,25 @@ def main() -> None:
         help="Optional deterministic seed to stamp into benchmark metadata.",
     )
     args = parser.parse_args()
-    if args.semantic_smoke or args.mvp_smoke:
+    if args.semantic_smoke or args.mvp_smoke or args.hetero_smoke:
         if args.limit == DEFAULT_LIMIT:
             args.limit = DEFAULT_SEMANTIC_SMOKE_LIMIT
         if args.mvp_smoke and not args.sample_indices:
             args.sample_indices = ",".join(str(index) for index in DEFAULT_MVP_SMOKE_SAMPLE_INDICES)
+        if args.hetero_smoke and not args.sample_indices:
+            args.sample_indices = ",".join(str(index) for index in DEFAULT_HETERO_SMOKE_SAMPLE_INDICES)
         if args.max_new_tokens is None:
             args.max_new_tokens = DEFAULT_SEMANTIC_SMOKE_MAX_NEW_TOKENS
         if not args.latent_steps_values:
             args.latent_steps_values = "1"
         if not args.methods:
-            args.methods = ",".join(
-                DEFAULT_MVP_SMOKE_METHODS if args.mvp_smoke else DEFAULT_SEMANTIC_SMOKE_METHODS
-            )
+            if args.mvp_smoke:
+                default_methods = DEFAULT_MVP_SMOKE_METHODS
+            elif args.hetero_smoke:
+                default_methods = DEFAULT_HETERO_SMOKE_METHODS
+            else:
+                default_methods = DEFAULT_SEMANTIC_SMOKE_METHODS
+            args.methods = ",".join(default_methods)
         if args.receiver_context_mode is None:
             args.receiver_context_mode = "prompt_prefix"
 
@@ -1903,6 +1939,7 @@ def main() -> None:
         sample_indices=sample_indices,
         semantic_smoke=args.semantic_smoke,
         mvp_smoke=args.mvp_smoke,
+        hetero_smoke=args.hetero_smoke,
         answer_only_final=args.answer_only_final,
     )
 
