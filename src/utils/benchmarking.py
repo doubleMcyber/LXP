@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 8
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -21,6 +21,9 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "agent_a_model",
     "agent_b_model",
     "model_pair",
+    "model_pair_kv_cache_compatible",
+    "model_pair_compatibility_status",
+    "model_pair_compatibility_reason",
     "torch_dtype",
     "compression_steps",
     "semantic_anchor_count",
@@ -32,6 +35,14 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "kv_cache_transferred",
     "kv_cache_status",
     "kv_cache_reason",
+    "active_kv_cache_transferred",
+    "active_kv_cache_status",
+    "active_kv_cache_reason",
+    "active_kv_cache_source",
+    "receiver_context_status",
+    "receiver_context_reason",
+    "receiver_context_token_count",
+    "receiver_context_latent_position",
     "decode_status",
     "prompt",
     "target_answer",
@@ -71,6 +82,9 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "agent_a_model",
     "agent_b_model",
     "model_pair",
+    "model_pair_kv_cache_compatible",
+    "model_pair_compatibility_status",
+    "model_pair_compatibility_reason",
     "torch_dtype",
     "seed",
     "compression_steps",
@@ -82,6 +96,12 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "handoff_surface",
     "kv_cache_status",
     "kv_cache_reason",
+    "active_kv_cache_status",
+    "active_kv_cache_reason",
+    "active_kv_cache_source",
+    "receiver_context_status",
+    "receiver_context_reason",
+    "receiver_context_latent_position",
     "decode_status",
     "repetition_count",
     "sample_count",
@@ -147,6 +167,9 @@ def build_standard_row_base(
     semantic_anchor_count: Optional[int] = None,
     reasoning_layer_weights: Optional[Sequence[float] | str] = None,
     seed: Optional[int] = None,
+    model_pair_kv_cache_compatible: Optional[bool] = None,
+    model_pair_compatibility_status: str = "",
+    model_pair_compatibility_reason: str = "",
 ) -> dict[str, Any]:
     if compression_steps is None:
         compression_steps = int(
@@ -173,6 +196,9 @@ def build_standard_row_base(
         "agent_a_model": agent_a_model,
         "agent_b_model": agent_b_model,
         "model_pair": f"{agent_a_model} -> {agent_b_model}",
+        "model_pair_kv_cache_compatible": model_pair_kv_cache_compatible,
+        "model_pair_compatibility_status": str(model_pair_compatibility_status),
+        "model_pair_compatibility_reason": str(model_pair_compatibility_reason),
         "torch_dtype": str(_cfg_value(cfg, "torch_dtype", "")),
         "compression_steps": int(compression_steps),
         "semantic_anchor_count": int(semantic_anchor_count),
@@ -220,6 +246,9 @@ def aggregate_standard_rows(
             "agent_a_model",
             "agent_b_model",
             "model_pair",
+            "model_pair_kv_cache_compatible",
+            "model_pair_compatibility_status",
+            "model_pair_compatibility_reason",
             "torch_dtype",
             "seed",
             "compression_steps",
@@ -293,6 +322,12 @@ def aggregate_standard_rows(
                 "handoff_surface": _unique_join(group_rows, "handoff_surface"),
                 "kv_cache_status": _unique_join(group_rows, "kv_cache_status"),
                 "kv_cache_reason": _unique_join(group_rows, "kv_cache_reason"),
+                "active_kv_cache_status": _unique_join(group_rows, "active_kv_cache_status"),
+                "active_kv_cache_reason": _unique_join(group_rows, "active_kv_cache_reason"),
+                "active_kv_cache_source": _unique_join(group_rows, "active_kv_cache_source"),
+                "receiver_context_status": _unique_join(group_rows, "receiver_context_status"),
+                "receiver_context_reason": _unique_join(group_rows, "receiver_context_reason"),
+                "receiver_context_latent_position": _unique_join(group_rows, "receiver_context_latent_position"),
                 "decode_status": _unique_join(group_rows, "decode_status"),
                 "repetition_count": len(repetitions),
                 "sample_count": sample_count,
@@ -415,6 +450,304 @@ def build_runtime_smoke_report(
         "require_explicit_statuses": require_explicit_statuses,
         "missing_requirements": missing_requirements,
     }
+
+
+def _percentage(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return 100.0 * numerator / denominator
+
+
+def build_semantic_smoke_report(
+    rows: Sequence[dict[str, Any]],
+    *,
+    baseline_methods: Sequence[str],
+    latent_methods: Sequence[str],
+    model_pair_compatibility: Optional[dict[str, Any]] = None,
+    min_baseline_accuracy_percentage: Optional[float] = None,
+    min_latent_accuracy_percentage: Optional[float] = None,
+    min_method_accuracy_percentage: Optional[float] = None,
+    min_latent_non_empty_decoded_rate_percentage: float = 100.0,
+    min_compatible_cache_transfer_rate_percentage: float = 100.0,
+    max_answer_perplexity: Optional[float] = None,
+    max_degenerate_decode_count: int = 0,
+    require_baseline_final_answer_marker: bool = False,
+    require_final_answer_marker_methods: Optional[Sequence[str]] = None,
+    max_diagnostic_rows: int = 5,
+) -> dict[str, Any]:
+    baseline_method_set = set(baseline_methods)
+    latent_method_set = set(latent_methods)
+    baseline_rows = [row for row in rows if row.get("method") in baseline_method_set]
+    latent_rows = [row for row in rows if row.get("method") in latent_method_set]
+    marker_method_set = (
+        set(require_final_answer_marker_methods)
+        if require_final_answer_marker_methods is not None
+        else baseline_method_set
+    )
+    marker_scope_rows = [row for row in rows if row.get("method") in marker_method_set]
+
+    baseline_answer_rows = [
+        row for row in baseline_rows if str(row.get("predicted_answer") or "").strip()
+    ]
+    latent_non_empty_rows = [
+        row for row in latent_rows if str(row.get("decoded_text") or "").strip()
+    ]
+    latent_kv_rows = [
+        row
+        for row in latent_rows
+        if row.get("kv_cache_transferred") is not None and row.get("kv_cache_transferred") != ""
+    ]
+    compatible_cache_rows = [
+        row for row in latent_kv_rows if bool(row.get("kv_cache_transferred"))
+    ]
+    perplexity_rows = [
+        row
+        for row in rows
+        if row.get("answer_perplexity") is not None and row.get("answer_perplexity") != ""
+    ]
+    finite_perplexity_rows = [
+        row
+        for row in perplexity_rows
+        if math.isfinite(float(row["answer_perplexity"]))
+    ]
+    baseline_final_answer_marker_rows = [
+        row for row in baseline_rows if "final answer" in str(row.get("decoded_text") or "").casefold()
+    ]
+    marker_rows = [
+        row for row in marker_scope_rows if "final answer" in str(row.get("decoded_text") or "").casefold()
+    ]
+    degenerate_rows = [
+        row for row in rows if _is_degenerate_decode(str(row.get("decoded_text") or ""))
+    ]
+    baseline_correct_values = [
+        value for value in (_row_correct_value(row) for row in baseline_rows) if value is not None
+    ]
+    latent_correct_values = [
+        value for value in (_row_correct_value(row) for row in latent_rows) if value is not None
+    ]
+    wrong_answer_rows = [
+        row for row in rows if _row_correct_value(row) is False
+    ]
+    semantic_methods = list(dict.fromkeys([*baseline_methods, *latent_methods]))
+    method_accuracy = {
+        method: _accuracy_rate([row for row in rows if row.get("method") == method])
+        for method in semantic_methods
+    }
+    diagnostic_limit = max(0, int(max_diagnostic_rows))
+    worst_perplexity_rows = sorted(
+        finite_perplexity_rows,
+        key=lambda row: float(row["answer_perplexity"]),
+        reverse=True,
+    )[:diagnostic_limit]
+
+    baseline_answer_rate = _percentage(len(baseline_answer_rows), len(baseline_rows))
+    baseline_accuracy_rate = _percentage(sum(baseline_correct_values), len(baseline_correct_values))
+    latent_accuracy_rate = _percentage(sum(latent_correct_values), len(latent_correct_values))
+    latent_non_empty_rate = _percentage(len(latent_non_empty_rows), len(latent_rows))
+    compatible_cache_transfer_rate = _percentage(len(compatible_cache_rows), len(latent_kv_rows))
+    max_observed_perplexity = (
+        max(float(row["answer_perplexity"]) for row in finite_perplexity_rows)
+        if finite_perplexity_rows
+        else None
+    )
+    compatibility = model_pair_compatibility or {}
+    cache_transfer_required = bool(compatibility.get("kv_cache_compatible", False))
+
+    missing_requirements: list[str] = []
+    if not baseline_rows:
+        missing_requirements.append("No baseline rows were provided.")
+    elif len(baseline_answer_rows) < len(baseline_rows):
+        missing_requirements.append("At least one baseline row did not extract a predicted answer.")
+    if min_baseline_accuracy_percentage is not None:
+        if baseline_accuracy_rate is None:
+            missing_requirements.append("No baseline correctness rows were provided.")
+        elif baseline_accuracy_rate < float(min_baseline_accuracy_percentage):
+            missing_requirements.append(
+                "Baseline accuracy "
+                f"{baseline_accuracy_rate:.2f}% is below required "
+                f"{float(min_baseline_accuracy_percentage):.2f}%."
+            )
+
+    if not latent_rows:
+        missing_requirements.append("No latent rows were provided.")
+    elif (
+        latent_non_empty_rate is not None
+        and latent_non_empty_rate < min_latent_non_empty_decoded_rate_percentage
+    ):
+        missing_requirements.append(
+            "Latent non-empty decode rate "
+            f"{latent_non_empty_rate:.2f}% is below required "
+                f"{min_latent_non_empty_decoded_rate_percentage:.2f}%."
+        )
+    if min_latent_accuracy_percentage is not None:
+        if latent_accuracy_rate is None:
+            missing_requirements.append("No latent correctness rows were provided.")
+        elif latent_accuracy_rate < float(min_latent_accuracy_percentage):
+            missing_requirements.append(
+                "Latent accuracy "
+                f"{latent_accuracy_rate:.2f}% is below required "
+                f"{float(min_latent_accuracy_percentage):.2f}%."
+            )
+    if min_method_accuracy_percentage is not None:
+        for method, accuracy_rate in method_accuracy.items():
+            if accuracy_rate is None:
+                missing_requirements.append(f"No correctness rows were provided for method {method}.")
+            elif accuracy_rate < float(min_method_accuracy_percentage):
+                missing_requirements.append(
+                    f"Method {method} accuracy {accuracy_rate:.2f}% is below required "
+                    f"{float(min_method_accuracy_percentage):.2f}%."
+                )
+
+    if cache_transfer_required:
+        if compatible_cache_transfer_rate is None:
+            missing_requirements.append("No latent KV cache transfer rows were provided.")
+        elif compatible_cache_transfer_rate < min_compatible_cache_transfer_rate_percentage:
+            missing_requirements.append(
+                "Compatible-pair cache transfer rate "
+                f"{compatible_cache_transfer_rate:.2f}% is below required "
+                f"{min_compatible_cache_transfer_rate_percentage:.2f}%."
+            )
+
+    if len(perplexity_rows) < len(rows):
+        missing_requirements.append("At least one row did not report answer perplexity.")
+    if len(finite_perplexity_rows) < len(perplexity_rows):
+        missing_requirements.append("At least one answer perplexity was not finite.")
+    if max_answer_perplexity is not None and max_observed_perplexity is not None:
+        if max_observed_perplexity > float(max_answer_perplexity):
+            missing_requirements.append(
+                f"Observed max answer perplexity {max_observed_perplexity:.4f} "
+                f"exceeds allowed {float(max_answer_perplexity):.4f}."
+            )
+    if len(degenerate_rows) > int(max_degenerate_decode_count):
+        missing_requirements.append(
+            f"Observed {len(degenerate_rows)} degenerate decode rows, "
+            f"exceeds allowed {int(max_degenerate_decode_count)}."
+        )
+    if require_baseline_final_answer_marker and len(baseline_final_answer_marker_rows) < len(baseline_rows):
+        missing_requirements.append(
+            "At least one baseline row did not include a final-answer marker."
+        )
+    if require_final_answer_marker_methods is not None:
+        if not marker_scope_rows:
+            missing_requirements.append("No rows were provided for required final-answer marker methods.")
+        elif len(marker_rows) < len(marker_scope_rows):
+            missing_requirements.append(
+                "At least one required-method row did not include a final-answer marker."
+            )
+
+    return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "phase": "semantic_smoke",
+        "passed": not missing_requirements,
+        "baseline_methods": list(baseline_methods),
+        "latent_methods": list(latent_methods),
+        "baseline_sample_count": len(baseline_rows),
+        "latent_sample_count": len(latent_rows),
+        "baseline_answer_extraction_rate_percentage": baseline_answer_rate,
+        "baseline_accuracy_percentage": baseline_accuracy_rate,
+        "min_baseline_accuracy_percentage": min_baseline_accuracy_percentage,
+        "latent_accuracy_percentage": latent_accuracy_rate,
+        "min_latent_accuracy_percentage": min_latent_accuracy_percentage,
+        "method_accuracy_percentage": method_accuracy,
+        "min_method_accuracy_percentage": min_method_accuracy_percentage,
+        "latent_non_empty_decoded_rate_percentage": latent_non_empty_rate,
+        "compatible_cache_transfer_rate_percentage": compatible_cache_transfer_rate,
+        "cache_transfer_required": cache_transfer_required,
+        "model_pair_compatibility_status": compatibility.get("status"),
+        "model_pair_compatibility_reason": compatibility.get("reason"),
+        "finite_answer_perplexity_count": len(finite_perplexity_rows),
+        "answer_perplexity_count": len(perplexity_rows),
+        "max_answer_perplexity": max_observed_perplexity,
+        "max_allowed_answer_perplexity": max_answer_perplexity,
+        "degenerate_decode_count": len(degenerate_rows),
+        "max_allowed_degenerate_decode_count": int(max_degenerate_decode_count),
+        "baseline_final_answer_marker_rate_percentage": _percentage(
+            len(baseline_final_answer_marker_rows),
+            len(baseline_rows),
+        ),
+        "require_baseline_final_answer_marker": bool(require_baseline_final_answer_marker),
+        "required_final_answer_marker_methods": (
+            list(require_final_answer_marker_methods)
+            if require_final_answer_marker_methods is not None
+            else None
+        ),
+        "required_final_answer_marker_sample_count": len(marker_scope_rows),
+        "required_final_answer_marker_rate_percentage": _percentage(
+            len(marker_rows),
+            len(marker_scope_rows),
+        ),
+        "worst_answer_perplexity_rows": [
+            _semantic_row_diagnostic(row) for row in worst_perplexity_rows
+        ],
+        "wrong_answer_rows": [
+            _semantic_row_diagnostic(row) for row in wrong_answer_rows[:diagnostic_limit]
+        ],
+        "wrong_answer_count": len(wrong_answer_rows),
+        "missing_requirements": missing_requirements,
+    }
+
+
+def _row_correct_value(row: dict[str, Any]) -> Optional[bool]:
+    value = row.get("correct")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip():
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+
+    predicted = row.get("predicted_answer")
+    target = row.get("target_answer")
+    if predicted is not None and target is not None:
+        return str(predicted).strip() == str(target).strip()
+    return None
+
+
+def _accuracy_rate(rows: Sequence[dict[str, Any]]) -> Optional[float]:
+    correct_values = [
+        value for value in (_row_correct_value(row) for row in rows) if value is not None
+    ]
+    return _percentage(sum(correct_values), len(correct_values))
+
+
+def _semantic_row_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
+    decoded_text = " ".join(str(row.get("decoded_text") or "").split())
+    return {
+        "method": row.get("method"),
+        "sample_index": row.get("sample_index"),
+        "target_answer": row.get("target_answer"),
+        "predicted_answer": row.get("predicted_answer"),
+        "correct": _row_correct_value(row),
+        "answer_perplexity": row.get("answer_perplexity"),
+        "generated_tokens": row.get("generated_tokens"),
+        "kv_cache_status": row.get("kv_cache_status"),
+        "active_kv_cache_status": row.get("active_kv_cache_status"),
+        "active_kv_cache_source": row.get("active_kv_cache_source"),
+        "receiver_context_status": row.get("receiver_context_status"),
+        "receiver_context_reason": row.get("receiver_context_reason"),
+        "receiver_context_latent_position": row.get("receiver_context_latent_position"),
+        "decoded_preview": decoded_text[:240],
+    }
+
+
+def _is_degenerate_decode(decoded_text: str) -> bool:
+    tokens = decoded_text.split()
+    if len(tokens) < 24:
+        return False
+    max_run = 1
+    current_run = 1
+    previous_token = tokens[0]
+    for token in tokens[1:]:
+        if token == previous_token:
+            current_run += 1
+            max_run = max(max_run, current_run)
+        else:
+            current_run = 1
+            previous_token = token
+    unique_ratio = len(set(tokens)) / len(tokens)
+    return max_run >= 16 or unique_ratio < 0.08
 
 
 def build_phase1_gate_report(

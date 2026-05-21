@@ -39,6 +39,7 @@ from src.utils.lm_eval import (
     compute_answer_metrics_from_prefix,
     greedy_decode_from_prefix,
     prepare_latent_prefix_state,
+    prepare_receiver_context_latent_prefix_state,
 )
 
 _DTYPE_MAP = {
@@ -55,6 +56,11 @@ _DEFAULT_REASONING_LAYER_WEIGHTS: tuple[float, ...] = (0.2, 0.3, 0.5)
 _ALIGNMENT_CACHE_VERSION = 4
 _SUPPORTED_HANDOFF_TARGETS: frozenset[str] = frozenset({"input_embedding"})
 _SUPPORTED_DIAGNOSTIC_TARGETS: frozenset[str] = frozenset({"hidden_consensus"})
+_SUPPORTED_LATENT_POOLING_MODES: frozenset[str] = frozenset({"last_token", "mean", "prompt_mean"})
+_SUPPORTED_RECEIVER_CONTEXT_MODES: frozenset[str] = frozenset({"none", "auto", "prompt_prefix"})
+_SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS: frozenset[str] = frozenset(
+    {"after_context", "before_context"}
+)
 _MATH_COMPLEXITY_PATTERNS: tuple[str, ...] = (
     "solve",
     "equation",
@@ -213,6 +219,97 @@ def _dynamics_mode(cfg: Optional[DictConfig]) -> str:
     if mode not in {"identity", "ode"}:
         raise ValueError("dynamics.mode must be either 'identity' or 'ode'")
     return mode
+
+
+def _handoff_cfg(cfg: Optional[DictConfig]) -> Any:
+    return getattr(cfg, "handoff", None)
+
+
+def _latent_pooling_mode(cfg: Optional[DictConfig]) -> str:
+    mode = str(getattr(_handoff_cfg(cfg), "latent_pooling", "last_token")).strip().lower()
+    if mode not in _SUPPORTED_LATENT_POOLING_MODES:
+        supported = ", ".join(sorted(_SUPPORTED_LATENT_POOLING_MODES))
+        raise ValueError(f"handoff.latent_pooling must be one of: {supported}")
+    return "mean" if mode == "prompt_mean" else mode
+
+
+def _receiver_context_mode(cfg: Optional[DictConfig]) -> str:
+    context_cfg = getattr(_handoff_cfg(cfg), "receiver_context", None)
+    mode = str(getattr(context_cfg, "mode", "auto")).strip().lower()
+    if mode not in _SUPPORTED_RECEIVER_CONTEXT_MODES:
+        supported = ", ".join(sorted(_SUPPORTED_RECEIVER_CONTEXT_MODES))
+        raise ValueError(f"handoff.receiver_context.mode must be one of: {supported}")
+    return mode
+
+
+def _receiver_context_latent_position(cfg: Optional[DictConfig]) -> str:
+    context_cfg = getattr(_handoff_cfg(cfg), "receiver_context", None)
+    position = str(getattr(context_cfg, "latent_position", "after_context")).strip().lower()
+    if position not in _SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS:
+        supported = ", ".join(sorted(_SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS))
+        raise ValueError(f"handoff.receiver_context.latent_position must be one of: {supported}")
+    return position
+
+
+def _should_use_receiver_context(context_mode: str, *, sender_kv_cache_transferred: bool) -> bool:
+    if context_mode == "none":
+        return False
+    if context_mode == "prompt_prefix":
+        return True
+    return not sender_kv_cache_transferred
+
+
+def _maybe_apply_chat_template(tokenizer: Any, user_message: str) -> str:
+    if tokenizer is None or not getattr(tokenizer, "chat_template", None):
+        return user_message
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:  # noqa: BLE001
+        return user_message
+
+
+def _answer_only_final_enabled(cfg: Optional[DictConfig]) -> bool:
+    return bool(getattr(getattr(cfg, "benchmark", None), "answer_only_final", False))
+
+
+def _format_receiver_context_prompt(prompt: str, tokenizer: Any = None, cfg: Optional[DictConfig] = None) -> str:
+    instruction = (
+        "Use the latent reasoning signal that follows. Return only the final answer "
+        "in the form: Final answer: <answer>."
+        if _answer_only_final_enabled(cfg)
+        else "Use the latent reasoning signal that follows and give the final answer."
+    )
+    user_message = f"{prompt}\n\n{instruction}"
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_receiver_context_answer_suffix(cfg: Optional[DictConfig] = None) -> str:
+    if not _answer_only_final_enabled(cfg):
+        return ""
+    return "\n\nFinal answer:"
+
+
+def _pool_latent_handoff_step(
+    consensus_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    pooling_mode: str,
+) -> torch.Tensor:
+    if pooling_mode == "last_token":
+        return consensus_hidden_states[:, -1:, :]
+    if pooling_mode != "mean":
+        raise ValueError("pooling_mode must be 'last_token' or 'mean'")
+    weights = attention_mask.to(
+        device=consensus_hidden_states.device,
+        dtype=torch.float32,
+    ).unsqueeze(-1)
+    pooled = (consensus_hidden_states.float() * weights).sum(dim=1, keepdim=True)
+    pooled = pooled / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return pooled.to(dtype=consensus_hidden_states.dtype)
 
 
 def _alignment_center_anchors(cfg: Optional[DictConfig]) -> bool:
@@ -1336,7 +1433,12 @@ def extract_reasoning_trace(cfg: DictConfig, prompt: Optional[str] = None) -> di
     )
     alignment_state = _handoff_alignment_state_from_pipeline_state(state)
 
-    current_latent_step = consensus_hidden_states[:, -1:, :]
+    latent_pooling_mode = _latent_pooling_mode(cfg)
+    current_latent_step = _pool_latent_handoff_step(
+        consensus_hidden_states,
+        attention_mask_a,
+        pooling_mode=latent_pooling_mode,
+    )
     continuous_position_ids = position_ids_a[:, -1:] + 1
     effective_latent_steps = _scale_integration_points(
         int(cfg.latent_steps), complexity_factor
@@ -1366,6 +1468,7 @@ def extract_reasoning_trace(cfg: DictConfig, prompt: Optional[str] = None) -> di
         "handoff_surface": state.get("handoff_surface", _alignment_handoff_target(cfg)),
         "diagnostic_surface": state.get("diagnostic_surface", _alignment_diagnostic_target(cfg)),
         "dynamics_mode": dynamics_mode,
+        "latent_pooling": latent_pooling_mode,
         "semantic_anchor_count": int(state["semantic_anchor_count"]),
         "semantic_anchor_preview": semantic_anchor_strings[:10],
         "reasoning_layer_weights": reasoning_layer_weights,
@@ -1414,6 +1517,9 @@ def run_hybrid_pipeline(
         _prompt_calibration_settings(cfg)
     )
     dynamics_mode = _dynamics_mode(cfg)
+    latent_pooling_mode = _latent_pooling_mode(cfg)
+    receiver_context_mode = _receiver_context_mode(cfg)
+    receiver_context_latent_position = _receiver_context_latent_position(cfg)
     trace_events: list[dict[str, Any]] = []
 
     encoded = tokenizer_a(prompt, return_tensors="pt")
@@ -1471,7 +1577,11 @@ def run_hybrid_pipeline(
             )
         )
     )
-    current_latent_step = consensus_hidden_states[:, -1:, :]
+    current_latent_step = _pool_latent_handoff_step(
+        consensus_hidden_states,
+        attention_mask_a,
+        pooling_mode=latent_pooling_mode,
+    )
     trace_events.append(
         _trace_tensor_event(
             operation="sender_consensus",
@@ -1479,7 +1589,10 @@ def run_hybrid_pipeline(
             source_surface="reasoner_hidden_consensus",
             target_surface="reasoner_hidden_consensus",
             model_id=str(cfg.agent_a_model),
-            diagnostics={"reasoning_layer_indices": reasoning_layer_indices},
+            diagnostics={
+                "reasoning_layer_indices": reasoning_layer_indices,
+                "latent_pooling": latent_pooling_mode,
+            },
         )
     )
     continuous_position_ids = position_ids_a[:, -1:] + 1
@@ -1575,15 +1688,66 @@ def run_hybrid_pipeline(
         device=agent_b_device,
         dtype=agent_b_embed_dtype,
     )
-    prefix_state = prepare_latent_prefix_state(
+    sender_prefix_state = prepare_latent_prefix_state(
         model=agent_b,
         handoff_step=handoff_step,
         kv_cache=kv_cache_a,
     )
+    kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
+    kv_cache_status = str(
+        sender_prefix_state.get(
+            "kv_cache_status",
+            "transferred" if kv_cache_transferred else "unsupported",
+        )
+    )
+    kv_cache_reason = str(sender_prefix_state.get("kv_cache_reason", ""))
+    receiver_context_status = str(sender_prefix_state.get("receiver_context_status", "not_used"))
+    receiver_context_reason = str(sender_prefix_state.get("receiver_context_reason", "latent_only"))
+    receiver_context_token_count = int(sender_prefix_state.get("receiver_context_token_count", 0))
+    receiver_context_latent_position_value = str(
+        sender_prefix_state.get("receiver_context_latent_position", "not_applicable")
+    )
+    active_kv_cache_transferred = bool(
+        sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
+    )
+    active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
+    active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
+    active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
+
+    if _should_use_receiver_context(
+        receiver_context_mode,
+        sender_kv_cache_transferred=kv_cache_transferred,
+    ):
+        context_reason = (
+            "forced_prompt_prefix"
+            if receiver_context_mode == "prompt_prefix"
+            else f"sender_kv_cache_status:{kv_cache_status}"
+        )
+        prefix_state = prepare_receiver_context_latent_prefix_state(
+            model=agent_b,
+            tokenizer=tokenizer_b,
+            context_text=_format_receiver_context_prompt(prompt, tokenizer_b, cfg),
+            handoff_step=handoff_step,
+            kv_cache=kv_cache_a,
+            reason=context_reason,
+            suffix_text=_format_receiver_context_answer_suffix(cfg),
+            decoded_text_prefix="Final answer:",
+            latent_position=receiver_context_latent_position,
+        )
+        receiver_context_status = str(prefix_state.get("receiver_context_status", "used_prompt_prefix"))
+        receiver_context_reason = str(prefix_state.get("receiver_context_reason", context_reason))
+        receiver_context_token_count = int(prefix_state.get("receiver_context_token_count", 0))
+        receiver_context_latent_position_value = str(
+            prefix_state.get("receiver_context_latent_position", receiver_context_latent_position)
+        )
+        active_kv_cache_transferred = bool(prefix_state.get("active_kv_cache_transferred", False))
+        active_kv_cache_status = str(prefix_state.get("active_kv_cache_status", "not_provided"))
+        active_kv_cache_reason = str(prefix_state.get("active_kv_cache_reason", ""))
+        active_kv_cache_source = str(prefix_state.get("active_kv_cache_source", "receiver_context"))
+    else:
+        prefix_state = sender_prefix_state
+
     outputs_b = prefix_state["outputs"]
-    kv_cache_transferred = bool(prefix_state["kv_cache_transferred"])
-    kv_cache_status = str(prefix_state.get("kv_cache_status", "transferred" if kv_cache_transferred else "unsupported"))
-    kv_cache_reason = str(prefix_state.get("kv_cache_reason", ""))
     raw_handoff_entropy = float(
         _compute_logits_entropy(outputs_b.logits[:, -1, :]).mean().detach().cpu().item()
     )
@@ -1623,15 +1787,53 @@ def run_hybrid_pipeline(
                 max_norm_ratio=prompt_calibration_max_norm,
             )
         handoff_step = aligned_handoff_step.to(device=agent_b_device, dtype=agent_b_embed_dtype)
-        prefix_state = prepare_latent_prefix_state(
+        sender_prefix_state = prepare_latent_prefix_state(
             model=agent_b,
             handoff_step=handoff_step,
             kv_cache=kv_cache_a,
         )
+        kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
+        kv_cache_status = str(sender_prefix_state.get("kv_cache_status", kv_cache_status))
+        kv_cache_reason = str(sender_prefix_state.get("kv_cache_reason", kv_cache_reason))
+        active_kv_cache_transferred = bool(
+            sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
+        )
+        active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
+        active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
+        active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
+        if _should_use_receiver_context(
+            receiver_context_mode,
+            sender_kv_cache_transferred=kv_cache_transferred,
+        ):
+            context_reason = (
+                "forced_prompt_prefix"
+                if receiver_context_mode == "prompt_prefix"
+                else f"sender_kv_cache_status:{kv_cache_status}"
+            )
+            prefix_state = prepare_receiver_context_latent_prefix_state(
+                model=agent_b,
+                tokenizer=tokenizer_b,
+                context_text=_format_receiver_context_prompt(prompt, tokenizer_b, cfg),
+                handoff_step=handoff_step,
+                kv_cache=kv_cache_a,
+                reason=context_reason,
+                suffix_text=_format_receiver_context_answer_suffix(cfg),
+                decoded_text_prefix="Final answer:",
+                latent_position=receiver_context_latent_position,
+            )
+            receiver_context_status = str(prefix_state.get("receiver_context_status", "used_prompt_prefix"))
+            receiver_context_reason = str(prefix_state.get("receiver_context_reason", context_reason))
+            receiver_context_token_count = int(prefix_state.get("receiver_context_token_count", 0))
+            receiver_context_latent_position_value = str(
+                prefix_state.get("receiver_context_latent_position", receiver_context_latent_position)
+            )
+            active_kv_cache_transferred = bool(prefix_state.get("active_kv_cache_transferred", False))
+            active_kv_cache_status = str(prefix_state.get("active_kv_cache_status", "not_provided"))
+            active_kv_cache_reason = str(prefix_state.get("active_kv_cache_reason", ""))
+            active_kv_cache_source = str(prefix_state.get("active_kv_cache_source", "receiver_context"))
+        else:
+            prefix_state = sender_prefix_state
         outputs_b = prefix_state["outputs"]
-        kv_cache_transferred = bool(prefix_state["kv_cache_transferred"])
-        kv_cache_status = str(prefix_state.get("kv_cache_status", kv_cache_status))
-        kv_cache_reason = str(prefix_state.get("kv_cache_reason", kv_cache_reason))
 
     total_reasoning_steps = effective_latent_steps + executed_discrete_fallback_steps
     pre_alignment_l2_distance: Optional[float] = None
@@ -1714,8 +1916,15 @@ def run_hybrid_pipeline(
             diagnostics={
                 "kv_cache_status": kv_cache_status,
                 "kv_cache_reason": kv_cache_reason,
+                "active_kv_cache_status": active_kv_cache_status,
+                "active_kv_cache_reason": active_kv_cache_reason,
+                "active_kv_cache_source": active_kv_cache_source,
                 "decode_status": decode_status,
                 "generated_tokens": int(decode_metrics["generated_tokens"]),
+                "receiver_context_status": receiver_context_status,
+                "receiver_context_reason": receiver_context_reason,
+                "receiver_context_token_count": receiver_context_token_count,
+                "receiver_context_latent_position": receiver_context_latent_position_value,
             },
         )
     )
@@ -1727,9 +1936,20 @@ def run_hybrid_pipeline(
         "handoff_surface": handoff_surface,
         "kv_cache_status": kv_cache_status,
         "kv_cache_reason": kv_cache_reason,
+        "active_kv_cache_transferred": active_kv_cache_transferred,
+        "active_kv_cache_status": active_kv_cache_status,
+        "active_kv_cache_reason": active_kv_cache_reason,
+        "active_kv_cache_source": active_kv_cache_source,
+        "receiver_context_status": receiver_context_status,
+        "receiver_context_reason": receiver_context_reason,
+        "receiver_context_token_count": receiver_context_token_count,
+        "receiver_context_latent_position": receiver_context_latent_position_value,
         "trace_events": trace_events,
         "complexity_factor": complexity_factor,
         "dynamics_mode": dynamics_mode,
+        "latent_pooling": latent_pooling_mode,
+        "receiver_context_mode": receiver_context_mode,
+        "receiver_context_latent_position": receiver_context_latent_position,
         "alignment_mode": alignment_mode,
         "alignment_strategy": alignment_state.get("alignment_strategy", alignment_mode),
         "semantic_anchor_count": int(state["semantic_anchor_count"]),
@@ -1795,7 +2015,12 @@ def main(cfg: DictConfig) -> None:
     outputs = run_hybrid_pipeline(cfg)
     print(f"Pipeline complexity factor: {outputs['complexity_factor']:.2f}")
     print(f"Dynamics mode: {outputs['dynamics_mode']}")
+    print(f"Latent pooling: {outputs['latent_pooling']}")
     print(f"Handoff status: {outputs['handoff_status']}")
+    print(
+        f"Receiver context: {outputs['receiver_context_status']} "
+        f"({outputs['receiver_context_reason']})"
+    )
     print(f"KV cache status: {outputs['kv_cache_status']} ({outputs['kv_cache_reason']})")
     print(f"Decode status: {outputs['decode_status']}")
     print(f"Handoff uncertainty: {outputs['handoff_uncertainty']:.4f}")

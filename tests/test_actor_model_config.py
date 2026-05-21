@@ -16,6 +16,7 @@ _CFG = OmegaConf.load(Path(__file__).resolve().parent.parent / "configs" / "main
 )
 def test_actor_model_config_loads() -> None:
     config = AutoConfig.from_pretrained(_CFG.agent_b_model, trust_remote_code=True)
+    text_config = getattr(config, "text_config", config)
     assert config is not None
-    assert hasattr(config, "num_hidden_layers")
-    assert hasattr(config, "num_attention_heads")
+    assert hasattr(text_config, "num_hidden_layers")
+    assert hasattr(text_config, "num_attention_heads")

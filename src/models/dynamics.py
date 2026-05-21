@@ -39,10 +39,58 @@ def _kv_cache_layer_count(kv_cache: Any) -> int:
         return 0
     if isinstance(kv_cache, (tuple, list)):
         return len(kv_cache)
+    layers = getattr(kv_cache, "layers", None)
+    if layers is not None:
+        return len(layers)
+    key_cache = getattr(kv_cache, "key_cache", None)
+    if key_cache is not None:
+        return len(key_cache)
     try:
         return len(kv_cache)  # type: ignore[arg-type]
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _kv_cache_layer_key_value(kv_cache: Any, layer_index: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return the (key, value) tensors for a given layer of a cache.
+
+    Supports legacy tuple-of-tuples caches and modern cache objects exposing
+    either ``layers`` (e.g. ``DynamicCache``) or parallel ``key_cache`` /
+    ``value_cache`` lists (e.g. hybrid caches like ``Qwen3_5DynamicCache``).
+    """
+    if kv_cache is None:
+        return None
+    layers = getattr(kv_cache, "layers", None)
+    if layers is not None:
+        if layer_index < 0 or layer_index >= len(layers):
+            return None
+        layer = layers[layer_index]
+        key_tensor = getattr(layer, "keys", None)
+        value_tensor = getattr(layer, "values", None)
+        if not torch.is_tensor(key_tensor) or not torch.is_tensor(value_tensor):
+            return None
+        return key_tensor, value_tensor
+    key_cache = getattr(kv_cache, "key_cache", None)
+    value_cache = getattr(kv_cache, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        if layer_index < 0 or layer_index >= min(len(key_cache), len(value_cache)):
+            return None
+        key_tensor = key_cache[layer_index]
+        value_tensor = value_cache[layer_index]
+        if not torch.is_tensor(key_tensor) or not torch.is_tensor(value_tensor):
+            return None
+        return key_tensor, value_tensor
+    if isinstance(kv_cache, (tuple, list)):
+        if layer_index < 0 or layer_index >= len(kv_cache):
+            return None
+        layer = kv_cache[layer_index]
+        if not isinstance(layer, (tuple, list)) or len(layer) < 2:
+            return None
+        key_tensor, value_tensor = layer[0], layer[1]
+        if not torch.is_tensor(key_tensor) or not torch.is_tensor(value_tensor):
+            return None
+        return key_tensor, value_tensor
+    return None
 
 
 def _move_kv_cache_to_device(kv_cache: Any, device: torch.device) -> Any:
@@ -76,28 +124,38 @@ def _kv_cache_compatibility_status(
 ) -> tuple[str, str]:
     if kv_cache is None:
         return "not_provided", "no_cache_provided"
-    if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) == 0:
+
+    is_legacy = isinstance(kv_cache, (tuple, list))
+    is_object_cache = (
+        getattr(kv_cache, "layers", None) is not None
+        or getattr(kv_cache, "key_cache", None) is not None
+    )
+    if not is_legacy and not is_object_cache:
+        return "unsupported_cache_type", type(kv_cache).__name__
+
+    layer_count = _kv_cache_layer_count(kv_cache)
+    if layer_count == 0:
         return "unsupported_cache_type", type(kv_cache).__name__
 
     cfg = actor_model.config
     expected_layers = getattr(cfg, "num_hidden_layers", None)
-    if isinstance(expected_layers, int) and len(kv_cache) != expected_layers:
+    if isinstance(expected_layers, int) and layer_count != expected_layers:
         return (
             "unsupported_architecture_mismatch",
-            f"layer_count_mismatch: expected {expected_layers}, got {len(kv_cache)}",
+            f"layer_count_mismatch: expected {expected_layers}, got {layer_count}",
         )
 
-    first_layer = kv_cache[0]
-    if not isinstance(first_layer, (tuple, list)) or len(first_layer) < 2:
+    # For hybrid/state-space caches (e.g. Qwen3_5DynamicCache), some layers are
+    # linear-attention with no standard key/value tensors. Trust the cache as
+    # long as the layer count matches the receiver model; the model's own
+    # forward will handle layer-type dispatch.
+    first_pair = _kv_cache_layer_key_value(kv_cache, 0)
+    if first_pair is None:
+        if is_object_cache:
+            return "transferred", "compatible_object_cache"
         return "invalid_cache", "first_layer_missing_key_value_tensors"
-    first_key_tensor = first_layer[0]
-    first_value_tensor = first_layer[1]
-    if (
-        not torch.is_tensor(first_key_tensor)
-        or not torch.is_tensor(first_value_tensor)
-        or first_key_tensor.dim() < 4
-        or first_value_tensor.dim() < 4
-    ):
+    first_key_tensor, first_value_tensor = first_pair
+    if first_key_tensor.dim() < 4 or first_value_tensor.dim() < 4:
         return "invalid_cache", "first_layer_key_value_missing_or_rank_too_low"
     if first_key_tensor.shape != first_value_tensor.shape:
         return (
@@ -128,17 +186,12 @@ def _kv_cache_compatibility_status(
         )
 
     first_shape = tuple(first_key_tensor.shape)
-    for layer_index, layer_cache in enumerate(kv_cache[1:], start=1):
-        if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
+    for layer_index in range(1, layer_count):
+        layer_pair = _kv_cache_layer_key_value(kv_cache, layer_index)
+        if layer_pair is None:
             return "invalid_cache", f"layer_{layer_index}_missing_key_value_tensors"
-        key_tensor = layer_cache[0]
-        value_tensor = layer_cache[1]
-        if (
-            not torch.is_tensor(key_tensor)
-            or not torch.is_tensor(value_tensor)
-            or key_tensor.dim() < 4
-            or value_tensor.dim() < 4
-        ):
+        key_tensor, value_tensor = layer_pair
+        if key_tensor.dim() < 4 or value_tensor.dim() < 4:
             return "invalid_cache", f"layer_{layer_index}_key_value_missing_or_rank_too_low"
         if key_tensor.shape != value_tensor.shape:
             return (

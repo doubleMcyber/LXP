@@ -25,6 +25,7 @@ from latent_pipeline import (
 from src.data.loader import get_dataloader, pick_field
 from src.utils.alignment import apply_alignment
 from src.utils.benchmarking import (
+    REPORT_SCHEMA_VERSION,
     build_distance_calibration_report,
     build_standard_row_base,
     write_json,
@@ -425,7 +426,7 @@ def _summarize_rows(
         aggregate = _aggregate_group_rows(group_rows)
         summary_row = {
             "row_type": "overall",
-            "report_schema_version": base_row.get("report_schema_version", 2),
+            "report_schema_version": base_row.get("report_schema_version", REPORT_SCHEMA_VERSION),
             "evaluation_surface": base_row["evaluation_surface"],
             "suite": base_row["suite"],
             "method": base_row["method"],
@@ -882,7 +883,7 @@ def run_analysis(
     full_anchor_rows = [row for row in rows if row["control_name"] == "full_anchor"]
     full_anchor_summary_rows = [row for row in summary_rows if row["control_name"] == "full_anchor"]
     report_payload = {
-        "report_schema_version": 2,
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "evaluation_surface": "analyze_distance_accuracy",
         "dataset": dataset_name,
         "dataset_split": effective_split,

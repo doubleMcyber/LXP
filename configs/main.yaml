@@ -1,6 +1,6 @@
 seed: 0
-agent_a_model: "Qwen/Qwen3.5-0.8B"
-agent_b_model: "LGAI-EXAONE/EXAONE-4.0-1.2B"
+agent_a_model: "Qwen/Qwen3.5-2B"
+agent_b_model: "Qwen/Qwen3.5-0.8B"
 default_prompt: "Explain the concept of entropy"
 latent_steps: 10
 max_new_tokens: 50
@@ -15,6 +15,7 @@ datasets:
     validation_size: 128
 
 benchmark:
+  answer_only_final: false
   text_hybrid_reasoning_max_new_tokens: 64
   latent_steps_sweep: [1, 2, 4, 8, 16, 32, 64]
   q_generalization:
@@ -45,6 +46,12 @@ alignment:
     enabled: true
     strength: 0.2
     max_norm_ratio: 0.15
+
+handoff:
+  latent_pooling: "last_token"
+  receiver_context:
+    mode: "auto"
+    latent_position: "after_context"
 
 dynamics:
   mode: "identity"
@@ -125,6 +132,21 @@ reporting:
     max_repetitions: 1
     max_error_count: 0
     require_explicit_statuses: true
+  semantic_smoke:
+    enabled: false
+    sample_indices: null
+    baseline_methods: ["pure_text_cot", "text_text_hybrid"]
+    latent_methods: ["homogeneous_orthogonal_latent", "hybrid_hl_mas"]
+    min_baseline_accuracy_percentage: 1.0
+    min_latent_accuracy_percentage: 1.0
+    min_method_accuracy_percentage: 1.0
+    min_latent_non_empty_decoded_rate_percentage: 100.0
+    min_compatible_cache_transfer_rate_percentage: 100.0
+    max_answer_perplexity: 10000.0
+    max_degenerate_decode_count: 0
+    require_baseline_final_answer_marker: true
+    require_final_answer_marker_methods: ["pure_text_cot", "text_text_hybrid", "homogeneous_orthogonal_latent", "hybrid_hl_mas"]
+    max_diagnostic_rows: 5
   phase_gates:
     phase1:
       required_repetitions: 3
