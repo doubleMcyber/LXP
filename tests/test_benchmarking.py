@@ -6,8 +6,13 @@ import pytest
 from benchmark_all import (
     DEFAULT_HETERO_SMOKE_AGENT_A_MODEL,
     DEFAULT_HETERO_SMOKE_AGENT_B_MODEL,
+    DEFAULT_HETERO_SMOKE_GENERATED_ADAPTER_TRAIN_LIMIT,
+    DEFAULT_HETERO_SMOKE_LATENT_METHODS,
+    DEFAULT_HETERO_SMOKE_METHODS,
     FINAL_ANSWER_COMPLETE_REGEX,
     _apply_model_profile_defaults,
+    _generated_trajectory_adapter_input_space,
+    _generated_trajectory_adapter_target_alignment,
     _methods_for_suite,
     _predicted_answer,
 )
@@ -99,6 +104,9 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "decode_status": "decoded",
             "prompt": "q1",
             "target_answer": "1",
+            "sender_reasoning_text": "Final answer: 1",
+            "sender_predicted_answer": "1",
+            "sender_answer_matches_target": True,
             "predicted_answer": "1",
             "decoded_text": "1",
             "generated_tokens": 1,
@@ -136,6 +144,9 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "decode_status": "decoded",
             "prompt": "q2",
             "target_answer": "2",
+            "sender_reasoning_text": "Final answer: 2",
+            "sender_predicted_answer": "2",
+            "sender_answer_matches_target": True,
             "predicted_answer": "0",
             "decoded_text": "0",
             "generated_tokens": 1,
@@ -168,6 +179,9 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
 
     assert summary["sample_count"] == 2
     assert summary["accuracy_percentage"] == 50.0
+    assert summary["sender_accuracy_percentage"] == 100.0
+    assert summary["sender_correct_sample_count"] == 2
+    assert summary["accuracy_when_sender_correct_percentage"] == 50.0
     assert summary["average_latency_seconds"] == 2.0
     assert summary["tokens_per_second"] == 0.5
     assert summary["cache_transfer_rate_percentage"] == 100.0
@@ -277,6 +291,84 @@ def test_semantic_smoke_report_does_not_require_kv_for_soft_prefix_rows() -> Non
     assert report["passed"] is True
     assert report["cache_transfer_required"] is False
     assert report["compatible_cache_transfer_rate_percentage"] is None
+
+
+def test_semantic_smoke_report_supports_latent_only_focused_runs() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "generated_latent_handoff",
+                "predicted_answer": "42",
+                "target_answer": "42",
+                "correct": True,
+                "decoded_text": "Final answer: 42",
+                "sender_reasoning_text": "Final answer: 42",
+                "sender_predicted_answer": "42",
+                "sender_answer_matches_target": True,
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 2.0,
+            },
+        ],
+        baseline_methods=(),
+        latent_methods=("generated_latent_handoff",),
+        min_baseline_accuracy_percentage=1.0,
+        min_latent_accuracy_percentage=1.0,
+        min_latent_accuracy_when_sender_correct_percentage=100.0,
+        min_method_accuracy_percentage=1.0,
+        require_baseline_final_answer_marker=True,
+        require_final_answer_marker_methods=("generated_latent_handoff",),
+    )
+
+    assert report["passed"] is True
+    assert report["baseline_sample_count"] == 0
+    assert report["sender_accuracy_percentage"] == 100.0
+    assert report["latent_accuracy_when_sender_correct_percentage"] == 100.0
+    assert report["latent_accuracy_percentage"] == 100.0
+
+
+def test_semantic_smoke_report_flags_sender_correct_latent_regressions() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "generated_latent_handoff",
+                "predicted_answer": "41",
+                "target_answer": "42",
+                "correct": False,
+                "decoded_text": "Final answer: 41",
+                "sender_reasoning_text": "Final answer: 42",
+                "sender_predicted_answer": "42",
+                "sender_answer_matches_target": True,
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 2.0,
+            },
+            {
+                "method": "generated_latent_handoff",
+                "predicted_answer": "10",
+                "target_answer": "99",
+                "correct": False,
+                "decoded_text": "Final answer: 10",
+                "sender_reasoning_text": "Final answer: 10",
+                "sender_predicted_answer": "10",
+                "sender_answer_matches_target": False,
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 2.0,
+            },
+        ],
+        baseline_methods=(),
+        latent_methods=("generated_latent_handoff",),
+        min_latent_accuracy_percentage=None,
+        min_latent_accuracy_when_sender_correct_percentage=100.0,
+        min_method_accuracy_percentage=None,
+        require_final_answer_marker_methods=("generated_latent_handoff",),
+    )
+
+    assert report["passed"] is False
+    assert report["sender_correct_latent_sample_count"] == 1
+    assert report["latent_accuracy_when_sender_correct_percentage"] == 0.0
+    assert any(
+        "Latent accuracy when sender is correct" in item
+        for item in report["missing_requirements"]
+    )
 
 
 def test_semantic_smoke_report_flags_degenerate_decode_and_high_perplexity() -> None:
@@ -394,7 +486,35 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
 def test_final_answer_stop_regex_waits_for_numeric_delimiter() -> None:
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9") is None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9800 ") is not None
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 2.") is not None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: **252**") is not None
+
+
+def test_generated_trajectory_adapter_input_space_is_validated() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "input_space": "raw",
+                    "target_alignment": "character",
+                },
+            },
+        }
+    )
+
+    assert _generated_trajectory_adapter_input_space(cfg) == "raw"
+    assert _generated_trajectory_adapter_target_alignment(cfg) == "character"
+    cfg.handoff.generated_trajectory_adapter.input_space = "invalid"
+    with pytest.raises(ValueError, match="input_space"):
+        _generated_trajectory_adapter_input_space(cfg)
+    cfg.handoff.generated_trajectory_adapter.input_space = "aligned"
+    cfg.handoff.generated_trajectory_adapter.target_alignment = "invalid"
+    with pytest.raises(ValueError, match="target_alignment"):
+        _generated_trajectory_adapter_target_alignment(cfg)
+    cfg.handoff.generated_trajectory_adapter.target_mode = "final_answer_line"
+    cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
+    with pytest.raises(ValueError, match="generated_text"):
+        _generated_trajectory_adapter_target_alignment(cfg)
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:
@@ -403,6 +523,15 @@ def test_raw_latent_methods_are_available_for_standard_suite() -> None:
     assert "prompt_local_latent" in standard_methods
     assert "global_anchor_hybrid_affine_plus_calibration" in standard_methods
     assert "hybrid_hl_mas" in standard_methods
+
+
+def test_hetero_smoke_defaults_to_generated_trajectory_mvp() -> None:
+    assert DEFAULT_HETERO_SMOKE_METHODS == (
+        "text_text_hybrid",
+        "generated_latent_handoff",
+    )
+    assert DEFAULT_HETERO_SMOKE_LATENT_METHODS == ("generated_latent_handoff",)
+    assert DEFAULT_HETERO_SMOKE_GENERATED_ADAPTER_TRAIN_LIMIT == 32
 
 
 def test_hetero_smoke_uses_cross_family_default_models() -> None:

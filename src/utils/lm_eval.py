@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -334,14 +335,52 @@ def compute_answer_metrics_from_prefix(
     tokenizer: Any,
     prefix_state: dict[str, Any],
     answer_text: Optional[str],
+    answer_variants: Optional[Sequence[str]] = None,
 ) -> dict[str, Optional[float]]:
-    if answer_text is None or not str(answer_text).strip():
+    candidates: list[str] = []
+    if answer_text is not None and str(answer_text).strip():
+        candidates.append(str(answer_text))
+    for variant in answer_variants or ():
+        if variant is None:
+            continue
+        variant_text = str(variant)
+        if variant_text.strip() and variant_text not in candidates:
+            candidates.append(variant_text)
+    if not candidates:
         return {
             "answer_token_count": 0,
             "answer_nll": None,
             "answer_perplexity": None,
         }
 
+    best_metrics: Optional[dict[str, Optional[float]]] = None
+    for candidate in candidates:
+        candidate_metrics = _compute_single_answer_metrics_from_prefix(
+            model=model,
+            tokenizer=tokenizer,
+            prefix_state=prefix_state,
+            answer_text=candidate,
+        )
+        if candidate_metrics["answer_nll"] is None:
+            continue
+        if best_metrics is None or float(candidate_metrics["answer_nll"]) < float(best_metrics["answer_nll"]):
+            best_metrics = candidate_metrics
+    if best_metrics is None:
+        return {
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+        }
+    return best_metrics
+
+
+def _compute_single_answer_metrics_from_prefix(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_state: dict[str, Any],
+    answer_text: str,
+) -> dict[str, Optional[float]]:
     answer_token_ids = tokenizer.encode(str(answer_text), add_special_tokens=False)
     if not answer_token_ids:
         return {

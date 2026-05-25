@@ -64,6 +64,26 @@ handoff:
     residual_max_norm_ratio: 0.5
     center: true
     use_bias: true
+  generated_trajectory_adapter:
+    enabled: false
+    train_on_missing: true
+    cache_dir: ".cache/generated_trajectory_adapter"
+    dataset_name: "gsm8k"
+    train_split: "train"
+    train_limit: 8
+    input_space: "aligned"
+    source_mode: "generated_text"
+    source_tail_tokens: 32
+    target_mode: "generated_text"
+    target_alignment: "character"
+    strategy: "hybrid_affine"
+    regularization: 1.0e-3
+    residual_alpha: 1.0
+    residual_max_norm_ratio: 0.5
+    center: true
+    use_bias: true
+    adaptive_projection_strength: 0.15
+    adaptive_projection_clip_std_multiplier: 4.0
   embedding_manifold:
     enabled: false
     top_k: 4
@@ -157,17 +177,18 @@ reporting:
   semantic_smoke:
     enabled: false
     sample_indices: null
-    baseline_methods: ["pure_text_cot", "text_text_hybrid"]
-    latent_methods: ["global_anchor_hybrid_affine", "hybrid_hl_mas"]
+    baseline_methods: ["text_text_hybrid"]
+    latent_methods: ["generated_latent_handoff"]
     min_baseline_accuracy_percentage: 1.0
     min_latent_accuracy_percentage: 1.0
+    min_latent_accuracy_when_sender_correct_percentage: null
     min_method_accuracy_percentage: 1.0
     min_latent_non_empty_decoded_rate_percentage: 100.0
     min_compatible_cache_transfer_rate_percentage: 100.0
     max_answer_perplexity: 10000.0
     max_degenerate_decode_count: 0
     require_baseline_final_answer_marker: true
-    require_final_answer_marker_methods: ["pure_text_cot", "text_text_hybrid", "global_anchor_hybrid_affine", "hybrid_hl_mas"]
+    require_final_answer_marker_methods: ["text_text_hybrid", "generated_latent_handoff"]
     max_diagnostic_rows: 5
   phase_gates:
     phase1:

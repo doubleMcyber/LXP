@@ -73,7 +73,7 @@ _SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS: frozenset[str] = frozenset(
     {"after_context", "before_context"}
 )
 _FINAL_ANSWER_COMPLETE_REGEX = re.compile(
-    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.])",
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.]|\.(?!\d))",
     re.IGNORECASE,
 )
 _MATH_COMPLEXITY_PATTERNS: tuple[str, ...] = (
@@ -397,6 +397,20 @@ def _answer_only_final_enabled(cfg: Optional[DictConfig]) -> bool:
 
 def _decode_stop_regex(cfg: Optional[DictConfig]) -> Optional[re.Pattern[str]]:
     return _FINAL_ANSWER_COMPLETE_REGEX if _answer_only_final_enabled(cfg) else None
+
+
+def _answer_metric_variants(cfg: Optional[DictConfig], answer_text: Optional[str]) -> tuple[str, ...]:
+    if not _answer_only_final_enabled(cfg) or answer_text is None or not str(answer_text).strip():
+        return ()
+    answer = str(answer_text).strip()
+    return (
+        f"Final answer:{answer}",
+        f"Final answer: {answer}",
+        f"\nFinal answer:{answer}",
+        f"\nFinal answer: {answer}",
+        f"\n\nFinal answer:{answer}",
+        f"\n\nFinal answer: {answer}",
+    )
 
 
 def _format_receiver_context_prompt(prompt: str, tokenizer: Any = None, cfg: Optional[DictConfig] = None) -> str:
@@ -1583,6 +1597,10 @@ def apply_embedding_manifold_projection(
 
 
 def attach_latent_forward(agent_model: AutoModelForCausalLM) -> None:
+    if bool(getattr(agent_model, "_lxp_latent_forward_attached", False)):
+        return
+    agent_model._lxp_original_forward = agent_model.forward
+
     def latent_forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1616,6 +1634,7 @@ def attach_latent_forward(agent_model: AutoModelForCausalLM) -> None:
         return hidden_states, past_key_values
 
     agent_model.forward = MethodType(latent_forward, agent_model)
+    agent_model._lxp_latent_forward_attached = True
 
 
 def _get_pipeline_state(cfg: DictConfig) -> dict[str, Any]:
@@ -2392,12 +2411,6 @@ def run_hybrid_pipeline(
             .item()
         )
 
-    answer_metrics = compute_answer_metrics_from_prefix(
-        model=agent_b,
-        tokenizer=tokenizer_b,
-        prefix_state=prefix_state,
-        answer_text=target_answer_text,
-    )
     decode_metrics = greedy_decode_from_prefix(
         model=agent_b,
         tokenizer=tokenizer_b,
@@ -2406,6 +2419,13 @@ def run_hybrid_pipeline(
         stop_regex=_decode_stop_regex(cfg),
     )
     decoded_text = str(decode_metrics["decoded_text"])
+    answer_metrics = compute_answer_metrics_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        answer_text=target_answer_text,
+        answer_variants=_answer_metric_variants(cfg, target_answer_text),
+    )
     decode_status = "decoded" if decoded_text.strip() else "empty_decode"
     trace_events.append(
         _trace_tensor_event(

@@ -11,6 +11,15 @@ venv/bin/python -m pytest -q
 
 Generated benchmark, training, sweep, and visualization outputs default to `outputs/`. Runtime smoke reports check for uncaught errors and explicit handoff/cache/decode statuses; phase gates remain for real evaluation runs.
 
+Semantic smoke gates are the fastest end-to-end checks for latent handoff quality:
+
+```bash
+venv/bin/python benchmark_all.py --semantic-smoke
+venv/bin/python benchmark_all.py --hetero-smoke
+```
+
+The default semantic smoke uses `Qwen/Qwen3.5-2B -> Qwen/Qwen3.5-0.8B` with a generated-reasoning latent handoff. The default hetero smoke uses `LGAI-EXAONE/EXAONE-4.0-1.2B -> Qwen/Qwen3.5-0.8B` with a character-aligned generated trajectory adapter and reports both overall latent accuracy and latent accuracy conditioned on Agent A producing the correct answer.
+
 ## Latent Blame
 
 `src/utils/latent_blame.py` contains the first validation harness for git-blame-style latent packet attribution. It records latent packets with sender/receiver/turn/tensor metadata, replays a run through caller-provided replay logic, applies ablation/noise/replacement interventions, ranks packets by causal impact, and emits a concise blame report.

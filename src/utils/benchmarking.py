@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 11
+REPORT_SCHEMA_VERSION = 12
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -46,6 +46,10 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "decode_status",
     "prompt",
     "target_answer",
+    "sender_reasoning_text",
+    "sender_reasoning_token_count",
+    "sender_predicted_answer",
+    "sender_answer_matches_target",
     "predicted_answer",
     "decoded_text",
     "generated_tokens",
@@ -121,6 +125,10 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "repetition_count",
     "sample_count",
     "accuracy_percentage",
+    "sender_answer_extraction_rate_percentage",
+    "sender_accuracy_percentage",
+    "sender_correct_sample_count",
+    "accuracy_when_sender_correct_percentage",
     "total_latency_seconds",
     "average_latency_seconds",
     "total_generated_tokens",
@@ -290,8 +298,33 @@ def aggregate_standard_rows(
     for key, group_rows in grouped_rows.items():
         row_template = {field: value for field, value in zip(group_fields, key)}
         sample_count = len(group_rows)
-        correct_count = sum(1 for row in group_rows if bool(row.get("correct")))
+        correct_values = [
+            value for value in (_row_correct_value(row) for row in group_rows) if value is not None
+        ]
+        correct_count = sum(correct_values)
         error_count = sum(1 for row in group_rows if bool(row.get("error")))
+        sender_reasoning_rows = [
+            row for row in group_rows if str(row.get("sender_reasoning_text") or "").strip()
+        ]
+        sender_answer_rows = [
+            row for row in sender_reasoning_rows if str(row.get("sender_predicted_answer") or "").strip()
+        ]
+        sender_correct_values = [
+            value
+            for value in (
+                _optional_bool_value(row.get("sender_answer_matches_target"))
+                for row in sender_reasoning_rows
+            )
+            if value is not None
+        ]
+        sender_correct_rows = [
+            row
+            for row in group_rows
+            if _optional_bool_value(row.get("sender_answer_matches_target")) is True
+        ]
+        sender_correct_row_values = [
+            value for value in (_row_correct_value(row) for row in sender_correct_rows) if value is not None
+        ]
         total_latency_seconds = sum(float(row.get("latency_seconds", 0.0)) for row in group_rows)
         total_generated_tokens = sum(int(row.get("generated_tokens", 0) or 0) for row in group_rows)
         total_answer_tokens = sum(int(row.get("answer_token_count", 0) or 0) for row in group_rows)
@@ -371,7 +404,22 @@ def aggregate_standard_rows(
                 "decode_status": _unique_join(group_rows, "decode_status"),
                 "repetition_count": len(repetitions),
                 "sample_count": sample_count,
-                "accuracy_percentage": (100.0 * correct_count / sample_count) if sample_count else 0.0,
+                "accuracy_percentage": (
+                    100.0 * correct_count / len(correct_values) if correct_values else None
+                ),
+                "sender_answer_extraction_rate_percentage": _percentage(
+                    len(sender_answer_rows),
+                    len(sender_reasoning_rows),
+                ),
+                "sender_accuracy_percentage": _percentage(
+                    sum(sender_correct_values),
+                    len(sender_correct_values),
+                ),
+                "sender_correct_sample_count": len(sender_correct_rows),
+                "accuracy_when_sender_correct_percentage": _percentage(
+                    sum(sender_correct_row_values),
+                    len(sender_correct_row_values),
+                ),
                 "total_latency_seconds": total_latency_seconds,
                 "average_latency_seconds": (total_latency_seconds / sample_count) if sample_count else 0.0,
                 "total_generated_tokens": total_generated_tokens,
@@ -469,7 +517,9 @@ def aggregate_standard_rows(
                     100.0 * len(non_empty_rows) / sample_count if sample_count else 0.0
                 ),
                 "failure_rate_percentage": (
-                    100.0 * (sample_count - correct_count) / sample_count if sample_count else 0.0
+                    100.0 * (len(correct_values) - correct_count) / len(correct_values)
+                    if correct_values
+                    else None
                 ),
                 "error_count": error_count,
             }
@@ -536,6 +586,18 @@ def _percentage(numerator: int, denominator: int) -> Optional[float]:
     return 100.0 * numerator / denominator
 
 
+def _optional_bool_value(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip():
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
+
+
 def build_semantic_smoke_report(
     rows: Sequence[dict[str, Any]],
     *,
@@ -544,6 +606,7 @@ def build_semantic_smoke_report(
     model_pair_compatibility: Optional[dict[str, Any]] = None,
     min_baseline_accuracy_percentage: Optional[float] = None,
     min_latent_accuracy_percentage: Optional[float] = None,
+    min_latent_accuracy_when_sender_correct_percentage: Optional[float] = None,
     min_method_accuracy_percentage: Optional[float] = None,
     min_latent_non_empty_decoded_rate_percentage: float = 100.0,
     min_compatible_cache_transfer_rate_percentage: float = 100.0,
@@ -614,6 +677,30 @@ def build_semantic_smoke_report(
     latent_correct_values = [
         value for value in (_row_correct_value(row) for row in latent_rows) if value is not None
     ]
+    sender_reasoning_rows = [
+        row for row in rows if str(row.get("sender_reasoning_text") or "").strip()
+    ]
+    sender_answer_rows = [
+        row for row in sender_reasoning_rows if str(row.get("sender_predicted_answer") or "").strip()
+    ]
+    sender_correct_values = [
+        value
+        for value in (
+            _optional_bool_value(row.get("sender_answer_matches_target"))
+            for row in sender_reasoning_rows
+        )
+        if value is not None
+    ]
+    sender_correct_latent_rows = [
+        row
+        for row in latent_rows
+        if _optional_bool_value(row.get("sender_answer_matches_target")) is True
+    ]
+    sender_correct_latent_values = [
+        value
+        for value in (_row_correct_value(row) for row in sender_correct_latent_rows)
+        if value is not None
+    ]
     wrong_answer_rows = [
         row for row in rows if _row_correct_value(row) is False
     ]
@@ -632,6 +719,12 @@ def build_semantic_smoke_report(
     baseline_answer_rate = _percentage(len(baseline_answer_rows), len(baseline_rows))
     baseline_accuracy_rate = _percentage(sum(baseline_correct_values), len(baseline_correct_values))
     latent_accuracy_rate = _percentage(sum(latent_correct_values), len(latent_correct_values))
+    sender_answer_rate = _percentage(len(sender_answer_rows), len(sender_reasoning_rows))
+    sender_accuracy_rate = _percentage(sum(sender_correct_values), len(sender_correct_values))
+    latent_accuracy_when_sender_correct = _percentage(
+        sum(sender_correct_latent_values),
+        len(sender_correct_latent_values),
+    )
     latent_non_empty_rate = _percentage(len(latent_non_empty_rows), len(latent_rows))
     compatible_cache_transfer_rate = _percentage(len(compatible_cache_rows), len(latent_kv_rows))
     max_all_observed_perplexity = (
@@ -648,11 +741,12 @@ def build_semantic_smoke_report(
     cache_transfer_required = bool(compatibility.get("kv_cache_compatible", False)) and bool(latent_kv_rows)
 
     missing_requirements: list[str] = []
-    if not baseline_rows:
+    baseline_required = bool(baseline_methods)
+    if baseline_required and not baseline_rows:
         missing_requirements.append("No baseline rows were provided.")
     elif len(baseline_answer_rows) < len(baseline_rows):
         missing_requirements.append("At least one baseline row did not extract a predicted answer.")
-    if min_baseline_accuracy_percentage is not None:
+    if baseline_required and min_baseline_accuracy_percentage is not None:
         if baseline_accuracy_rate is None:
             missing_requirements.append("No baseline correctness rows were provided.")
         elif baseline_accuracy_rate < float(min_baseline_accuracy_percentage):
@@ -681,6 +775,17 @@ def build_semantic_smoke_report(
                 "Latent accuracy "
                 f"{latent_accuracy_rate:.2f}% is below required "
                 f"{float(min_latent_accuracy_percentage):.2f}%."
+            )
+    if min_latent_accuracy_when_sender_correct_percentage is not None:
+        if latent_accuracy_when_sender_correct is None:
+            missing_requirements.append("No sender-correct latent correctness rows were provided.")
+        elif latent_accuracy_when_sender_correct < float(
+            min_latent_accuracy_when_sender_correct_percentage
+        ):
+            missing_requirements.append(
+                "Latent accuracy when sender is correct "
+                f"{latent_accuracy_when_sender_correct:.2f}% is below required "
+                f"{float(min_latent_accuracy_when_sender_correct_percentage):.2f}%."
             )
     if min_method_accuracy_percentage is not None:
         for method, accuracy_rate in method_accuracy.items():
@@ -717,7 +822,11 @@ def build_semantic_smoke_report(
             f"Observed {len(degenerate_rows)} degenerate decode rows, "
             f"exceeds allowed {int(max_degenerate_decode_count)}."
         )
-    if require_baseline_final_answer_marker and len(baseline_final_answer_marker_rows) < len(baseline_rows):
+    if (
+        require_baseline_final_answer_marker
+        and baseline_required
+        and len(baseline_final_answer_marker_rows) < len(baseline_rows)
+    ):
         missing_requirements.append(
             "At least one baseline row did not include a final-answer marker."
         )
@@ -740,6 +849,14 @@ def build_semantic_smoke_report(
         "baseline_answer_extraction_rate_percentage": baseline_answer_rate,
         "baseline_accuracy_percentage": baseline_accuracy_rate,
         "min_baseline_accuracy_percentage": min_baseline_accuracy_percentage,
+        "sender_reasoning_sample_count": len(sender_reasoning_rows),
+        "sender_answer_extraction_rate_percentage": sender_answer_rate,
+        "sender_accuracy_percentage": sender_accuracy_rate,
+        "sender_correct_latent_sample_count": len(sender_correct_latent_rows),
+        "latent_accuracy_when_sender_correct_percentage": latent_accuracy_when_sender_correct,
+        "min_latent_accuracy_when_sender_correct_percentage": (
+            min_latent_accuracy_when_sender_correct_percentage
+        ),
         "latent_accuracy_percentage": latent_accuracy_rate,
         "min_latent_accuracy_percentage": min_latent_accuracy_percentage,
         "method_accuracy_percentage": method_accuracy,
@@ -784,14 +901,9 @@ def build_semantic_smoke_report(
 
 def _row_correct_value(row: dict[str, Any]) -> Optional[bool]:
     value = row.get("correct")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.strip():
-        normalized = value.strip().casefold()
-        if normalized in {"true", "1", "yes"}:
-            return True
-        if normalized in {"false", "0", "no"}:
-            return False
+    bool_value = _optional_bool_value(value)
+    if bool_value is not None:
+        return bool_value
 
     predicted = row.get("predicted_answer")
     target = row.get("target_answer")
@@ -813,6 +925,10 @@ def _semantic_row_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
         "method": row.get("method"),
         "sample_index": row.get("sample_index"),
         "target_answer": row.get("target_answer"),
+        "sender_predicted_answer": row.get("sender_predicted_answer"),
+        "sender_answer_matches_target": _optional_bool_value(
+            row.get("sender_answer_matches_target")
+        ),
         "predicted_answer": row.get("predicted_answer"),
         "correct": _row_correct_value(row),
         "answer_perplexity": row.get("answer_perplexity"),
