@@ -79,6 +79,7 @@ DEFAULT_LATENT_STEPS_SWEEP = (1, 2, 4, 8, 16, 32, 64)
 DEFAULT_SEMANTIC_SMOKE_LIMIT = 3
 DEFAULT_SEMANTIC_SMOKE_MAX_NEW_TOKENS = 128
 DEFAULT_SEMANTIC_SMOKE_REASONER_MAX_NEW_TOKENS = 320
+DEFAULT_HETERO_SMOKE_REASONER_MAX_NEW_TOKENS = 640
 DEFAULT_SEMANTIC_SMOKE_GENERATED_ADAPTER_TRAIN_LIMIT = 16
 DEFAULT_HETERO_SMOKE_GENERATED_ADAPTER_TRAIN_LIMIT = 32
 DEFAULT_SEMANTIC_SMOKE_METHODS = (
@@ -226,6 +227,14 @@ def _format_text_cot_prompt(prompt: str, tokenizer: Any = None, cfg: Any = None)
 
 def _decode_stop_regex(cfg: Any) -> Optional[re.Pattern[str]]:
     return FINAL_ANSWER_COMPLETE_REGEX if _answer_only_final_enabled(cfg) else None
+
+
+def _sender_reasoning_status(token_ids: Sequence[int], text: str, cfg: Any) -> str:
+    if FINAL_ANSWER_COMPLETE_REGEX.search(str(text)) is not None:
+        return "complete"
+    if len(token_ids) >= _reasoner_generation_max_new_tokens(cfg):
+        return "max_tokens_without_final_answer"
+    return "stopped_without_final_answer"
 
 
 def _answer_metric_variants(cfg: Any, answer_text: Optional[str]) -> tuple[str, ...]:
@@ -525,6 +534,14 @@ def _collect_sender_generated_consensus_state(
         "generated_reasoning_token_count": len(generated_ids),
         "generated_latent_includes_prompt": bool(include_prompt),
     }
+    result["generated_reasoning_status"] = _sender_reasoning_status(
+        generated_ids,
+        str(result["generated_reasoning_text"]),
+        cfg,
+    )
+    result["generated_reasoning_final_answer_marker"] = (
+        result["generated_reasoning_status"] == "complete"
+    )
     cache[cache_key] = result
     return result
 
@@ -1510,6 +1527,12 @@ def run_text_text_hybrid(
         "decoded_text": decoded_text,
         "sender_reasoning_text": reasoning_text,
         "sender_reasoning_token_count": len(reasoning_token_ids),
+        "sender_reasoning_status": _sender_reasoning_status(
+            reasoning_token_ids,
+            reasoning_text,
+            cfg,
+        ),
+        "sender_final_answer_marker": FINAL_ANSWER_COMPLETE_REGEX.search(reasoning_text) is not None,
         "generated_tokens": int(decode_metrics["generated_tokens"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
@@ -2113,6 +2136,8 @@ def _run_generated_latent_variant(
         "_row_state": variant_state,
         "sender_reasoning_text": sender_state["generated_reasoning_text"],
         "sender_reasoning_token_count": sender_state["generated_reasoning_token_count"],
+        "sender_reasoning_status": sender_state["generated_reasoning_status"],
+        "sender_final_answer_marker": sender_state["generated_reasoning_final_answer_marker"],
     }
 
 
@@ -2490,6 +2515,7 @@ def run_benchmark(
     summary_output_path: Path,
     report_output_path: Path,
     max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
     latent_steps_values: Optional[list[int]] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
@@ -2583,12 +2609,19 @@ def run_benchmark(
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
         base_cfg.max_new_tokens = int(max_new_tokens)
+    if reasoner_max_new_tokens is not None:
+        base_cfg.benchmark.text_hybrid_reasoning_max_new_tokens = int(reasoner_max_new_tokens)
     if semantic_smoke or mvp_smoke or hetero_smoke or answer_only_final:
         base_cfg.benchmark.answer_only_final = True
     if semantic_smoke or mvp_smoke or hetero_smoke:
+        smoke_reasoner_max_new_tokens = (
+            DEFAULT_HETERO_SMOKE_REASONER_MAX_NEW_TOKENS
+            if hetero_smoke
+            else DEFAULT_SEMANTIC_SMOKE_REASONER_MAX_NEW_TOKENS
+        )
         base_cfg.benchmark.text_hybrid_reasoning_max_new_tokens = max(
             int(getattr(base_cfg.benchmark, "text_hybrid_reasoning_max_new_tokens", 0)),
-            DEFAULT_SEMANTIC_SMOKE_REASONER_MAX_NEW_TOKENS,
+            smoke_reasoner_max_new_tokens,
         )
     if semantic_smoke:
         base_cfg.reporting.semantic_smoke.baseline_methods = list(
@@ -2789,6 +2822,10 @@ def run_benchmark(
                             "sender_reasoning_token_count": row_result.get(
                                 "sender_reasoning_token_count"
                             ),
+                            "sender_reasoning_status": row_result.get("sender_reasoning_status"),
+                            "sender_final_answer_marker": row_result.get(
+                                "sender_final_answer_marker"
+                            ),
                             "sender_predicted_answer": sender_predicted_answer,
                             "sender_answer_matches_target": sender_answer_matches_target,
                             "predicted_answer": predicted_answer,
@@ -2958,6 +2995,17 @@ def run_benchmark(
             and any(method in GENERATED_LATENT_METHODS for method in latent_methods)
         ):
             min_sender_correct_latent_accuracy = 100.0
+        min_sender_final_answer_marker_rate = getattr(
+            semantic_smoke_cfg,
+            "min_sender_final_answer_marker_rate_percentage",
+            None,
+        )
+        if (
+            min_sender_final_answer_marker_rate is None
+            and (semantic_smoke or hetero_smoke)
+            and any(method in GENERATED_LATENT_METHODS for method in latent_methods)
+        ):
+            min_sender_final_answer_marker_rate = 100.0
         semantic_smoke_report = build_semantic_smoke_report(
             sample_rows,
             baseline_methods=baseline_methods,
@@ -2977,6 +3025,11 @@ def run_benchmark(
                 None
                 if min_sender_correct_latent_accuracy is None
                 else float(min_sender_correct_latent_accuracy)
+            ),
+            min_sender_final_answer_marker_rate_percentage=(
+                None
+                if min_sender_final_answer_marker_rate is None
+                else float(min_sender_final_answer_marker_rate)
             ),
             min_method_accuracy_percentage=getattr(
                 semantic_smoke_cfg,
@@ -3016,6 +3069,7 @@ def run_benchmark(
         "latent_pooling": _latent_pooling_mode(base_cfg),
         "receiver_context_mode": _receiver_context_mode(base_cfg),
         "answer_only_final": _answer_only_final_enabled(base_cfg),
+        "reasoner_max_new_tokens": _reasoner_generation_max_new_tokens(base_cfg),
         "handoff_adapter": {
             "enabled": bool(getattr(getattr(base_cfg.handoff, "adapter", None), "enabled", False)),
             "train_on_missing": bool(
@@ -3159,6 +3213,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Optional override for cfg.max_new_tokens to support faster smoke tests.",
+    )
+    parser.add_argument(
+        "--reasoner-max-new-tokens",
+        type=int,
+        default=None,
+        help="Optional override for benchmark.text_hybrid_reasoning_max_new_tokens.",
     )
     parser.add_argument(
         "--latent-steps-values",
@@ -3410,7 +3470,7 @@ def main() -> None:
         if not args.disable_embedding_manifold:
             args.enable_embedding_manifold = True
             if args.embedding_manifold_top_k is None:
-                args.embedding_manifold_top_k = 1
+                args.embedding_manifold_top_k = 4 if args.hetero_smoke else 1
             if args.embedding_manifold_blend is None:
                 args.embedding_manifold_blend = 1.0
     sample_indices = (
@@ -3429,6 +3489,7 @@ def main() -> None:
         summary_output_path=args.summary_output,
         report_output_path=args.report_output,
         max_new_tokens=args.max_new_tokens,
+        reasoner_max_new_tokens=args.reasoner_max_new_tokens,
         latent_steps_values=latent_steps_values,
         agent_a_model=args.agent_a_model,
         agent_b_model=args.agent_b_model,

@@ -18,7 +18,7 @@ venv/bin/python benchmark_all.py --semantic-smoke
 venv/bin/python benchmark_all.py --hetero-smoke
 ```
 
-The default semantic smoke uses `Qwen/Qwen3.5-2B -> Qwen/Qwen3.5-0.8B` with a generated-reasoning latent handoff. The default hetero smoke uses `LGAI-EXAONE/EXAONE-4.0-1.2B -> Qwen/Qwen3.5-0.8B` with a character-aligned generated trajectory adapter and reports both overall latent accuracy and latent accuracy conditioned on Agent A producing the correct answer.
+The default semantic smoke uses `Qwen/Qwen3.5-2B -> Qwen/Qwen3.5-0.8B` with a generated-reasoning latent handoff. The default hetero smoke uses `LGAI-EXAONE/EXAONE-4.0-1.2B -> Qwen/Qwen3.5-0.8B` with a 640-token sender budget, character-aligned generated trajectory adapter, and top-4 receiver embedding-manifold projection. Reports include overall latent accuracy, sender final-answer completion rate, and latent accuracy conditioned on Agent A producing the correct answer.
 
 ## Latent Blame
 

@@ -48,6 +48,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "target_answer",
     "sender_reasoning_text",
     "sender_reasoning_token_count",
+    "sender_reasoning_status",
+    "sender_final_answer_marker",
     "sender_predicted_answer",
     "sender_answer_matches_target",
     "predicted_answer",
@@ -126,6 +128,7 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "sample_count",
     "accuracy_percentage",
     "sender_answer_extraction_rate_percentage",
+    "sender_final_answer_marker_rate_percentage",
     "sender_accuracy_percentage",
     "sender_correct_sample_count",
     "accuracy_when_sender_correct_percentage",
@@ -309,6 +312,12 @@ def aggregate_standard_rows(
         sender_answer_rows = [
             row for row in sender_reasoning_rows if str(row.get("sender_predicted_answer") or "").strip()
         ]
+        sender_final_answer_marker_rows = [
+            row
+            for row in sender_reasoning_rows
+            if _optional_bool_value(row.get("sender_final_answer_marker")) is True
+            or str(row.get("sender_reasoning_status") or "") == "complete"
+        ]
         sender_correct_values = [
             value
             for value in (
@@ -409,6 +418,10 @@ def aggregate_standard_rows(
                 ),
                 "sender_answer_extraction_rate_percentage": _percentage(
                     len(sender_answer_rows),
+                    len(sender_reasoning_rows),
+                ),
+                "sender_final_answer_marker_rate_percentage": _percentage(
+                    len(sender_final_answer_marker_rows),
                     len(sender_reasoning_rows),
                 ),
                 "sender_accuracy_percentage": _percentage(
@@ -607,6 +620,7 @@ def build_semantic_smoke_report(
     min_baseline_accuracy_percentage: Optional[float] = None,
     min_latent_accuracy_percentage: Optional[float] = None,
     min_latent_accuracy_when_sender_correct_percentage: Optional[float] = None,
+    min_sender_final_answer_marker_rate_percentage: Optional[float] = None,
     min_method_accuracy_percentage: Optional[float] = None,
     min_latent_non_empty_decoded_rate_percentage: float = 100.0,
     min_compatible_cache_transfer_rate_percentage: float = 100.0,
@@ -683,6 +697,12 @@ def build_semantic_smoke_report(
     sender_answer_rows = [
         row for row in sender_reasoning_rows if str(row.get("sender_predicted_answer") or "").strip()
     ]
+    sender_final_answer_marker_rows = [
+        row
+        for row in sender_reasoning_rows
+        if _optional_bool_value(row.get("sender_final_answer_marker")) is True
+        or str(row.get("sender_reasoning_status") or "") == "complete"
+    ]
     sender_correct_values = [
         value
         for value in (
@@ -720,6 +740,10 @@ def build_semantic_smoke_report(
     baseline_accuracy_rate = _percentage(sum(baseline_correct_values), len(baseline_correct_values))
     latent_accuracy_rate = _percentage(sum(latent_correct_values), len(latent_correct_values))
     sender_answer_rate = _percentage(len(sender_answer_rows), len(sender_reasoning_rows))
+    sender_final_answer_marker_rate = _percentage(
+        len(sender_final_answer_marker_rows),
+        len(sender_reasoning_rows),
+    )
     sender_accuracy_rate = _percentage(sum(sender_correct_values), len(sender_correct_values))
     latent_accuracy_when_sender_correct = _percentage(
         sum(sender_correct_latent_values),
@@ -787,6 +811,17 @@ def build_semantic_smoke_report(
                 f"{latent_accuracy_when_sender_correct:.2f}% is below required "
                 f"{float(min_latent_accuracy_when_sender_correct_percentage):.2f}%."
             )
+    if min_sender_final_answer_marker_rate_percentage is not None:
+        if sender_final_answer_marker_rate is None:
+            missing_requirements.append("No sender reasoning rows were provided.")
+        elif sender_final_answer_marker_rate < float(
+            min_sender_final_answer_marker_rate_percentage
+        ):
+            missing_requirements.append(
+                "Sender final-answer marker rate "
+                f"{sender_final_answer_marker_rate:.2f}% is below required "
+                f"{float(min_sender_final_answer_marker_rate_percentage):.2f}%."
+            )
     if min_method_accuracy_percentage is not None:
         for method, accuracy_rate in method_accuracy.items():
             if accuracy_rate is None:
@@ -851,6 +886,10 @@ def build_semantic_smoke_report(
         "min_baseline_accuracy_percentage": min_baseline_accuracy_percentage,
         "sender_reasoning_sample_count": len(sender_reasoning_rows),
         "sender_answer_extraction_rate_percentage": sender_answer_rate,
+        "sender_final_answer_marker_rate_percentage": sender_final_answer_marker_rate,
+        "min_sender_final_answer_marker_rate_percentage": (
+            min_sender_final_answer_marker_rate_percentage
+        ),
         "sender_accuracy_percentage": sender_accuracy_rate,
         "sender_correct_latent_sample_count": len(sender_correct_latent_rows),
         "latent_accuracy_when_sender_correct_percentage": latent_accuracy_when_sender_correct,
@@ -925,6 +964,10 @@ def _semantic_row_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
         "method": row.get("method"),
         "sample_index": row.get("sample_index"),
         "target_answer": row.get("target_answer"),
+        "sender_reasoning_status": row.get("sender_reasoning_status"),
+        "sender_final_answer_marker": _optional_bool_value(
+            row.get("sender_final_answer_marker")
+        ),
         "sender_predicted_answer": row.get("sender_predicted_answer"),
         "sender_answer_matches_target": _optional_bool_value(
             row.get("sender_answer_matches_target")

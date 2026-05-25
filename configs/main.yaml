@@ -182,6 +182,7 @@ reporting:
     min_baseline_accuracy_percentage: 1.0
     min_latent_accuracy_percentage: 1.0
     min_latent_accuracy_when_sender_correct_percentage: null
+    min_sender_final_answer_marker_rate_percentage: null
     min_method_accuracy_percentage: 1.0
     min_latent_non_empty_decoded_rate_percentage: 100.0
     min_compatible_cache_transfer_rate_percentage: 100.0
