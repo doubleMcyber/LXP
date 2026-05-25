@@ -2219,7 +2219,7 @@ def run_hybrid_pipeline(
     active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
     active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
 
-    if (not sequence_prefix) and _should_use_receiver_context(
+    if _should_use_receiver_context(
         receiver_context_mode,
         sender_kv_cache_transferred=kv_cache_transferred,
     ):

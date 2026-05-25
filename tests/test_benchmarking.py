@@ -14,6 +14,7 @@ from benchmark_all import (
     _apply_model_profile_defaults,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
+    _handoff_decode_prompt,
     _methods_for_suite,
     _predicted_answer,
 )
@@ -50,6 +51,17 @@ def _make_cfg():
             },
         }
     )
+
+
+def test_handoff_decode_prompt_respects_receiver_context_mode() -> None:
+    cfg = OmegaConf.create({"handoff": {"receiver_context": {"mode": "auto"}}})
+    assert _handoff_decode_prompt("question", cfg) == "question"
+
+    cfg.handoff.receiver_context.mode = "prompt_prefix"
+    assert _handoff_decode_prompt("question", cfg) == "question"
+
+    cfg.handoff.receiver_context.mode = "none"
+    assert _handoff_decode_prompt("question", cfg) is None
 
 
 def test_build_standard_row_base_uses_cfg_metadata() -> None:

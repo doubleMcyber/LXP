@@ -682,6 +682,12 @@ def _select_handoff_latent(sender_state: dict[str, Any], cfg: Any) -> torch.Tens
     return sender_state["current_latent_step"]
 
 
+def _handoff_decode_prompt(prompt: str, cfg: Any) -> Optional[str]:
+    if _receiver_context_mode(cfg) == "none":
+        return None
+    return prompt
+
+
 def _resample_sequence(reference: torch.Tensor, target_steps: int) -> torch.Tensor:
     if reference.dim() != 3:
         raise ValueError("reference must have shape [batch, steps, dim]")
@@ -1585,10 +1591,15 @@ def run_prompt_local_latent(
         device=agent_b_device,
         dtype=agent_b.get_input_embeddings().weight.dtype,
     )
+    handoff_step, manifold_metrics = apply_embedding_manifold_projection(
+        handoff_step,
+        cfg,
+        state,
+    )
     decode_metrics = _decode_handoff(
         agent_b=agent_b,
         tokenizer_b=tokenizer_b,
-        prompt=None if sequence_prefix else prompt,
+        prompt=_handoff_decode_prompt(prompt, cfg),
         cfg=cfg,
         handoff_step=handoff_step,
         kv_cache_a=None if sequence_prefix else sender_state["kv_cache_a"],
@@ -1603,6 +1614,7 @@ def run_prompt_local_latent(
             state=state,
             current_latent_step=handoff_source,
             alignment_state={"mapping_matrix": prompt_local_q},
+            cfg=cfg,
         ),
         "alignment_mode": "prompt_local_procrustes",
         "alignment_strategy": "orthogonal",
@@ -1614,6 +1626,17 @@ def run_prompt_local_latent(
         "latent_trajectory_steps": int(handoff_step.shape[1]),
         "total_reasoning_steps": int(handoff_step.shape[1]),
         "continuous_integration_seconds": 0.0,
+        "embedding_manifold_enabled": bool(
+            getattr(getattr(cfg.handoff, "embedding_manifold", None), "enabled", False)
+        ),
+        "embedding_manifold_applied": manifold_metrics["embedding_manifold_applied"],
+        "embedding_manifold_delta_norm": manifold_metrics["embedding_manifold_delta_norm"],
+        "embedding_manifold_mean_top_similarity": manifold_metrics[
+            "embedding_manifold_mean_top_similarity"
+        ],
+        "embedding_manifold_unique_token_count": manifold_metrics[
+            "embedding_manifold_unique_token_count"
+        ],
     }
 
 
@@ -1742,7 +1765,7 @@ def _run_global_anchor_variant(
     decode_metrics = _decode_handoff(
         agent_b=agent_b,
         tokenizer_b=tokenizer_b,
-        prompt=None if sequence_prefix else prompt,
+        prompt=_handoff_decode_prompt(prompt, variant_cfg),
         cfg=variant_cfg,
         handoff_step=handoff_step,
         kv_cache_a=None if sequence_prefix else sender_state["kv_cache_a"],
