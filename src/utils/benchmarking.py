@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 12
+REPORT_SCHEMA_VERSION = 13
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -78,6 +78,10 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "handoff_adapter_training_token_count",
     "handoff_adapter_training_reconstruction_mse",
     "handoff_adapter_training_mean_cosine_similarity",
+    "generated_adapter_local_residual_applied",
+    "generated_adapter_local_residual_delta_norm",
+    "generated_adapter_local_residual_mean_top_similarity",
+    "generated_adapter_local_residual_memory_rows",
     "embedding_manifold_enabled",
     "embedding_manifold_applied",
     "embedding_manifold_delta_norm",
@@ -152,6 +156,10 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "mean_handoff_adapter_delta_norm",
     "mean_handoff_adapter_training_reconstruction_mse",
     "mean_handoff_adapter_training_mean_cosine_similarity",
+    "generated_adapter_local_residual_rate_percentage",
+    "mean_generated_adapter_local_residual_delta_norm",
+    "mean_generated_adapter_local_residual_top_similarity",
+    "mean_generated_adapter_local_residual_memory_rows",
     "embedding_manifold_rate_percentage",
     "mean_embedding_manifold_delta_norm",
     "mean_embedding_manifold_top_similarity",
@@ -372,6 +380,12 @@ def aggregate_standard_rows(
             for row in group_rows
             if row.get("handoff_adapter_cache_hit") is not None and row.get("handoff_adapter_cache_hit") != ""
         ]
+        generated_adapter_local_residual_rows = [
+            bool(row["generated_adapter_local_residual_applied"])
+            for row in group_rows
+            if row.get("generated_adapter_local_residual_applied") is not None
+            and row.get("generated_adapter_local_residual_applied") != ""
+        ]
         embedding_manifold_rows = [
             bool(row["embedding_manifold_applied"])
             for row in group_rows
@@ -479,6 +493,25 @@ def aggregate_standard_rows(
                 "mean_handoff_adapter_training_mean_cosine_similarity": _mean_or_none(
                     group_rows,
                     "handoff_adapter_training_mean_cosine_similarity",
+                ),
+                "generated_adapter_local_residual_rate_percentage": (
+                    100.0
+                    * sum(1 for item in generated_adapter_local_residual_rows if item)
+                    / len(generated_adapter_local_residual_rows)
+                    if generated_adapter_local_residual_rows
+                    else None
+                ),
+                "mean_generated_adapter_local_residual_delta_norm": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_local_residual_delta_norm",
+                ),
+                "mean_generated_adapter_local_residual_top_similarity": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_local_residual_mean_top_similarity",
+                ),
+                "mean_generated_adapter_local_residual_memory_rows": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_local_residual_memory_rows",
                 ),
                 "embedding_manifold_rate_percentage": (
                     100.0 * sum(1 for item in embedding_manifold_rows if item)

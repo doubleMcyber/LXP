@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from omegaconf import OmegaConf
 import pytest
+import torch
 
 from benchmark_all import (
     DEFAULT_HETERO_SMOKE_AGENT_A_MODEL,
@@ -12,6 +13,9 @@ from benchmark_all import (
     DEFAULT_HETERO_SMOKE_REASONER_MAX_NEW_TOKENS,
     FINAL_ANSWER_COMPLETE_REGEX,
     _apply_model_profile_defaults,
+    _apply_generated_adapter_local_residual,
+    _build_generated_adapter_local_residual_state,
+    _answers_match,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
     _handoff_decode_prompt,
@@ -542,6 +546,12 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
     assert _predicted_answer("gsm8k", decoded) == "42"
 
 
+def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
+    assert _answers_match("gsm8k", "252.00", "252")
+    assert _answers_match("gsm8k", "9,800.0", "9800")
+    assert not _answers_match("gsm8k", "252.01", "252")
+
+
 def test_final_answer_stop_regex_waits_for_numeric_delimiter() -> None:
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9") is None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9800 ") is not None
@@ -574,6 +584,45 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
     cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
     with pytest.raises(ValueError, match="generated_text"):
         _generated_trajectory_adapter_target_alignment(cfg)
+
+
+def test_generated_trajectory_local_residual_corrects_nearest_training_error() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "local_residual": {
+                        "enabled": True,
+                        "top_k": 1,
+                        "temperature": 0.05,
+                        "blend": 1.0,
+                        "max_memory_rows": 8,
+                        "chunk_size": 2,
+                    }
+                }
+            }
+        }
+    )
+    source = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    fitted = torch.tensor([[0.5, 0.0], [0.0, 0.5]])
+    target = torch.tensor([[1.5, 0.0], [0.0, 1.5]])
+
+    residual_state = _build_generated_adapter_local_residual_state(
+        cfg,
+        source,
+        target,
+        fitted,
+    )
+    adapter_state = {"local_residual_state": residual_state}
+    corrected, metrics = _apply_generated_adapter_local_residual(
+        source.reshape(1, 2, 2),
+        fitted.reshape(1, 2, 2),
+        adapter_state,
+    )
+
+    assert metrics["generated_adapter_local_residual_applied"] is True
+    assert metrics["generated_adapter_local_residual_memory_rows"] == 2
+    assert torch.allclose(corrected.reshape(2, 2), target)
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:

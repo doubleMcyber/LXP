@@ -84,6 +84,13 @@ handoff:
     use_bias: true
     adaptive_projection_strength: 0.15
     adaptive_projection_clip_std_multiplier: 4.0
+    local_residual:
+      enabled: false
+      top_k: 8
+      temperature: 0.05
+      blend: 1.0
+      max_memory_rows: 4096
+      chunk_size: 64
   embedding_manifold:
     enabled: false
     top_k: 4

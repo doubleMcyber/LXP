@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -358,7 +359,16 @@ def _normalize_numeric_answer(answer: Optional[str]) -> Optional[str]:
     normalized = normalize_answer(answer)
     if normalized is None:
         return None
-    return normalized.replace(",", "")
+    normalized = normalized.replace(",", "")
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
+        return normalized
+    try:
+        decimal_value = Decimal(normalized)
+    except InvalidOperation:
+        return normalized
+    if decimal_value == 0:
+        return "0"
+    return format(decimal_value.normalize(), "f")
 
 
 def _target_answer(dataset_name: str, row: Any) -> Optional[str]:
@@ -777,6 +787,40 @@ def _generated_trajectory_adapter_source_tail_tokens(cfg: Any) -> int:
     return int(getattr(adapter_cfg, "source_tail_tokens", 32))
 
 
+def _generated_trajectory_adapter_local_residual_cfg(cfg: Any) -> Any:
+    return getattr(_generated_trajectory_adapter_cfg(cfg), "local_residual", None)
+
+
+def _generated_trajectory_adapter_local_residual_enabled(cfg: Any) -> bool:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return bool(getattr(residual_cfg, "enabled", False))
+
+
+def _generated_trajectory_adapter_local_residual_top_k(cfg: Any) -> int:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return max(1, int(getattr(residual_cfg, "top_k", 8)))
+
+
+def _generated_trajectory_adapter_local_residual_temperature(cfg: Any) -> float:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return max(1e-6, float(getattr(residual_cfg, "temperature", 0.05)))
+
+
+def _generated_trajectory_adapter_local_residual_blend(cfg: Any) -> float:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return max(0.0, min(1.0, float(getattr(residual_cfg, "blend", 1.0))))
+
+
+def _generated_trajectory_adapter_local_residual_max_rows(cfg: Any) -> int:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return max(0, int(getattr(residual_cfg, "max_memory_rows", 4096)))
+
+
+def _generated_trajectory_adapter_local_residual_chunk_size(cfg: Any) -> int:
+    residual_cfg = _generated_trajectory_adapter_local_residual_cfg(cfg)
+    return max(1, int(getattr(residual_cfg, "chunk_size", 64)))
+
+
 def _generated_trajectory_adapter_cache_dir(cfg: Any) -> Path:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     return Path(str(getattr(adapter_cfg, "cache_dir", ".cache/generated_trajectory_adapter")))
@@ -827,8 +871,9 @@ def _generated_trajectory_adapter_cache_key(
     *,
     include_prompt: bool,
 ) -> tuple[Any, ...]:
-    return (
-        "generated_trajectory_adapter_v1",
+    local_residual_enabled = _generated_trajectory_adapter_local_residual_enabled(cfg)
+    base_key: tuple[Any, ...] = (
+        "generated_trajectory_adapter_v2" if local_residual_enabled else "generated_trajectory_adapter_v1",
         str(cfg.agent_a_model),
         str(cfg.agent_b_model),
         str(cfg.torch_dtype),
@@ -850,6 +895,16 @@ def _generated_trajectory_adapter_cache_key(
         float(_generated_trajectory_adapter_value(cfg, "residual_max_norm_ratio", 0.5)),
         bool(_generated_trajectory_adapter_value(cfg, "center", True)),
         bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
+    )
+    if not local_residual_enabled:
+        return base_key
+    return (
+        *base_key,
+        True,
+        _generated_trajectory_adapter_local_residual_top_k(cfg),
+        _generated_trajectory_adapter_local_residual_temperature(cfg),
+        _generated_trajectory_adapter_local_residual_blend(cfg),
+        _generated_trajectory_adapter_local_residual_max_rows(cfg),
     )
 
 
@@ -1024,6 +1079,124 @@ def _mean_handoff_delta_norm(
     )
 
 
+def _select_generated_adapter_memory_rows(
+    source_matrix: torch.Tensor,
+    residual_matrix: torch.Tensor,
+    *,
+    max_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if max_rows <= 0 or int(source_matrix.shape[0]) <= max_rows:
+        return source_matrix.detach().cpu(), residual_matrix.detach().cpu()
+    indices = torch.linspace(
+        0,
+        int(source_matrix.shape[0]) - 1,
+        steps=max_rows,
+        dtype=torch.long,
+    )
+    return (
+        source_matrix.index_select(0, indices).detach().cpu(),
+        residual_matrix.index_select(0, indices).detach().cpu(),
+    )
+
+
+def _build_generated_adapter_local_residual_state(
+    cfg: Any,
+    source_matrix: torch.Tensor,
+    target_matrix: torch.Tensor,
+    fitted_matrix: torch.Tensor,
+) -> Optional[dict[str, Any]]:
+    if not _generated_trajectory_adapter_local_residual_enabled(cfg):
+        return None
+    residual_matrix = target_matrix.float() - fitted_matrix.float()
+    source_memory, residual_memory = _select_generated_adapter_memory_rows(
+        source_matrix.float(),
+        residual_matrix.float(),
+        max_rows=_generated_trajectory_adapter_local_residual_max_rows(cfg),
+    )
+    if int(source_memory.shape[0]) == 0:
+        return None
+    return {
+        "enabled": True,
+        "top_k": _generated_trajectory_adapter_local_residual_top_k(cfg),
+        "temperature": _generated_trajectory_adapter_local_residual_temperature(cfg),
+        "blend": _generated_trajectory_adapter_local_residual_blend(cfg),
+        "chunk_size": _generated_trajectory_adapter_local_residual_chunk_size(cfg),
+        "source_memory": source_memory,
+        "residual_memory": residual_memory,
+        "memory_row_count": int(source_memory.shape[0]),
+    }
+
+
+def _apply_generated_adapter_local_residual(
+    adapter_input: torch.Tensor,
+    adapted_handoff_step: torch.Tensor,
+    adapter_state: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    residual_state = adapter_state.get("local_residual_state")
+    if not residual_state or not bool(residual_state.get("enabled", False)):
+        return adapted_handoff_step, {
+            "generated_adapter_local_residual_applied": False,
+            "generated_adapter_local_residual_delta_norm": None,
+            "generated_adapter_local_residual_mean_top_similarity": None,
+            "generated_adapter_local_residual_memory_rows": None,
+        }
+    source_memory = residual_state["source_memory"].to(
+        device=adapter_input.device,
+        dtype=torch.float32,
+    )
+    residual_memory = residual_state["residual_memory"].to(
+        device=adapted_handoff_step.device,
+        dtype=torch.float32,
+    )
+    if int(source_memory.shape[0]) == 0:
+        return adapted_handoff_step, {
+            "generated_adapter_local_residual_applied": False,
+            "generated_adapter_local_residual_delta_norm": None,
+            "generated_adapter_local_residual_mean_top_similarity": None,
+            "generated_adapter_local_residual_memory_rows": 0,
+        }
+    query_rows = adapter_input.reshape(-1, adapter_input.shape[-1]).float()
+    output_shape = adapted_handoff_step.shape
+    top_k = min(int(residual_state.get("top_k", 8)), int(source_memory.shape[0]))
+    temperature = max(1e-6, float(residual_state.get("temperature", 0.05)))
+    blend = max(0.0, min(1.0, float(residual_state.get("blend", 1.0))))
+    chunk_size = max(1, int(residual_state.get("chunk_size", 64)))
+    if blend == 0.0:
+        return adapted_handoff_step, {
+            "generated_adapter_local_residual_applied": False,
+            "generated_adapter_local_residual_delta_norm": 0.0,
+            "generated_adapter_local_residual_mean_top_similarity": None,
+            "generated_adapter_local_residual_memory_rows": int(source_memory.shape[0]),
+        }
+
+    normalized_memory = torch.nn.functional.normalize(source_memory, dim=-1)
+    corrections: list[torch.Tensor] = []
+    top_similarities: list[torch.Tensor] = []
+    for start in range(0, int(query_rows.shape[0]), chunk_size):
+        query_chunk = query_rows[start : start + chunk_size]
+        similarities = torch.nn.functional.normalize(query_chunk, dim=-1) @ normalized_memory.T
+        top_values, top_indices = torch.topk(similarities, k=top_k, dim=-1)
+        weights = torch.softmax(top_values / temperature, dim=-1)
+        residual_neighbors = residual_memory.index_select(0, top_indices.reshape(-1)).reshape(
+            top_indices.shape[0],
+            top_indices.shape[1],
+            residual_memory.shape[-1],
+        )
+        corrections.append((residual_neighbors * weights.unsqueeze(-1)).sum(dim=1))
+        top_similarities.append(top_values[:, 0].detach())
+    correction = torch.cat(corrections, dim=0).reshape(output_shape)
+    correction = correction.to(device=adapted_handoff_step.device, dtype=adapted_handoff_step.dtype)
+    corrected = adapted_handoff_step + (correction * blend)
+    delta_norm = _mean_handoff_delta_norm(adapted_handoff_step, corrected)
+    mean_top_similarity = float(torch.cat(top_similarities).mean().detach().cpu().item())
+    return corrected, {
+        "generated_adapter_local_residual_applied": True,
+        "generated_adapter_local_residual_delta_norm": delta_norm,
+        "generated_adapter_local_residual_mean_top_similarity": mean_top_similarity,
+        "generated_adapter_local_residual_memory_rows": int(source_memory.shape[0]),
+    }
+
+
 def _fit_generated_trajectory_adapter_state(
     cfg: Any,
     state: dict[str, Any],
@@ -1106,10 +1279,17 @@ def _fit_generated_trajectory_adapter_state(
     fitted = apply_alignment(source_matrix, adapter_state).float()
     mse = torch.mean((fitted - target_matrix.float()) ** 2)
     cosine = torch.nn.functional.cosine_similarity(fitted, target_matrix.float(), dim=-1).mean()
+    local_residual_state = _build_generated_adapter_local_residual_state(
+        cfg,
+        source_matrix,
+        target_matrix,
+        fitted,
+    )
     return {
         **adapter_state,
         "adapter_type": "generated_trajectory_handoff",
         "input_space": _generated_trajectory_adapter_input_space(cfg),
+        "local_residual_state": local_residual_state,
         "training_prompt_count": int(prompt_count),
         "training_token_count": int(token_count),
         "training_reconstruction_mse": float(mse.item()),
@@ -1987,6 +2167,12 @@ def _run_generated_latent_variant(
     )
     generated_adapter_state = generated_adapter_info.get("state")
     generated_adapter_delta_norm: Optional[float] = None
+    generated_adapter_local_residual_metrics = {
+        "generated_adapter_local_residual_applied": False,
+        "generated_adapter_local_residual_delta_norm": None,
+        "generated_adapter_local_residual_mean_top_similarity": None,
+        "generated_adapter_local_residual_memory_rows": None,
+    }
     generated_adapter_input_space = _generated_trajectory_adapter_input_space(variant_cfg)
     if generated_adapter_state is not None:
         adapter_input = (
@@ -2001,6 +2187,13 @@ def _run_generated_latent_variant(
         adapted_handoff_step = apply_alignment(adapter_input, generated_adapter_state).to(
             device=agent_b_device,
             dtype=agent_b.get_input_embeddings().weight.dtype,
+        )
+        adapted_handoff_step, generated_adapter_local_residual_metrics = (
+            _apply_generated_adapter_local_residual(
+                adapter_input,
+                adapted_handoff_step,
+                generated_adapter_state,
+            )
         )
         generated_adapter_delta_norm = _mean_handoff_delta_norm(handoff_step, adapted_handoff_step)
         handoff_step = adapted_handoff_step
@@ -2137,6 +2330,7 @@ def _run_generated_latent_variant(
         )
         if not generated_adapter_report
         else generated_adapter_info.get("training_mean_cosine_similarity"),
+        **generated_adapter_local_residual_metrics,
         "embedding_manifold_enabled": bool(
             getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
         ),
@@ -2558,6 +2752,10 @@ def run_benchmark(
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
     generated_trajectory_adapter_target_mode: Optional[str] = None,
+    generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
+    generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
@@ -2621,6 +2819,22 @@ def run_benchmark(
     if generated_trajectory_adapter_target_mode is not None:
         base_cfg.handoff.generated_trajectory_adapter.target_mode = str(
             generated_trajectory_adapter_target_mode
+        )
+    if generated_trajectory_adapter_local_residual_enabled is not None:
+        base_cfg.handoff.generated_trajectory_adapter.local_residual.enabled = bool(
+            generated_trajectory_adapter_local_residual_enabled
+        )
+    if generated_trajectory_adapter_local_residual_top_k is not None:
+        base_cfg.handoff.generated_trajectory_adapter.local_residual.top_k = int(
+            generated_trajectory_adapter_local_residual_top_k
+        )
+    if generated_trajectory_adapter_local_residual_blend is not None:
+        base_cfg.handoff.generated_trajectory_adapter.local_residual.blend = float(
+            generated_trajectory_adapter_local_residual_blend
+        )
+    if generated_trajectory_adapter_local_residual_max_memory_rows is not None:
+        base_cfg.handoff.generated_trajectory_adapter.local_residual.max_memory_rows = int(
+            generated_trajectory_adapter_local_residual_max_memory_rows
         )
     if embedding_manifold_enabled is not None:
         base_cfg.handoff.embedding_manifold.enabled = bool(embedding_manifold_enabled)
@@ -2890,6 +3104,18 @@ def run_benchmark(
                             "handoff_adapter_training_mean_cosine_similarity": row_result.get(
                                 "handoff_adapter_training_mean_cosine_similarity"
                             ),
+                            "generated_adapter_local_residual_applied": row_result.get(
+                                "generated_adapter_local_residual_applied"
+                            ),
+                            "generated_adapter_local_residual_delta_norm": row_result.get(
+                                "generated_adapter_local_residual_delta_norm"
+                            ),
+                            "generated_adapter_local_residual_mean_top_similarity": row_result.get(
+                                "generated_adapter_local_residual_mean_top_similarity"
+                            ),
+                            "generated_adapter_local_residual_memory_rows": row_result.get(
+                                "generated_adapter_local_residual_memory_rows"
+                            ),
                             "embedding_manifold_enabled": row_result.get("embedding_manifold_enabled"),
                             "embedding_manifold_applied": row_result.get("embedding_manifold_applied"),
                             "embedding_manifold_delta_norm": row_result.get(
@@ -3150,6 +3376,12 @@ def run_benchmark(
                     "character",
                 )
             ),
+            "local_residual": {
+                "enabled": _generated_trajectory_adapter_local_residual_enabled(base_cfg),
+                "top_k": _generated_trajectory_adapter_local_residual_top_k(base_cfg),
+                "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
+                "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
+            },
         },
         "embedding_manifold": {
             "enabled": bool(
@@ -3370,6 +3602,34 @@ def main() -> None:
         help="Optional override for handoff.generated_trajectory_adapter.target_mode.",
     )
     parser.add_argument(
+        "--enable-generated-trajectory-local-residual",
+        action="store_true",
+        help="Enable top-k local residual correction for the generated-trajectory adapter.",
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-local-residual",
+        action="store_true",
+        help="Disable generated-trajectory local residual correction for this run.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-local-residual-top-k",
+        type=int,
+        default=None,
+        help="Optional override for handoff.generated_trajectory_adapter.local_residual.top_k.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-local-residual-blend",
+        type=float,
+        default=None,
+        help="Optional override for handoff.generated_trajectory_adapter.local_residual.blend.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-local-residual-max-memory-rows",
+        type=int,
+        default=None,
+        help="Optional override for handoff.generated_trajectory_adapter.local_residual.max_memory_rows.",
+    )
+    parser.add_argument(
         "--enable-embedding-manifold",
         action="store_true",
         help="Project latent prefix vectors onto the receiver embedding manifold.",
@@ -3490,6 +3750,11 @@ def main() -> None:
                 if args.generated_trajectory_adapter_target_mode == "final_answer_line"
                 else "character"
             )
+        if (
+            args.generated_trajectory_adapter_input_space == "raw"
+            and not args.disable_generated_trajectory_local_residual
+        ):
+            args.enable_generated_trajectory_local_residual = True
         if not args.disable_embedding_manifold:
             args.enable_embedding_manifold = True
             if args.embedding_manifold_top_k is None:
@@ -3546,6 +3811,22 @@ def main() -> None:
             args.generated_trajectory_adapter_source_tail_tokens
         ),
         generated_trajectory_adapter_target_mode=args.generated_trajectory_adapter_target_mode,
+        generated_trajectory_adapter_local_residual_enabled=(
+            False
+            if args.disable_generated_trajectory_local_residual
+            else True
+            if args.enable_generated_trajectory_local_residual
+            else None
+        ),
+        generated_trajectory_adapter_local_residual_top_k=(
+            args.generated_trajectory_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_blend=(
+            args.generated_trajectory_local_residual_blend
+        ),
+        generated_trajectory_adapter_local_residual_max_memory_rows=(
+            args.generated_trajectory_local_residual_max_memory_rows
+        ),
         embedding_manifold_enabled=(
             False
             if args.disable_embedding_manifold
