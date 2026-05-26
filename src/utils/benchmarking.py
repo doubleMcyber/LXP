@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 14
+REPORT_SCHEMA_VERSION = 16
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -49,6 +49,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "sender_reasoning_text",
     "sender_reasoning_token_count",
     "sender_reasoning_status",
+    "sender_trace_cache_hit",
+    "sender_trace_cache_path",
     "sender_final_answer_marker",
     "sender_predicted_answer",
     "sender_answer_matches_target",
@@ -78,6 +80,9 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "handoff_adapter_training_token_count",
     "handoff_adapter_training_row_cache_hit",
     "handoff_adapter_training_row_cache_path",
+    "handoff_adapter_training_trace_cache_hit_count",
+    "handoff_adapter_training_trace_cache_miss_count",
+    "handoff_adapter_training_trace_cache_hit_rate_percentage",
     "handoff_adapter_training_reconstruction_mse",
     "handoff_adapter_training_mean_cosine_similarity",
     "generated_adapter_local_residual_applied",
@@ -135,6 +140,7 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "accuracy_percentage",
     "sender_answer_extraction_rate_percentage",
     "sender_final_answer_marker_rate_percentage",
+    "sender_trace_cache_hit_rate_percentage",
     "sender_accuracy_percentage",
     "sender_correct_sample_count",
     "accuracy_when_sender_correct_percentage",
@@ -156,6 +162,9 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "handoff_adapter_rate_percentage",
     "handoff_adapter_cache_hit_rate_percentage",
     "handoff_adapter_training_row_cache_hit_rate_percentage",
+    "mean_handoff_adapter_training_trace_cache_hit_count",
+    "mean_handoff_adapter_training_trace_cache_miss_count",
+    "mean_handoff_adapter_training_trace_cache_hit_rate_percentage",
     "mean_handoff_adapter_delta_norm",
     "mean_handoff_adapter_training_reconstruction_mse",
     "mean_handoff_adapter_training_mean_cosine_similarity",
@@ -329,6 +338,15 @@ def aggregate_standard_rows(
             if _optional_bool_value(row.get("sender_final_answer_marker")) is True
             or str(row.get("sender_reasoning_status") or "") == "complete"
         ]
+        sender_trace_cache_rows = [
+            _optional_bool_value(row.get("sender_trace_cache_hit"))
+            for row in group_rows
+            if row.get("sender_trace_cache_hit") is not None
+            and row.get("sender_trace_cache_hit") != ""
+        ]
+        sender_trace_cache_values = [
+            value for value in sender_trace_cache_rows if value is not None
+        ]
         sender_correct_values = [
             value
             for value in (
@@ -447,6 +465,10 @@ def aggregate_standard_rows(
                     len(sender_final_answer_marker_rows),
                     len(sender_reasoning_rows),
                 ),
+                "sender_trace_cache_hit_rate_percentage": _percentage(
+                    sum(sender_trace_cache_values),
+                    len(sender_trace_cache_values),
+                ),
                 "sender_accuracy_percentage": _percentage(
                     sum(sender_correct_values),
                     len(sender_correct_values),
@@ -500,6 +522,18 @@ def aggregate_standard_rows(
                     / len(handoff_adapter_training_row_cache_rows)
                     if handoff_adapter_training_row_cache_rows
                     else None
+                ),
+                "mean_handoff_adapter_training_trace_cache_hit_count": _mean_or_none(
+                    group_rows,
+                    "handoff_adapter_training_trace_cache_hit_count",
+                ),
+                "mean_handoff_adapter_training_trace_cache_miss_count": _mean_or_none(
+                    group_rows,
+                    "handoff_adapter_training_trace_cache_miss_count",
+                ),
+                "mean_handoff_adapter_training_trace_cache_hit_rate_percentage": _mean_or_none(
+                    group_rows,
+                    "handoff_adapter_training_trace_cache_hit_rate_percentage",
                 ),
                 "mean_handoff_adapter_delta_norm": _mean_or_none(group_rows, "handoff_adapter_delta_norm"),
                 "mean_handoff_adapter_training_reconstruction_mse": _mean_or_none(

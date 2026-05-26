@@ -19,8 +19,11 @@ from benchmark_all import (
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_training_rows_cache_key,
+    _generated_trajectory_trace_cache_key,
+    _generated_adapter_include_prompt_values,
     _handoff_decode_prompt,
     _load_generated_trajectory_training_rows_from_disk,
+    _load_generated_trajectory_trace_from_disk,
     _methods_for_suite,
     _predicted_answer,
     _select_generated_adapter_memory_rows,
@@ -126,6 +129,8 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "target_answer": "1",
             "sender_reasoning_text": "Final answer: 1",
             "sender_reasoning_status": "complete",
+            "sender_trace_cache_hit": True,
+            "sender_trace_cache_path": ".cache/trace-a.pt",
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "1",
             "sender_answer_matches_target": True,
@@ -168,6 +173,8 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "target_answer": "2",
             "sender_reasoning_text": "Final answer: 2",
             "sender_reasoning_status": "complete",
+            "sender_trace_cache_hit": False,
+            "sender_trace_cache_path": ".cache/trace-b.pt",
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "2",
             "sender_answer_matches_target": True,
@@ -204,6 +211,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
     assert summary["sample_count"] == 2
     assert summary["accuracy_percentage"] == 50.0
     assert summary["sender_final_answer_marker_rate_percentage"] == 100.0
+    assert summary["sender_trace_cache_hit_rate_percentage"] == 50.0
     assert summary["sender_accuracy_percentage"] == 100.0
     assert summary["sender_correct_sample_count"] == 2
     assert summary["accuracy_when_sender_correct_percentage"] == 50.0
@@ -665,6 +673,117 @@ def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) 
 
     torch.save({"source_matrix": torch.zeros(2, 3), "target_matrix": torch.ones(3, 4)}, cache_path)
     assert _load_generated_trajectory_training_rows_from_disk(cache_path) is None
+
+
+def test_generated_trajectory_trace_cache_key_tracks_prompt_and_sender_setup() -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "a",
+            "agent_b_model": "b",
+            "torch_dtype": "bfloat16",
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 128,
+            },
+            "handoff": {
+                "latent_pooling": "mean",
+                "generated_trajectory_adapter": {
+                    "strategy": "hybrid_affine",
+                    "local_residual": {"enabled": False},
+                },
+            },
+        }
+    )
+    state = {
+        "global_reasoning_layer_indices": (1, 2),
+        "global_reasoning_layer_weights": (0.25, 0.75),
+    }
+
+    first_key = _generated_trajectory_trace_cache_key(
+        cfg,
+        state,
+        "How many?",
+        include_prompt=False,
+    )
+    cfg.handoff.generated_trajectory_adapter.strategy = "ridge"
+    cfg.handoff.generated_trajectory_adapter.local_residual.enabled = True
+    assert (
+        _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            "How many?",
+            include_prompt=False,
+        )
+        == first_key
+    )
+
+    assert (
+        _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            "How many?",
+            include_prompt=True,
+        )
+        != first_key
+    )
+    assert (
+        _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            "A different prompt",
+            include_prompt=False,
+        )
+        != first_key
+    )
+    state["global_reasoning_layer_weights"] = (0.5, 0.5)
+    assert (
+        _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            "How many?",
+            include_prompt=False,
+        )
+        != first_key
+    )
+
+
+def test_load_generated_trajectory_trace_validates_disk_cache(tmp_path) -> None:
+    cache_path = tmp_path / "trace.pt"
+    torch.save(
+        {
+            "consensus_hidden_states": torch.zeros(1, 2, 3),
+            "generated_token_ids": [1, 2],
+            "generated_reasoning_text": "Final answer: 4",
+        },
+        cache_path,
+    )
+
+    loaded = _load_generated_trajectory_trace_from_disk(cache_path)
+
+    assert loaded is not None
+    assert loaded["generated_token_ids"] == [1, 2]
+
+    torch.save(
+        {
+            "consensus_hidden_states": torch.zeros(2, 3),
+            "generated_token_ids": [1, 2],
+            "generated_reasoning_text": "Final answer: 4",
+        },
+        cache_path,
+    )
+    assert _load_generated_trajectory_trace_from_disk(cache_path) is None
+
+
+def test_generated_adapter_include_prompt_values_follow_selected_methods() -> None:
+    assert _generated_adapter_include_prompt_values(None) == (False,)
+    assert _generated_adapter_include_prompt_values(["text_text_hybrid"]) == (False,)
+    assert _generated_adapter_include_prompt_values(
+        [
+            "generated_latent_handoff",
+            "prompt_generated_latent_handoff",
+            "generated_context_latent_handoff",
+        ]
+    ) == (False, True)
 
 
 def test_generated_trajectory_residual_memory_keeps_hard_rows_and_coverage() -> None:

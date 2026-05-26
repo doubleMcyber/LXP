@@ -69,6 +69,9 @@ handoff:
     train_on_missing: true
     cache_dir: ".cache/generated_trajectory_adapter"
     training_rows_cache_dir: ".cache/generated_trajectory_rows"
+    trace_cache_enabled: true
+    trace_cache_dir: ".cache/generated_trajectory_traces"
+    progress_interval: 1
     dataset_name: "gsm8k"
     train_split: "train"
     train_limit: 8

@@ -192,7 +192,14 @@ def _benchmark_cfg(cfg: Any) -> Any:
 
 def _text_hybrid_reasoning_max_new_tokens(cfg: Any) -> int:
     benchmark_cfg = _benchmark_cfg(cfg)
-    return int(getattr(benchmark_cfg, "text_hybrid_reasoning_max_new_tokens", cfg.max_new_tokens))
+    fallback_max_new_tokens = int(getattr(cfg, "max_new_tokens", 0))
+    return int(
+        getattr(
+            benchmark_cfg,
+            "text_hybrid_reasoning_max_new_tokens",
+            fallback_max_new_tokens,
+        )
+    )
 
 
 def _reasoner_generation_max_new_tokens(cfg: Any) -> int:
@@ -441,6 +448,74 @@ def _generate_reasoner_text(prompt: str, cfg: Any, state: dict[str, Any]) -> str
     return tokenizer_a.decode(generated_ids, skip_special_tokens=True)
 
 
+def _sender_generated_trace_payload(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "consensus_hidden_states": result["consensus_hidden_states"].detach().cpu(),
+        "generated_token_ids": [int(token_id) for token_id in result["generated_token_ids"]],
+        "generated_reasoning_text": str(result["generated_reasoning_text"]),
+        "generated_reasoning_token_count": int(result["generated_reasoning_token_count"]),
+        "generated_reasoning_status": str(result["generated_reasoning_status"]),
+        "generated_reasoning_final_answer_marker": bool(
+            result["generated_reasoning_final_answer_marker"]
+        ),
+        "generated_latent_includes_prompt": bool(result["generated_latent_includes_prompt"]),
+    }
+
+
+def _sender_generated_trace_result_from_payload(
+    payload: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    cfg: Any,
+    cache_path: Optional[Path],
+) -> dict[str, Any]:
+    agent_a = state["agent_a"]
+    agent_a_device = next(agent_a.parameters()).device
+    consensus_hidden_states = payload["consensus_hidden_states"].to(agent_a_device)
+    latent_attention_mask = torch.ones(
+        (consensus_hidden_states.shape[0], consensus_hidden_states.shape[1]),
+        dtype=torch.long,
+        device=agent_a_device,
+    )
+    pooling_mode = _latent_pooling_mode(cfg)
+    reasoning_layer_indices, reasoning_layer_weights = _reasoning_alignment_metadata(state)
+    generated_token_ids = [int(token_id) for token_id in payload["generated_token_ids"]]
+    generated_text = str(payload["generated_reasoning_text"])
+    generated_status = str(
+        payload.get("generated_reasoning_status")
+        or _sender_reasoning_status(generated_token_ids, generated_text, cfg)
+    )
+    return {
+        "consensus_hidden_states": consensus_hidden_states,
+        "current_latent_step": _pool_latent_handoff_step(
+            consensus_hidden_states,
+            latent_attention_mask,
+            pooling_mode=pooling_mode,
+        ),
+        "attention_mask": latent_attention_mask,
+        "latent_pooling": pooling_mode,
+        "kv_cache_a": None,
+        "reasoning_layer_indices": reasoning_layer_indices,
+        "reasoning_layer_weights": reasoning_layer_weights,
+        "generated_token_ids": generated_token_ids,
+        "generated_reasoning_text": generated_text,
+        "generated_reasoning_token_count": int(
+            payload.get("generated_reasoning_token_count", len(generated_token_ids))
+        ),
+        "generated_latent_includes_prompt": bool(
+            payload.get("generated_latent_includes_prompt", False)
+        ),
+        "generated_reasoning_status": generated_status,
+        "generated_reasoning_final_answer_marker": bool(
+            payload.get("generated_reasoning_final_answer_marker")
+            if "generated_reasoning_final_answer_marker" in payload
+            else generated_status == "complete"
+        ),
+        "generated_trace_cache_hit": True,
+        "generated_trace_cache_path": "" if cache_path is None else str(cache_path),
+    }
+
+
 def _collect_sender_generated_consensus_state(
     prompt: str,
     state: dict[str, Any],
@@ -449,15 +524,29 @@ def _collect_sender_generated_consensus_state(
     include_prompt: bool = False,
 ) -> dict[str, Any]:
     cache = state.setdefault("_generated_sender_consensus_cache", {})
-    cache_key = (
-        str(prompt),
-        int(_reasoner_generation_max_new_tokens(cfg)),
-        bool(_answer_only_final_enabled(cfg)),
-        bool(include_prompt),
+    cache_key = _generated_trajectory_trace_cache_key(
+        cfg,
+        state,
+        prompt,
+        include_prompt=include_prompt,
     )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
+
+    trace_cache_path: Optional[Path] = None
+    if _generated_trajectory_adapter_trace_cache_enabled(cfg):
+        trace_cache_path = _generated_trajectory_adapter_trace_cache_path(cfg, cache_key)
+        cached_trace = _load_generated_trajectory_trace_from_disk(trace_cache_path)
+        if cached_trace is not None:
+            result = _sender_generated_trace_result_from_payload(
+                cached_trace,
+                state=state,
+                cfg=cfg,
+                cache_path=trace_cache_path,
+            )
+            cache[cache_key] = result
+            return result
 
     tokenizer_a = state["tokenizer_a"]
     agent_a = state["agent_a"]
@@ -552,6 +641,10 @@ def _collect_sender_generated_consensus_state(
     result["generated_reasoning_final_answer_marker"] = (
         result["generated_reasoning_status"] == "complete"
     )
+    result["generated_trace_cache_hit"] = False
+    result["generated_trace_cache_path"] = "" if trace_cache_path is None else str(trace_cache_path)
+    if trace_cache_path is not None:
+        torch.save(_sender_generated_trace_payload(result), trace_cache_path)
     cache[cache_key] = result
     return result
 
@@ -832,6 +925,24 @@ def _generated_trajectory_adapter_training_rows_cache_dir(cfg: Any) -> Path:
     return Path(str(getattr(adapter_cfg, "training_rows_cache_dir", default_dir)))
 
 
+def _generated_trajectory_adapter_trace_cache_enabled(cfg: Any) -> bool:
+    adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
+    if adapter_cfg is None:
+        return False
+    return bool(getattr(adapter_cfg, "trace_cache_enabled", True))
+
+
+def _generated_trajectory_adapter_trace_cache_dir(cfg: Any) -> Path:
+    adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
+    default_dir = _generated_trajectory_adapter_cache_dir(cfg).parent / "generated_trajectory_traces"
+    return Path(str(getattr(adapter_cfg, "trace_cache_dir", default_dir)))
+
+
+def _generated_trajectory_adapter_progress_interval(cfg: Any) -> int:
+    adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
+    return max(0, int(getattr(adapter_cfg, "progress_interval", 1)))
+
+
 def _generated_trajectory_adapter_dataset_name(cfg: Any) -> str:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     fallback = getattr(getattr(getattr(cfg, "handoff", None), "adapter", None), "dataset_name", "gsm8k")
@@ -871,6 +982,18 @@ def _generated_trajectory_adapter_training_rows_cache_path(
     return cache_dir / f"generated_trajectory_rows_{digest}.pt"
 
 
+def _generated_trajectory_adapter_trace_cache_path(
+    cfg: Any,
+    cache_key: tuple[Any, ...],
+) -> Path:
+    cache_dir = _generated_trajectory_adapter_trace_cache_dir(cfg)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps(cache_key, sort_keys=False, default=list).encode("utf-8")
+    ).hexdigest()
+    return cache_dir / f"generated_trajectory_trace_{digest}.pt"
+
+
 def _load_generated_trajectory_adapter_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
     if not cache_path.is_file():
         return None
@@ -901,6 +1024,32 @@ def _load_generated_trajectory_training_rows_from_disk(cache_path: Path) -> Opti
     if int(source_matrix.shape[0]) == 0 or int(source_matrix.shape[0]) != int(target_matrix.shape[0]):
         return None
     return cached_rows
+
+
+def _load_generated_trajectory_trace_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
+    if not cache_path.is_file():
+        return None
+    try:
+        cached_trace = torch.load(cache_path, map_location="cpu")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(cached_trace, dict):
+        return None
+    consensus_hidden_states = cached_trace.get("consensus_hidden_states")
+    if not isinstance(consensus_hidden_states, torch.Tensor):
+        return None
+    if consensus_hidden_states.dim() != 3 or int(consensus_hidden_states.shape[1]) == 0:
+        return None
+    generated_token_ids = cached_trace.get("generated_token_ids")
+    if not isinstance(generated_token_ids, (list, tuple)):
+        return None
+    try:
+        cached_trace["generated_token_ids"] = [int(token_id) for token_id in generated_token_ids]
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(cached_trace.get("generated_reasoning_text"), str):
+        return None
+    return cached_trace
 
 
 def _generated_trajectory_adapter_cache_key(
@@ -943,6 +1092,29 @@ def _generated_trajectory_adapter_cache_key(
         _generated_trajectory_adapter_local_residual_temperature(cfg),
         _generated_trajectory_adapter_local_residual_blend(cfg),
         _generated_trajectory_adapter_local_residual_max_rows(cfg),
+    )
+
+
+def _generated_trajectory_trace_cache_key(
+    cfg: Any,
+    state: dict[str, Any],
+    prompt: str,
+    *,
+    include_prompt: bool,
+) -> tuple[Any, ...]:
+    reasoning_layer_indices, reasoning_layer_weights = _reasoning_alignment_metadata(state)
+    prompt_hash = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()
+    return (
+        "generated_trajectory_trace_v1",
+        str(cfg.agent_a_model),
+        str(cfg.torch_dtype),
+        int(_reasoner_generation_max_new_tokens(cfg)),
+        bool(_answer_only_final_enabled(cfg)),
+        bool(include_prompt),
+        _latent_pooling_mode(cfg),
+        tuple(int(index) for index in reasoning_layer_indices),
+        tuple(round(float(weight), 8) for weight in reasoning_layer_weights),
+        prompt_hash,
     )
 
 
@@ -1306,7 +1478,12 @@ def _build_generated_trajectory_training_rows(
     target_rows: list[torch.Tensor] = []
     prompt_count = 0
     token_count = 0
-    for row in train_rows:
+    trace_cache_hit_count = 0
+    trace_cache_miss_count = 0
+    trace_cache_lookup_count = 0
+    progress_interval = _generated_trajectory_adapter_progress_interval(cfg)
+    total_train_rows = len(train_rows) if hasattr(train_rows, "__len__") else train_limit
+    for row_index, row in enumerate(train_rows, start=1):
         prompt = pick_field(row, ("question", "problem"))
         if not str(prompt).strip():
             continue
@@ -1316,6 +1493,13 @@ def _build_generated_trajectory_training_rows(
             cfg,
             include_prompt=include_prompt,
         )
+        trace_cache_path = str(sender_state.get("generated_trace_cache_path") or "")
+        if trace_cache_path:
+            trace_cache_lookup_count += 1
+            if bool(sender_state.get("generated_trace_cache_hit", False)):
+                trace_cache_hit_count += 1
+            else:
+                trace_cache_miss_count += 1
         source_sequence = _generated_trajectory_adapter_source_sequence(cfg, sender_state)
         adapter_source = _generated_trajectory_adapter_fit_source(
             source_sequence,
@@ -1340,15 +1524,34 @@ def _build_generated_trajectory_training_rows(
         target_rows.append(target_sequence.detach().float().cpu().reshape(-1, target_sequence.shape[-1]))
         prompt_count += 1
         token_count += int(adapter_source.shape[1])
+        if progress_interval and (
+            prompt_count == 1
+            or prompt_count % progress_interval == 0
+            or row_index == total_train_rows
+        ):
+            print(
+                "Generated trajectory rows: "
+                f"{prompt_count}/{train_limit} usable prompts "
+                f"(source row {row_index}/{total_train_rows}, "
+                f"trace cache hits={trace_cache_hit_count}, misses={trace_cache_miss_count})"
+            )
     if not source_rows:
         raise ValueError("No usable generated trajectories were available for adapter fitting")
     source_matrix = torch.cat(source_rows, dim=0)
     target_matrix = torch.cat(target_rows, dim=0)
+    trace_cache_hit_rate = (
+        100.0 * trace_cache_hit_count / trace_cache_lookup_count
+        if trace_cache_lookup_count
+        else None
+    )
     return {
         "source_matrix": source_matrix,
         "target_matrix": target_matrix,
         "training_prompt_count": int(prompt_count),
         "training_token_count": int(token_count),
+        "training_trace_cache_hit_count": int(trace_cache_hit_count),
+        "training_trace_cache_miss_count": int(trace_cache_miss_count),
+        "training_trace_cache_hit_rate_percentage": trace_cache_hit_rate,
     }
 
 
@@ -1440,6 +1643,15 @@ def _fit_generated_trajectory_adapter_state(
         "training_token_count": int(training_rows["training_token_count"]),
         "training_row_cache_hit": bool(training_rows.get("training_row_cache_hit", False)),
         "training_row_cache_path": str(training_rows.get("training_row_cache_path", "")),
+        "training_trace_cache_hit_count": training_rows.get(
+            "training_trace_cache_hit_count"
+        ),
+        "training_trace_cache_miss_count": training_rows.get(
+            "training_trace_cache_miss_count"
+        ),
+        "training_trace_cache_hit_rate_percentage": training_rows.get(
+            "training_trace_cache_hit_rate_percentage"
+        ),
         "training_reconstruction_mse": float(mse.item()),
         "training_mean_cosine_similarity": float(cosine.item()),
     }
@@ -1495,6 +1707,15 @@ def _load_or_train_generated_trajectory_adapter_state(
             "training_token_count": adapter_state.get("training_token_count"),
             "training_row_cache_hit": adapter_state.get("training_row_cache_hit"),
             "training_row_cache_path": adapter_state.get("training_row_cache_path"),
+            "training_trace_cache_hit_count": adapter_state.get(
+                "training_trace_cache_hit_count"
+            ),
+            "training_trace_cache_miss_count": adapter_state.get(
+                "training_trace_cache_miss_count"
+            ),
+            "training_trace_cache_hit_rate_percentage": adapter_state.get(
+                "training_trace_cache_hit_rate_percentage"
+            ),
             "training_reconstruction_mse": adapter_state.get("training_reconstruction_mse"),
             "training_mean_cosine_similarity": adapter_state.get(
                 "training_mean_cosine_similarity"
@@ -1502,6 +1723,60 @@ def _load_or_train_generated_trajectory_adapter_state(
         }
     memory_cache[cache_key] = info
     return info
+
+
+def _generated_adapter_alignment_state_from_variant_state(
+    variant_state: dict[str, Any],
+) -> dict[str, Any]:
+    handoff_mapping = variant_state.get(
+        "handoff_alignment_q",
+        variant_state["global_alignment_q"],
+    )
+    handoff_bias = variant_state.get(
+        "handoff_alignment_bias",
+        variant_state.get("global_alignment_bias"),
+    )
+    return {
+        "mapping_matrix": handoff_mapping,
+        "mapping_bias": handoff_bias,
+        "pre_projection_state": variant_state.get(
+            "handoff_pre_projection_state",
+            variant_state.get("pre_projection_state"),
+        ),
+        "post_projection_state": variant_state.get(
+            "handoff_post_projection_state",
+            variant_state.get("post_projection_state"),
+        ),
+        "alignment_strategy": variant_state.get("alignment_strategy", "hybrid_affine"),
+        "orthogonal_q": variant_state.get(
+            "handoff_alignment_backbone_q",
+            variant_state.get("global_alignment_backbone_q", handoff_mapping),
+        ),
+        "residual_matrix": variant_state.get("handoff_alignment_residual"),
+        "residual_norm_ratio": variant_state.get(
+            "handoff_residual_norm_ratio",
+            variant_state.get("residual_norm_ratio"),
+        ),
+        "bias_norm": variant_state.get("handoff_bias_norm", variant_state.get("bias_norm")),
+    }
+
+
+def _generated_adapter_include_prompt_values(
+    method_names: Optional[Sequence[str]],
+) -> tuple[bool, ...]:
+    if method_names is None:
+        return (False,)
+    values: list[bool] = []
+    for method_name in method_names:
+        if method_name == "prompt_generated_latent_handoff":
+            values.append(True)
+        elif method_name in GENERATED_LATENT_METHODS:
+            values.append(False)
+    deduped: list[bool] = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+    return tuple(deduped or [False])
 
 
 def _maybe_append_answer_suffix_to_prefix_state(
@@ -2278,37 +2553,7 @@ def _run_generated_latent_variant(
         if _generated_trajectory_adapter_enabled(variant_cfg)
         else sender_state["consensus_hidden_states"]
     )
-    handoff_mapping = variant_state.get(
-        "handoff_alignment_q",
-        variant_state["global_alignment_q"],
-    )
-    handoff_bias = variant_state.get(
-        "handoff_alignment_bias",
-        variant_state.get("global_alignment_bias"),
-    )
-    alignment_state = {
-        "mapping_matrix": handoff_mapping,
-        "mapping_bias": handoff_bias,
-        "pre_projection_state": variant_state.get(
-            "handoff_pre_projection_state",
-            variant_state.get("pre_projection_state"),
-        ),
-        "post_projection_state": variant_state.get(
-            "handoff_post_projection_state",
-            variant_state.get("post_projection_state"),
-        ),
-        "alignment_strategy": variant_state.get("alignment_strategy", "hybrid_affine"),
-        "orthogonal_q": variant_state.get(
-            "handoff_alignment_backbone_q",
-            variant_state.get("global_alignment_backbone_q", handoff_mapping),
-        ),
-        "residual_matrix": variant_state.get("handoff_alignment_residual"),
-        "residual_norm_ratio": variant_state.get(
-            "handoff_residual_norm_ratio",
-            variant_state.get("residual_norm_ratio"),
-        ),
-        "bias_norm": variant_state.get("handoff_bias_norm", variant_state.get("bias_norm")),
-    }
+    alignment_state = _generated_adapter_alignment_state_from_variant_state(variant_state)
     generated_adapter_info = _load_or_train_generated_trajectory_adapter_state(
         variant_cfg,
         variant_state,
@@ -2480,6 +2725,21 @@ def _run_generated_latent_variant(
         )
         if not generated_adapter_report
         else generated_adapter_info.get("training_row_cache_path"),
+        "handoff_adapter_training_trace_cache_hit_count": variant_state.get(
+            "handoff_adapter_training_trace_cache_hit_count"
+        )
+        if not generated_adapter_report
+        else generated_adapter_info.get("training_trace_cache_hit_count"),
+        "handoff_adapter_training_trace_cache_miss_count": variant_state.get(
+            "handoff_adapter_training_trace_cache_miss_count"
+        )
+        if not generated_adapter_report
+        else generated_adapter_info.get("training_trace_cache_miss_count"),
+        "handoff_adapter_training_trace_cache_hit_rate_percentage": variant_state.get(
+            "handoff_adapter_training_trace_cache_hit_rate_percentage"
+        )
+        if not generated_adapter_report
+        else generated_adapter_info.get("training_trace_cache_hit_rate_percentage"),
         "handoff_adapter_training_reconstruction_mse": variant_state.get(
             "handoff_adapter_training_reconstruction_mse"
         )
@@ -2514,6 +2774,8 @@ def _run_generated_latent_variant(
         "sender_reasoning_text": sender_state["generated_reasoning_text"],
         "sender_reasoning_token_count": sender_state["generated_reasoning_token_count"],
         "sender_reasoning_status": sender_state["generated_reasoning_status"],
+        "sender_trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
+        "sender_trace_cache_path": sender_state.get("generated_trace_cache_path"),
         "sender_final_answer_marker": sender_state["generated_reasoning_final_answer_marker"],
     }
 
@@ -2863,37 +3125,8 @@ def _coerce_sample_indices(values: Optional[Sequence[Any]]) -> Optional[list[int
     return [int(value) for value in values]
 
 
-def _apply_model_profile_defaults(
-    cfg: Any,
+def _configured_base_cfg(
     *,
-    agent_a_model: Optional[str],
-    agent_b_model: Optional[str],
-    hetero_smoke: bool,
-) -> None:
-    if hetero_smoke:
-        if agent_a_model is None:
-            cfg.agent_a_model = DEFAULT_HETERO_SMOKE_AGENT_A_MODEL
-        if agent_b_model is None:
-            cfg.agent_b_model = DEFAULT_HETERO_SMOKE_AGENT_B_MODEL
-    if agent_a_model is not None:
-        cfg.agent_a_model = str(agent_a_model)
-    if agent_b_model is not None:
-        cfg.agent_b_model = str(agent_b_model)
-
-
-def run_benchmark(
-    *,
-    suite_name: str,
-    dataset_name: str,
-    dataset_split: Optional[str],
-    limit: int,
-    repetitions: int,
-    samples_output_path: Path,
-    summary_output_path: Path,
-    report_output_path: Path,
-    max_new_tokens: Optional[int] = None,
-    reasoner_max_new_tokens: Optional[int] = None,
-    latent_steps_values: Optional[list[int]] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
     latent_pooling: Optional[str] = None,
@@ -2906,6 +3139,7 @@ def run_benchmark(
     handoff_adapter_train_on_missing: Optional[bool] = None,
     handoff_adapter_train_limit: Optional[int] = None,
     generated_trajectory_adapter_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
     generated_trajectory_adapter_train_limit: Optional[int] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
@@ -2920,13 +3154,13 @@ def run_benchmark(
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
     seed: Optional[int] = None,
-    method_names: Optional[list[str]] = None,
-    sample_indices: Optional[list[int]] = None,
+    max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
     semantic_smoke: bool = False,
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
     answer_only_final: bool = False,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+) -> Any:
     base_cfg = _load_cfg()
     _apply_model_profile_defaults(
         base_cfg,
@@ -2955,6 +3189,10 @@ def run_benchmark(
     if generated_trajectory_adapter_enabled is not None:
         base_cfg.handoff.generated_trajectory_adapter.enabled = bool(
             generated_trajectory_adapter_enabled
+        )
+    if generated_trajectory_adapter_train_on_missing is not None:
+        base_cfg.handoff.generated_trajectory_adapter.train_on_missing = bool(
+            generated_trajectory_adapter_train_on_missing
         )
     if generated_trajectory_adapter_train_limit is not None:
         base_cfg.handoff.generated_trajectory_adapter.train_limit = int(
@@ -3038,6 +3276,117 @@ def run_benchmark(
         base_cfg.reporting.semantic_smoke.baseline_methods = list(DEFAULT_HETERO_SMOKE_BASELINE_METHODS)
         base_cfg.reporting.semantic_smoke.latent_methods = list(DEFAULT_HETERO_SMOKE_LATENT_METHODS)
         base_cfg.reporting.semantic_smoke.require_final_answer_marker_methods = list(DEFAULT_HETERO_SMOKE_METHODS)
+    return base_cfg
+
+
+def _apply_model_profile_defaults(
+    cfg: Any,
+    *,
+    agent_a_model: Optional[str],
+    agent_b_model: Optional[str],
+    hetero_smoke: bool,
+) -> None:
+    if hetero_smoke:
+        if agent_a_model is None:
+            cfg.agent_a_model = DEFAULT_HETERO_SMOKE_AGENT_A_MODEL
+        if agent_b_model is None:
+            cfg.agent_b_model = DEFAULT_HETERO_SMOKE_AGENT_B_MODEL
+    if agent_a_model is not None:
+        cfg.agent_a_model = str(agent_a_model)
+    if agent_b_model is not None:
+        cfg.agent_b_model = str(agent_b_model)
+
+
+def run_benchmark(
+    *,
+    suite_name: str,
+    dataset_name: str,
+    dataset_split: Optional[str],
+    limit: int,
+    repetitions: int,
+    samples_output_path: Path,
+    summary_output_path: Path,
+    report_output_path: Path,
+    max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
+    latent_steps_values: Optional[list[int]] = None,
+    agent_a_model: Optional[str] = None,
+    agent_b_model: Optional[str] = None,
+    latent_pooling: Optional[str] = None,
+    receiver_context_mode: Optional[str] = None,
+    receiver_context_latent_position: Optional[str] = None,
+    prompt_calibration_enabled: Optional[bool] = None,
+    prompt_calibration_strength: Optional[float] = None,
+    prompt_calibration_max_norm_ratio: Optional[float] = None,
+    handoff_adapter_enabled: Optional[bool] = None,
+    handoff_adapter_train_on_missing: Optional[bool] = None,
+    handoff_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
+    generated_trajectory_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_input_space: Optional[str] = None,
+    generated_trajectory_adapter_target_alignment: Optional[str] = None,
+    generated_trajectory_adapter_source_mode: Optional[str] = None,
+    generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
+    generated_trajectory_adapter_target_mode: Optional[str] = None,
+    generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
+    generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    embedding_manifold_enabled: Optional[bool] = None,
+    embedding_manifold_top_k: Optional[int] = None,
+    embedding_manifold_blend: Optional[float] = None,
+    seed: Optional[int] = None,
+    method_names: Optional[list[str]] = None,
+    sample_indices: Optional[list[int]] = None,
+    semantic_smoke: bool = False,
+    mvp_smoke: bool = False,
+    hetero_smoke: bool = False,
+    answer_only_final: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    base_cfg = _configured_base_cfg(
+        agent_a_model=agent_a_model,
+        agent_b_model=agent_b_model,
+        latent_pooling=latent_pooling,
+        receiver_context_mode=receiver_context_mode,
+        receiver_context_latent_position=receiver_context_latent_position,
+        prompt_calibration_enabled=prompt_calibration_enabled,
+        prompt_calibration_strength=prompt_calibration_strength,
+        prompt_calibration_max_norm_ratio=prompt_calibration_max_norm_ratio,
+        handoff_adapter_enabled=handoff_adapter_enabled,
+        handoff_adapter_train_on_missing=handoff_adapter_train_on_missing,
+        handoff_adapter_train_limit=handoff_adapter_train_limit,
+        generated_trajectory_adapter_enabled=generated_trajectory_adapter_enabled,
+        generated_trajectory_adapter_train_on_missing=generated_trajectory_adapter_train_on_missing,
+        generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
+        generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
+        generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
+        generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
+        generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
+        generated_trajectory_adapter_target_mode=generated_trajectory_adapter_target_mode,
+        generated_trajectory_adapter_local_residual_enabled=(
+            generated_trajectory_adapter_local_residual_enabled
+        ),
+        generated_trajectory_adapter_local_residual_top_k=(
+            generated_trajectory_adapter_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_blend=(
+            generated_trajectory_adapter_local_residual_blend
+        ),
+        generated_trajectory_adapter_local_residual_max_memory_rows=(
+            generated_trajectory_adapter_local_residual_max_memory_rows
+        ),
+        embedding_manifold_enabled=embedding_manifold_enabled,
+        embedding_manifold_top_k=embedding_manifold_top_k,
+        embedding_manifold_blend=embedding_manifold_blend,
+        seed=seed,
+        max_new_tokens=max_new_tokens,
+        reasoner_max_new_tokens=reasoner_max_new_tokens,
+        semantic_smoke=semantic_smoke,
+        mvp_smoke=mvp_smoke,
+        hetero_smoke=hetero_smoke,
+        answer_only_final=answer_only_final,
+    )
     semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
     if sample_indices is None and semantic_smoke_cfg is not None:
         sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
@@ -3220,6 +3569,8 @@ def run_benchmark(
                                 "sender_reasoning_token_count"
                             ),
                             "sender_reasoning_status": row_result.get("sender_reasoning_status"),
+                            "sender_trace_cache_hit": row_result.get("sender_trace_cache_hit"),
+                            "sender_trace_cache_path": row_result.get("sender_trace_cache_path"),
                             "sender_final_answer_marker": row_result.get(
                                 "sender_final_answer_marker"
                             ),
@@ -3263,6 +3614,15 @@ def run_benchmark(
                             ),
                             "handoff_adapter_training_row_cache_path": row_result.get(
                                 "handoff_adapter_training_row_cache_path"
+                            ),
+                            "handoff_adapter_training_trace_cache_hit_count": row_result.get(
+                                "handoff_adapter_training_trace_cache_hit_count"
+                            ),
+                            "handoff_adapter_training_trace_cache_miss_count": row_result.get(
+                                "handoff_adapter_training_trace_cache_miss_count"
+                            ),
+                            "handoff_adapter_training_trace_cache_hit_rate_percentage": row_result.get(
+                                "handoff_adapter_training_trace_cache_hit_rate_percentage"
                             ),
                             "handoff_adapter_training_reconstruction_mse": row_result.get(
                                 "handoff_adapter_training_reconstruction_mse"
@@ -3507,9 +3867,13 @@ def run_benchmark(
                     0,
                 )
             ),
+            "train_on_missing": _generated_trajectory_adapter_train_on_missing(base_cfg),
             "training_rows_cache_dir": str(
                 _generated_trajectory_adapter_training_rows_cache_dir(base_cfg)
             ),
+            "trace_cache_enabled": _generated_trajectory_adapter_trace_cache_enabled(base_cfg),
+            "trace_cache_dir": str(_generated_trajectory_adapter_trace_cache_dir(base_cfg)),
+            "progress_interval": _generated_trajectory_adapter_progress_interval(base_cfg),
             "source_mode": str(
                 getattr(
                     getattr(base_cfg.handoff, "generated_trajectory_adapter", None),
@@ -3570,6 +3934,153 @@ def run_benchmark(
     }
     write_json(report_output_path, report_payload)
     return sample_rows, summary_rows, report_payload
+
+
+def prepare_generated_trajectory_adapter_cache(
+    *,
+    suite_name: str,
+    report_output_path: Path,
+    max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
+    agent_a_model: Optional[str] = None,
+    agent_b_model: Optional[str] = None,
+    latent_pooling: Optional[str] = None,
+    receiver_context_mode: Optional[str] = None,
+    receiver_context_latent_position: Optional[str] = None,
+    prompt_calibration_enabled: Optional[bool] = None,
+    prompt_calibration_strength: Optional[float] = None,
+    prompt_calibration_max_norm_ratio: Optional[float] = None,
+    generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
+    generated_trajectory_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_input_space: Optional[str] = None,
+    generated_trajectory_adapter_target_alignment: Optional[str] = None,
+    generated_trajectory_adapter_source_mode: Optional[str] = None,
+    generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
+    generated_trajectory_adapter_target_mode: Optional[str] = None,
+    generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
+    generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    seed: Optional[int] = None,
+    method_names: Optional[list[str]] = None,
+    semantic_smoke: bool = False,
+    mvp_smoke: bool = False,
+    hetero_smoke: bool = False,
+    answer_only_final: bool = False,
+) -> dict[str, Any]:
+    base_cfg = _configured_base_cfg(
+        agent_a_model=agent_a_model,
+        agent_b_model=agent_b_model,
+        latent_pooling=latent_pooling,
+        receiver_context_mode=receiver_context_mode,
+        receiver_context_latent_position=receiver_context_latent_position,
+        prompt_calibration_enabled=prompt_calibration_enabled,
+        prompt_calibration_strength=prompt_calibration_strength,
+        prompt_calibration_max_norm_ratio=prompt_calibration_max_norm_ratio,
+        generated_trajectory_adapter_enabled=True,
+        generated_trajectory_adapter_train_on_missing=generated_trajectory_adapter_train_on_missing,
+        generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
+        generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
+        generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
+        generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
+        generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
+        generated_trajectory_adapter_target_mode=generated_trajectory_adapter_target_mode,
+        generated_trajectory_adapter_local_residual_enabled=(
+            generated_trajectory_adapter_local_residual_enabled
+        ),
+        generated_trajectory_adapter_local_residual_top_k=(
+            generated_trajectory_adapter_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_blend=(
+            generated_trajectory_adapter_local_residual_blend
+        ),
+        generated_trajectory_adapter_local_residual_max_memory_rows=(
+            generated_trajectory_adapter_local_residual_max_memory_rows
+        ),
+        seed=seed,
+        max_new_tokens=max_new_tokens,
+        reasoner_max_new_tokens=reasoner_max_new_tokens,
+        semantic_smoke=semantic_smoke,
+        mvp_smoke=mvp_smoke,
+        hetero_smoke=hetero_smoke,
+        answer_only_final=answer_only_final,
+    )
+    suite_cfg = _suite_cfg(base_cfg, suite_name)
+    state = _get_pipeline_state(suite_cfg)
+    variant_cfg, variant_state = _alignment_variant_state(
+        suite_cfg,
+        state,
+        strategy="hybrid_affine",
+        prompt_calibration_enabled=False,
+    )
+    alignment_state = _generated_adapter_alignment_state_from_variant_state(variant_state)
+    prepared_adapters: list[dict[str, Any]] = []
+    for include_prompt in _generated_adapter_include_prompt_values(method_names):
+        info = _load_or_train_generated_trajectory_adapter_state(
+            variant_cfg,
+            variant_state,
+            alignment_state,
+            include_prompt=include_prompt,
+        )
+        prepared_adapters.append(
+            {
+                "include_prompt": bool(include_prompt),
+                "enabled": bool(info.get("enabled", False)),
+                "status": info.get("status"),
+                "cache_hit": info.get("cache_hit"),
+                "cache_path": info.get("cache_path"),
+                "training_prompt_count": info.get("training_prompt_count"),
+                "training_token_count": info.get("training_token_count"),
+                "training_row_cache_hit": info.get("training_row_cache_hit"),
+                "training_row_cache_path": info.get("training_row_cache_path"),
+                "training_trace_cache_hit_count": info.get(
+                    "training_trace_cache_hit_count"
+                ),
+                "training_trace_cache_miss_count": info.get(
+                    "training_trace_cache_miss_count"
+                ),
+                "training_trace_cache_hit_rate_percentage": info.get(
+                    "training_trace_cache_hit_rate_percentage"
+                ),
+                "training_reconstruction_mse": info.get("training_reconstruction_mse"),
+                "training_mean_cosine_similarity": info.get(
+                    "training_mean_cosine_similarity"
+                ),
+            }
+        )
+    report_payload = {
+        "suite": suite_name,
+        "methods": list(method_names or ("generated_latent_handoff",)),
+        "agent_a_model": str(suite_cfg.agent_a_model),
+        "agent_b_model": str(suite_cfg.agent_b_model),
+        "answer_only_final": _answer_only_final_enabled(base_cfg),
+        "reasoner_max_new_tokens": _reasoner_generation_max_new_tokens(base_cfg),
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "generated_trajectory_adapter": {
+            "enabled": _generated_trajectory_adapter_enabled(base_cfg),
+            "train_on_missing": _generated_trajectory_adapter_train_on_missing(base_cfg),
+            "train_limit": _generated_trajectory_adapter_train_limit(base_cfg),
+            "cache_dir": str(_generated_trajectory_adapter_cache_dir(base_cfg)),
+            "training_rows_cache_dir": str(
+                _generated_trajectory_adapter_training_rows_cache_dir(base_cfg)
+            ),
+            "trace_cache_enabled": _generated_trajectory_adapter_trace_cache_enabled(base_cfg),
+            "trace_cache_dir": str(_generated_trajectory_adapter_trace_cache_dir(base_cfg)),
+            "source_mode": _generated_trajectory_adapter_source_mode(base_cfg),
+            "input_space": _generated_trajectory_adapter_input_space(base_cfg),
+            "target_mode": _generated_trajectory_adapter_target_mode(base_cfg),
+            "target_alignment": _generated_trajectory_adapter_target_alignment(base_cfg),
+            "local_residual": {
+                "enabled": _generated_trajectory_adapter_local_residual_enabled(base_cfg),
+                "top_k": _generated_trajectory_adapter_local_residual_top_k(base_cfg),
+                "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
+                "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
+            },
+        },
+        "prepared_adapters": prepared_adapters,
+    }
+    write_json(report_output_path, report_payload)
+    return report_payload
 
 
 def main() -> None:
@@ -3729,6 +4240,16 @@ def main() -> None:
         help="Disable the generated-trajectory adapter for this benchmark run.",
     )
     parser.add_argument(
+        "--generated-trajectory-adapter-no-train-on-missing",
+        action="store_true",
+        help="Require a prebuilt generated-trajectory adapter cache instead of fitting one.",
+    )
+    parser.add_argument(
+        "--prepare-generated-trajectory-adapter",
+        action="store_true",
+        help="Fit/load generated-trajectory adapter caches and exit before benchmark decoding.",
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-train-limit",
         type=int,
         default=None,
@@ -3883,6 +4404,8 @@ def main() -> None:
             args.methods = ",".join(default_methods)
         if args.receiver_context_mode is None:
             args.receiver_context_mode = "prompt_prefix"
+    if args.prepare_generated_trajectory_adapter and not args.methods:
+        args.methods = "generated_latent_handoff"
     if args.limit is None:
         args.limit = DEFAULT_LIMIT
 
@@ -3898,6 +4421,14 @@ def main() -> None:
     )
     selected_method_set = set(method_names or ())
     uses_generated_latent = any(method in GENERATED_LATENT_METHODS for method in selected_method_set)
+    if args.prepare_generated_trajectory_adapter and uses_generated_latent:
+        if not args.disable_generated_trajectory_adapter:
+            args.enable_generated_trajectory_adapter = True
+        if (
+            args.generated_trajectory_adapter_input_space == "raw"
+            and not args.disable_generated_trajectory_local_residual
+        ):
+            args.enable_generated_trajectory_local_residual = True
     if (args.semantic_smoke or args.mvp_smoke or args.hetero_smoke) and uses_generated_latent:
         if not args.disable_generated_trajectory_adapter:
             args.enable_generated_trajectory_adapter = True
@@ -3936,6 +4467,70 @@ def main() -> None:
         else None
     )
 
+    if args.prepare_generated_trajectory_adapter:
+        report_payload = prepare_generated_trajectory_adapter_cache(
+            suite_name=args.suite,
+            report_output_path=args.report_output,
+            max_new_tokens=args.max_new_tokens,
+            reasoner_max_new_tokens=args.reasoner_max_new_tokens,
+            agent_a_model=args.agent_a_model,
+            agent_b_model=args.agent_b_model,
+            latent_pooling=args.latent_pooling,
+            receiver_context_mode=args.receiver_context_mode,
+            receiver_context_latent_position=args.receiver_context_latent_position,
+            prompt_calibration_enabled=False if args.disable_prompt_calibration else None,
+            prompt_calibration_strength=args.prompt_calibration_strength,
+            prompt_calibration_max_norm_ratio=args.prompt_calibration_max_norm_ratio,
+            generated_trajectory_adapter_train_on_missing=(
+                False
+                if args.generated_trajectory_adapter_no_train_on_missing
+                else None
+            ),
+            generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
+            generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
+            generated_trajectory_adapter_target_alignment=(
+                args.generated_trajectory_adapter_target_alignment
+            ),
+            generated_trajectory_adapter_source_mode=args.generated_trajectory_adapter_source_mode,
+            generated_trajectory_adapter_source_tail_tokens=(
+                args.generated_trajectory_adapter_source_tail_tokens
+            ),
+            generated_trajectory_adapter_target_mode=args.generated_trajectory_adapter_target_mode,
+            generated_trajectory_adapter_local_residual_enabled=(
+                False
+                if args.disable_generated_trajectory_local_residual
+                else True
+                if args.enable_generated_trajectory_local_residual
+                else None
+            ),
+            generated_trajectory_adapter_local_residual_top_k=(
+                args.generated_trajectory_local_residual_top_k
+            ),
+            generated_trajectory_adapter_local_residual_blend=(
+                args.generated_trajectory_local_residual_blend
+            ),
+            generated_trajectory_adapter_local_residual_max_memory_rows=(
+                args.generated_trajectory_local_residual_max_memory_rows
+            ),
+            seed=args.seed,
+            method_names=method_names,
+            semantic_smoke=args.semantic_smoke,
+            mvp_smoke=args.mvp_smoke,
+            hetero_smoke=args.hetero_smoke,
+            answer_only_final=args.answer_only_final,
+        )
+        print(f"Wrote generated trajectory adapter prepare report to {args.report_output}")
+        for prepared in report_payload["prepared_adapters"]:
+            print(
+                "Prepared generated trajectory adapter "
+                f"include_prompt={prepared['include_prompt']} "
+                f"status={prepared['status']} "
+                f"adapter_cache_hit={prepared['cache_hit']} "
+                f"row_cache_hit={prepared['training_row_cache_hit']} "
+                f"trace_hit_rate={prepared['training_trace_cache_hit_rate_percentage']}"
+            )
+        return
+
     _, summary_rows, report_payload = run_benchmark(
         suite_name=args.suite,
         dataset_name=args.dataset,
@@ -3971,6 +4566,9 @@ def main() -> None:
             else True
             if args.enable_generated_trajectory_adapter
             else None
+        ),
+        generated_trajectory_adapter_train_on_missing=(
+            False if args.generated_trajectory_adapter_no_train_on_missing else None
         ),
         generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
         generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
