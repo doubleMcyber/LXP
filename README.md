@@ -26,7 +26,7 @@ Direct raw-space generated adapters can be tested with:
 venv/bin/python benchmark_all.py --hetero-smoke --generated-trajectory-adapter-input-space raw
 ```
 
-For raw generated input space, the CLI enables a bounded top-k local residual adapter by default. The adapter fits a global trajectory map, stores a capped residual memory, and applies nearest-neighbor residual correction before receiver embedding-manifold projection. Prompt-only raw latent methods remain diagnostic for semantic-answer tasks; the current production MVP path is generated sender hidden trajectories with either aligned or local-residual raw generated-trajectory adapters.
+For raw generated input space, the CLI enables a bounded top-k local residual adapter by default. The adapter fits a global trajectory map, stores a capped residual memory, and applies nearest-neighbor residual correction before receiver embedding-manifold projection. Generated trajectory source/target training rows are cached separately in `.cache/generated_trajectory_rows`, so residual and adapter hyperparameter sweeps can reuse the expensive sender/receiver trace collection. Prompt-only raw latent methods remain diagnostic for semantic-answer tasks; the current production MVP path is generated sender hidden trajectories with either aligned or local-residual raw generated-trajectory adapters.
 
 ## Latent Blame
 

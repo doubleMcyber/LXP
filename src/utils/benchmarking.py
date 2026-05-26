@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 13
+REPORT_SCHEMA_VERSION = 14
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -76,6 +76,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "handoff_adapter_cache_path",
     "handoff_adapter_training_prompt_count",
     "handoff_adapter_training_token_count",
+    "handoff_adapter_training_row_cache_hit",
+    "handoff_adapter_training_row_cache_path",
     "handoff_adapter_training_reconstruction_mse",
     "handoff_adapter_training_mean_cosine_similarity",
     "generated_adapter_local_residual_applied",
@@ -153,6 +155,7 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "mean_prompt_calibration_bias_norm",
     "handoff_adapter_rate_percentage",
     "handoff_adapter_cache_hit_rate_percentage",
+    "handoff_adapter_training_row_cache_hit_rate_percentage",
     "mean_handoff_adapter_delta_norm",
     "mean_handoff_adapter_training_reconstruction_mse",
     "mean_handoff_adapter_training_mean_cosine_similarity",
@@ -380,6 +383,12 @@ def aggregate_standard_rows(
             for row in group_rows
             if row.get("handoff_adapter_cache_hit") is not None and row.get("handoff_adapter_cache_hit") != ""
         ]
+        handoff_adapter_training_row_cache_rows = [
+            bool(row["handoff_adapter_training_row_cache_hit"])
+            for row in group_rows
+            if row.get("handoff_adapter_training_row_cache_hit") is not None
+            and row.get("handoff_adapter_training_row_cache_hit") != ""
+        ]
         generated_adapter_local_residual_rows = [
             bool(row["generated_adapter_local_residual_applied"])
             for row in group_rows
@@ -483,6 +492,13 @@ def aggregate_standard_rows(
                     100.0 * sum(1 for item in handoff_adapter_cache_rows if item)
                     / len(handoff_adapter_cache_rows)
                     if handoff_adapter_cache_rows
+                    else None
+                ),
+                "handoff_adapter_training_row_cache_hit_rate_percentage": (
+                    100.0
+                    * sum(1 for item in handoff_adapter_training_row_cache_rows if item)
+                    / len(handoff_adapter_training_row_cache_rows)
+                    if handoff_adapter_training_row_cache_rows
                     else None
                 ),
                 "mean_handoff_adapter_delta_norm": _mean_or_none(group_rows, "handoff_adapter_delta_norm"),

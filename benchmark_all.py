@@ -826,6 +826,12 @@ def _generated_trajectory_adapter_cache_dir(cfg: Any) -> Path:
     return Path(str(getattr(adapter_cfg, "cache_dir", ".cache/generated_trajectory_adapter")))
 
 
+def _generated_trajectory_adapter_training_rows_cache_dir(cfg: Any) -> Path:
+    adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
+    default_dir = _generated_trajectory_adapter_cache_dir(cfg).parent / "generated_trajectory_rows"
+    return Path(str(getattr(adapter_cfg, "training_rows_cache_dir", default_dir)))
+
+
 def _generated_trajectory_adapter_dataset_name(cfg: Any) -> str:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     fallback = getattr(getattr(getattr(cfg, "handoff", None), "adapter", None), "dataset_name", "gsm8k")
@@ -853,6 +859,18 @@ def _generated_trajectory_adapter_cache_path(cfg: Any, cache_key: tuple[Any, ...
     return cache_dir / f"generated_trajectory_adapter_{digest}.pt"
 
 
+def _generated_trajectory_adapter_training_rows_cache_path(
+    cfg: Any,
+    cache_key: tuple[Any, ...],
+) -> Path:
+    cache_dir = _generated_trajectory_adapter_training_rows_cache_dir(cfg)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps(cache_key, sort_keys=False, default=list).encode("utf-8")
+    ).hexdigest()
+    return cache_dir / f"generated_trajectory_rows_{digest}.pt"
+
+
 def _load_generated_trajectory_adapter_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
     if not cache_path.is_file():
         return None
@@ -865,6 +883,26 @@ def _load_generated_trajectory_adapter_from_disk(cache_path: Path) -> Optional[d
     return cached_state
 
 
+def _load_generated_trajectory_training_rows_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
+    if not cache_path.is_file():
+        return None
+    try:
+        cached_rows = torch.load(cache_path, map_location="cpu")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(cached_rows, dict):
+        return None
+    source_matrix = cached_rows.get("source_matrix")
+    target_matrix = cached_rows.get("target_matrix")
+    if not isinstance(source_matrix, torch.Tensor) or not isinstance(target_matrix, torch.Tensor):
+        return None
+    if source_matrix.dim() != 2 or target_matrix.dim() != 2:
+        return None
+    if int(source_matrix.shape[0]) == 0 or int(source_matrix.shape[0]) != int(target_matrix.shape[0]):
+        return None
+    return cached_rows
+
+
 def _generated_trajectory_adapter_cache_key(
     cfg: Any,
     state: dict[str, Any],
@@ -873,7 +911,7 @@ def _generated_trajectory_adapter_cache_key(
 ) -> tuple[Any, ...]:
     local_residual_enabled = _generated_trajectory_adapter_local_residual_enabled(cfg)
     base_key: tuple[Any, ...] = (
-        "generated_trajectory_adapter_v2" if local_residual_enabled else "generated_trajectory_adapter_v1",
+        "generated_trajectory_adapter_v3" if local_residual_enabled else "generated_trajectory_adapter_v1",
         str(cfg.agent_a_model),
         str(cfg.agent_b_model),
         str(cfg.torch_dtype),
@@ -905,6 +943,32 @@ def _generated_trajectory_adapter_cache_key(
         _generated_trajectory_adapter_local_residual_temperature(cfg),
         _generated_trajectory_adapter_local_residual_blend(cfg),
         _generated_trajectory_adapter_local_residual_max_rows(cfg),
+    )
+
+
+def _generated_trajectory_adapter_training_rows_cache_key(
+    cfg: Any,
+    state: dict[str, Any],
+    *,
+    include_prompt: bool,
+) -> tuple[Any, ...]:
+    return (
+        "generated_trajectory_training_rows_v1",
+        str(cfg.agent_a_model),
+        str(cfg.agent_b_model),
+        str(cfg.torch_dtype),
+        state.get("global_alignment_cache_key"),
+        int(_reasoner_generation_max_new_tokens(cfg)),
+        bool(_answer_only_final_enabled(cfg)),
+        bool(include_prompt),
+        _generated_trajectory_adapter_dataset_name(cfg),
+        _generated_trajectory_adapter_train_split(cfg),
+        _generated_trajectory_adapter_train_limit(cfg),
+        _generated_trajectory_adapter_source_mode(cfg),
+        _generated_trajectory_adapter_source_tail_tokens(cfg),
+        _generated_trajectory_adapter_target_mode(cfg),
+        _generated_trajectory_adapter_target_alignment(cfg),
+        _generated_trajectory_adapter_input_space(cfg),
     )
 
 
@@ -1087,12 +1151,34 @@ def _select_generated_adapter_memory_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if max_rows <= 0 or int(source_matrix.shape[0]) <= max_rows:
         return source_matrix.detach().cpu(), residual_matrix.detach().cpu()
-    indices = torch.linspace(
+    row_count = int(source_matrix.shape[0])
+    hard_row_count = max(1, max_rows // 2)
+    residual_norms = torch.linalg.vector_norm(residual_matrix.float(), dim=-1)
+    hard_indices = torch.topk(
+        residual_norms,
+        k=min(hard_row_count, row_count),
+        largest=True,
+    ).indices
+    coverage_indices = torch.linspace(
         0,
-        int(source_matrix.shape[0]) - 1,
+        row_count - 1,
         steps=max_rows,
         dtype=torch.long,
     )
+    selected: list[int] = []
+    seen: set[int] = set()
+    for index_tensor in (hard_indices, coverage_indices):
+        for raw_index in index_tensor.detach().cpu().tolist():
+            index = int(raw_index)
+            if index in seen:
+                continue
+            seen.add(index)
+            selected.append(index)
+            if len(selected) == max_rows:
+                break
+        if len(selected) == max_rows:
+            break
+    indices = torch.tensor(selected, dtype=torch.long)
     return (
         source_matrix.index_select(0, indices).detach().cpu(),
         residual_matrix.index_select(0, indices).detach().cpu(),
@@ -1197,7 +1283,7 @@ def _apply_generated_adapter_local_residual(
     }
 
 
-def _fit_generated_trajectory_adapter_state(
+def _build_generated_trajectory_training_rows(
     cfg: Any,
     state: dict[str, Any],
     alignment_state: dict[str, Any],
@@ -1258,6 +1344,66 @@ def _fit_generated_trajectory_adapter_state(
         raise ValueError("No usable generated trajectories were available for adapter fitting")
     source_matrix = torch.cat(source_rows, dim=0)
     target_matrix = torch.cat(target_rows, dim=0)
+    return {
+        "source_matrix": source_matrix,
+        "target_matrix": target_matrix,
+        "training_prompt_count": int(prompt_count),
+        "training_token_count": int(token_count),
+    }
+
+
+def _load_or_build_generated_trajectory_training_rows(
+    cfg: Any,
+    state: dict[str, Any],
+    alignment_state: dict[str, Any],
+    *,
+    include_prompt: bool,
+) -> dict[str, Any]:
+    memory_cache = state.setdefault("_generated_trajectory_training_rows_cache", {})
+    cache_key = _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=include_prompt,
+    )
+    cached_rows = memory_cache.get(cache_key)
+    if cached_rows is not None:
+        return {**cached_rows, "training_row_cache_hit": True}
+
+    cache_path = _generated_trajectory_adapter_training_rows_cache_path(cfg, cache_key)
+    cached_rows = _load_generated_trajectory_training_rows_from_disk(cache_path)
+    cache_hit = cached_rows is not None
+    if cached_rows is None:
+        cached_rows = _build_generated_trajectory_training_rows(
+            cfg,
+            state,
+            alignment_state,
+            include_prompt=include_prompt,
+        )
+        torch.save(cached_rows, cache_path)
+    info = {
+        **cached_rows,
+        "training_row_cache_hit": cache_hit,
+        "training_row_cache_path": str(cache_path),
+    }
+    memory_cache[cache_key] = info
+    return info
+
+
+def _fit_generated_trajectory_adapter_state(
+    cfg: Any,
+    state: dict[str, Any],
+    alignment_state: dict[str, Any],
+    *,
+    include_prompt: bool,
+) -> dict[str, Any]:
+    training_rows = _load_or_build_generated_trajectory_training_rows(
+        cfg,
+        state,
+        alignment_state,
+        include_prompt=include_prompt,
+    )
+    source_matrix = training_rows["source_matrix"]
+    target_matrix = training_rows["target_matrix"]
     adapter_state = compute_alignment_state(
         source_matrix,
         target_matrix,
@@ -1290,8 +1436,10 @@ def _fit_generated_trajectory_adapter_state(
         "adapter_type": "generated_trajectory_handoff",
         "input_space": _generated_trajectory_adapter_input_space(cfg),
         "local_residual_state": local_residual_state,
-        "training_prompt_count": int(prompt_count),
-        "training_token_count": int(token_count),
+        "training_prompt_count": int(training_rows["training_prompt_count"]),
+        "training_token_count": int(training_rows["training_token_count"]),
+        "training_row_cache_hit": bool(training_rows.get("training_row_cache_hit", False)),
+        "training_row_cache_path": str(training_rows.get("training_row_cache_path", "")),
         "training_reconstruction_mse": float(mse.item()),
         "training_mean_cosine_similarity": float(cosine.item()),
     }
@@ -1345,6 +1493,8 @@ def _load_or_train_generated_trajectory_adapter_state(
             "state": adapter_state,
             "training_prompt_count": adapter_state.get("training_prompt_count"),
             "training_token_count": adapter_state.get("training_token_count"),
+            "training_row_cache_hit": adapter_state.get("training_row_cache_hit"),
+            "training_row_cache_path": adapter_state.get("training_row_cache_path"),
             "training_reconstruction_mse": adapter_state.get("training_reconstruction_mse"),
             "training_mean_cosine_similarity": adapter_state.get(
                 "training_mean_cosine_similarity"
@@ -2320,6 +2470,16 @@ def _run_generated_latent_variant(
         )
         if not generated_adapter_report
         else generated_adapter_info.get("training_token_count"),
+        "handoff_adapter_training_row_cache_hit": variant_state.get(
+            "handoff_adapter_training_row_cache_hit"
+        )
+        if not generated_adapter_report
+        else generated_adapter_info.get("training_row_cache_hit"),
+        "handoff_adapter_training_row_cache_path": variant_state.get(
+            "handoff_adapter_training_row_cache_path"
+        )
+        if not generated_adapter_report
+        else generated_adapter_info.get("training_row_cache_path"),
         "handoff_adapter_training_reconstruction_mse": variant_state.get(
             "handoff_adapter_training_reconstruction_mse"
         )
@@ -3098,6 +3258,12 @@ def run_benchmark(
                             "handoff_adapter_training_token_count": row_result.get(
                                 "handoff_adapter_training_token_count"
                             ),
+                            "handoff_adapter_training_row_cache_hit": row_result.get(
+                                "handoff_adapter_training_row_cache_hit"
+                            ),
+                            "handoff_adapter_training_row_cache_path": row_result.get(
+                                "handoff_adapter_training_row_cache_path"
+                            ),
                             "handoff_adapter_training_reconstruction_mse": row_result.get(
                                 "handoff_adapter_training_reconstruction_mse"
                             ),
@@ -3340,6 +3506,9 @@ def run_benchmark(
                     "train_limit",
                     0,
                 )
+            ),
+            "training_rows_cache_dir": str(
+                _generated_trajectory_adapter_training_rows_cache_dir(base_cfg)
             ),
             "source_mode": str(
                 getattr(

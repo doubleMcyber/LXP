@@ -18,9 +18,12 @@ from benchmark_all import (
     _answers_match,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
+    _generated_trajectory_adapter_training_rows_cache_key,
     _handoff_decode_prompt,
+    _load_generated_trajectory_training_rows_from_disk,
     _methods_for_suite,
     _predicted_answer,
+    _select_generated_adapter_memory_rows,
 )
 from src.utils.benchmarking import (
     REPORT_SCHEMA_VERSION,
@@ -584,6 +587,100 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
     cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
     with pytest.raises(ValueError, match="generated_text"):
         _generated_trajectory_adapter_target_alignment(cfg)
+
+
+def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "a",
+            "agent_b_model": "b",
+            "torch_dtype": "bfloat16",
+            "max_new_tokens": 64,
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 128,
+            },
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "dataset_name": "gsm8k",
+                    "train_split": "train",
+                    "train_limit": 8,
+                    "input_space": "raw",
+                    "source_mode": "generated_text",
+                    "source_tail_tokens": 32,
+                    "target_mode": "generated_text",
+                    "target_alignment": "character",
+                    "strategy": "hybrid_affine",
+                    "local_residual": {
+                        "enabled": False,
+                        "top_k": 8,
+                        "temperature": 0.05,
+                        "blend": 1.0,
+                        "max_memory_rows": 4096,
+                    },
+                }
+            },
+        }
+    )
+    state = {"global_alignment_cache_key": ("alignment", 1)}
+
+    first_key = _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    )
+    cfg.handoff.generated_trajectory_adapter.strategy = "ridge"
+    cfg.handoff.generated_trajectory_adapter.local_residual.enabled = True
+    cfg.handoff.generated_trajectory_adapter.local_residual.top_k = 16
+    assert _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    ) == first_key
+
+    cfg.handoff.generated_trajectory_adapter.source_mode = "final_answer_tail"
+    assert _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    ) != first_key
+
+
+def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) -> None:
+    cache_path = tmp_path / "rows.pt"
+    torch.save(
+        {
+            "source_matrix": torch.zeros(2, 3),
+            "target_matrix": torch.ones(2, 4),
+            "training_prompt_count": 1,
+            "training_token_count": 2,
+        },
+        cache_path,
+    )
+
+    loaded = _load_generated_trajectory_training_rows_from_disk(cache_path)
+
+    assert loaded is not None
+    assert loaded["source_matrix"].shape == (2, 3)
+
+    torch.save({"source_matrix": torch.zeros(2, 3), "target_matrix": torch.ones(3, 4)}, cache_path)
+    assert _load_generated_trajectory_training_rows_from_disk(cache_path) is None
+
+
+def test_generated_trajectory_residual_memory_keeps_hard_rows_and_coverage() -> None:
+    source = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+    residual = torch.zeros(10, 2)
+    residual[5] = torch.tensor([100.0, 0.0])
+
+    source_memory, residual_memory = _select_generated_adapter_memory_rows(
+        source,
+        residual,
+        max_rows=4,
+    )
+
+    assert int(source_memory.shape[0]) == 4
+    assert any(torch.allclose(row, source[5]) for row in source_memory)
+    assert torch.linalg.vector_norm(residual_memory, dim=-1).max().item() == 100.0
 
 
 def test_generated_trajectory_local_residual_corrects_nearest_training_error() -> None:
