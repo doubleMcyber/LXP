@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 17
+REPORT_SCHEMA_VERSION = 18
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -51,6 +51,10 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "sender_reasoning_status",
     "sender_trace_cache_hit",
     "sender_trace_cache_path",
+    "sender_revision_enabled",
+    "sender_revision_applied",
+    "sender_initial_predicted_answer",
+    "sender_revision_predicted_answer",
     "sender_final_answer_marker",
     "sender_predicted_answer",
     "sender_answer_matches_target",
@@ -141,6 +145,7 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "sender_answer_extraction_rate_percentage",
     "sender_final_answer_marker_rate_percentage",
     "sender_trace_cache_hit_rate_percentage",
+    "sender_revision_applied_rate_percentage",
     "sender_accuracy_percentage",
     "sender_correct_sample_count",
     "accuracy_when_sender_correct_percentage",
@@ -347,6 +352,15 @@ def aggregate_standard_rows(
         sender_trace_cache_values = [
             value for value in sender_trace_cache_rows if value is not None
         ]
+        sender_revision_rows = [
+            _optional_bool_value(row.get("sender_revision_applied"))
+            for row in group_rows
+            if row.get("sender_revision_applied") is not None
+            and row.get("sender_revision_applied") != ""
+        ]
+        sender_revision_values = [
+            value for value in sender_revision_rows if value is not None
+        ]
         sender_correct_values = [
             value
             for value in (
@@ -468,6 +482,10 @@ def aggregate_standard_rows(
                 "sender_trace_cache_hit_rate_percentage": _percentage(
                     sum(sender_trace_cache_values),
                     len(sender_trace_cache_values),
+                ),
+                "sender_revision_applied_rate_percentage": _percentage(
+                    sum(sender_revision_values),
+                    len(sender_revision_values),
                 ),
                 "sender_accuracy_percentage": _percentage(
                     sum(sender_correct_values),

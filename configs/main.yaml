@@ -17,6 +17,9 @@ datasets:
 benchmark:
   answer_only_final: false
   text_hybrid_reasoning_max_new_tokens: 64
+  sender_revision:
+    enabled: false
+    max_new_tokens: 256
   latent_steps_sweep: [1, 2, 4, 8, 16, 32, 64]
   q_generalization:
     heldout_anchor_ratio: 0.2

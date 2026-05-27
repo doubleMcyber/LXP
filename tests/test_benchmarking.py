@@ -29,6 +29,7 @@ from benchmark_all import (
     _predicted_answer,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
     _select_generated_adapter_memory_rows,
+    _sender_generation_cache_fingerprint,
 )
 from src.utils.benchmarking import (
     REPORT_SCHEMA_VERSION,
@@ -133,6 +134,10 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "sender_reasoning_status": "complete",
             "sender_trace_cache_hit": True,
             "sender_trace_cache_path": ".cache/trace-a.pt",
+            "sender_revision_enabled": True,
+            "sender_revision_applied": True,
+            "sender_initial_predicted_answer": "0",
+            "sender_revision_predicted_answer": "1",
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "1",
             "sender_answer_matches_target": True,
@@ -177,6 +182,10 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "sender_reasoning_status": "complete",
             "sender_trace_cache_hit": False,
             "sender_trace_cache_path": ".cache/trace-b.pt",
+            "sender_revision_enabled": True,
+            "sender_revision_applied": False,
+            "sender_initial_predicted_answer": "2",
+            "sender_revision_predicted_answer": None,
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "2",
             "sender_answer_matches_target": True,
@@ -214,6 +223,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
     assert summary["accuracy_percentage"] == 50.0
     assert summary["sender_final_answer_marker_rate_percentage"] == 100.0
     assert summary["sender_trace_cache_hit_rate_percentage"] == 50.0
+    assert summary["sender_revision_applied_rate_percentage"] == 50.0
     assert summary["sender_accuracy_percentage"] == 100.0
     assert summary["sender_correct_sample_count"] == 2
     assert summary["accuracy_when_sender_correct_percentage"] == 50.0
@@ -610,6 +620,16 @@ def test_gsm8k_prediction_prefers_final_answer_marker() -> None:
     assert _predicted_answer("gsm8k", decoded) == "42"
 
 
+def test_gsm8k_prediction_uses_latest_final_answer_marker() -> None:
+    decoded = (
+        "Draft solution says Final answer: 108.\n\n"
+        "Verification finds the copied relationship was off.\n"
+        "Final answer: 107."
+    )
+
+    assert _predicted_answer("gsm8k", decoded) == "107"
+
+
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
     assert _answers_match("gsm8k", "252.00", "252")
     assert _answers_match("gsm8k", "9,800.0", "9800")
@@ -690,6 +710,17 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
         state,
         include_prompt=False,
     )
+    cfg.benchmark.sender_revision = {
+        "enabled": True,
+        "max_new_tokens": 256,
+    }
+    assert _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    ) != first_key
+    cfg.benchmark.sender_revision.enabled = False
+
     cfg.handoff.generated_trajectory_adapter.strategy = "ridge"
     cfg.handoff.generated_trajectory_adapter.local_residual.enabled = True
     cfg.handoff.generated_trajectory_adapter.local_residual.top_k = 16
@@ -758,6 +789,23 @@ def test_generated_trajectory_trace_cache_key_tracks_prompt_and_sender_setup() -
         "How many?",
         include_prompt=False,
     )
+    first_generation_fingerprint = _sender_generation_cache_fingerprint(cfg)
+    cfg.benchmark.sender_revision = {
+        "enabled": True,
+        "max_new_tokens": 256,
+    }
+    assert _sender_generation_cache_fingerprint(cfg) != first_generation_fingerprint
+    assert (
+        _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            "How many?",
+            include_prompt=False,
+        )
+        != first_key
+    )
+    cfg.benchmark.sender_revision.enabled = False
+
     cfg.handoff.generated_trajectory_adapter.strategy = "ridge"
     cfg.handoff.generated_trajectory_adapter.local_residual.enabled = True
     assert (

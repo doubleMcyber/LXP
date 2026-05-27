@@ -220,6 +220,27 @@ def _answer_only_final_enabled(cfg: Any) -> bool:
     return bool(getattr(_benchmark_cfg(cfg), "answer_only_final", False))
 
 
+def _sender_revision_cfg(cfg: Any) -> Any:
+    return getattr(_benchmark_cfg(cfg), "sender_revision", None)
+
+
+def _sender_revision_enabled(cfg: Any) -> bool:
+    return bool(getattr(_sender_revision_cfg(cfg), "enabled", False))
+
+
+def _sender_revision_max_new_tokens(cfg: Any) -> int:
+    return max(1, int(getattr(_sender_revision_cfg(cfg), "max_new_tokens", 256)))
+
+
+def _sender_generation_cache_fingerprint(cfg: Any) -> tuple[Any, ...]:
+    return (
+        "sender_generation_v3",
+        bool(_answer_only_final_enabled(cfg)),
+        bool(_sender_revision_enabled(cfg)),
+        int(_sender_revision_max_new_tokens(cfg)),
+    )
+
+
 def _final_answer_instruction(cfg: Any) -> str:
     if _answer_only_final_enabled(cfg):
         return (
@@ -234,6 +255,23 @@ def _format_reasoner_cot_prompt(prompt: str, tokenizer: Any = None) -> str:
         f"{prompt}\n\n"
         "Solve carefully with compact arithmetic. Track quantities in chronological order. "
         "Write only essential equations, then end with exactly: Final answer: <answer>."
+    )
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_reasoner_revision_prompt(
+    prompt: str,
+    initial_reasoning_text: str,
+    tokenizer: Any = None,
+) -> str:
+    del initial_reasoning_text
+    user_message = (
+        f"{prompt}\n\n"
+        "Solve again from scratch. First copy every numeric quantity and relationship "
+        "from the problem exactly as written, especially phrases like 'less than', "
+        "'more than', and 'times'. Then translate those copied relationships into "
+        "equations and check each arithmetic operation. Write only the copied facts "
+        "and essential equations, then end with exactly: Final answer: <answer>."
     )
     return _maybe_apply_chat_template(tokenizer, user_message)
 
@@ -312,18 +350,25 @@ def _trim_generated_ids_to_final_answer(tokenizer: Any, token_ids: Sequence[int]
     return trimmed
 
 
-def _generate_reasoner_token_ids(prompt: str, cfg: Any, state: dict[str, Any]) -> list[int]:
+def _final_answer_marker_value(text: str) -> Optional[str]:
+    marker_match = FINAL_ANSWER_MARKER_REGEX.search(str(text))
+    if marker_match is None:
+        return None
+    return marker_match.group(1).strip()
+
+
+def _generate_agent_a_token_ids(
+    formatted_prompt: str,
+    cfg: Any,
+    state: dict[str, Any],
+    *,
+    max_new_tokens: int,
+) -> list[int]:
     tokenizer_a = state["tokenizer_a"]
     agent_a = state["agent_a"]
     agent_a_device = next(agent_a.parameters()).device
-    max_new_tokens = _reasoner_generation_max_new_tokens(cfg)
-    cache = state.setdefault("_reasoner_token_ids_cache", {})
-    cache_key = (str(prompt), int(max_new_tokens), bool(_answer_only_final_enabled(cfg)))
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return list(cached)
     encoded = tokenizer_a(
-        _format_reasoner_cot_prompt(prompt, tokenizer_a),
+        formatted_prompt,
         return_tensors="pt",
         add_special_tokens=False,
     )
@@ -352,9 +397,88 @@ def _generate_reasoner_token_ids(prompt: str, cfg: Any, state: dict[str, Any]) -
         if original_forward is not None:
             agent_a.forward = latent_forward
     generated_ids = generated[0, input_ids.shape[1] :].detach().cpu().tolist()
-    trimmed_ids = _trim_generated_ids_to_final_answer(tokenizer_a, generated_ids)
-    cache[cache_key] = tuple(trimmed_ids)
-    return trimmed_ids
+    return _trim_generated_ids_to_final_answer(tokenizer_a, generated_ids)
+
+
+def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) -> dict[str, Any]:
+    tokenizer_a = state["tokenizer_a"]
+    max_new_tokens = _reasoner_generation_max_new_tokens(cfg)
+    cache = state.setdefault("_reasoner_token_ids_cache", {})
+    cache_key = (
+        str(prompt),
+        int(max_new_tokens),
+        _sender_generation_cache_fingerprint(cfg),
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        cached_metadata = dict(cached)
+        cached_metadata["token_ids"] = list(cached_metadata.get("token_ids", ()))
+        cached_metadata["initial_token_ids"] = list(
+            cached_metadata.get("initial_token_ids", ())
+        )
+        cached_metadata["revision_token_ids"] = list(
+            cached_metadata.get("revision_token_ids", ())
+        )
+        return cached_metadata
+
+    initial_ids = _generate_agent_a_token_ids(
+        _format_reasoner_cot_prompt(prompt, tokenizer_a),
+        cfg,
+        state,
+        max_new_tokens=max_new_tokens,
+    )
+    initial_text = tokenizer_a.decode(initial_ids, skip_special_tokens=True)
+    initial_answer = _final_answer_marker_value(initial_text)
+    revision_enabled = _sender_revision_enabled(cfg)
+    revision_applied = False
+    revision_ids: list[int] = []
+    revision_text = ""
+    revision_answer: Optional[str] = None
+    token_ids = list(initial_ids)
+
+    if revision_enabled:
+        revision_ids = _generate_agent_a_token_ids(
+            _format_reasoner_revision_prompt(prompt, initial_text, tokenizer_a),
+            cfg,
+            state,
+            max_new_tokens=_sender_revision_max_new_tokens(cfg),
+        )
+        revision_text = tokenizer_a.decode(revision_ids, skip_special_tokens=True)
+        revision_answer = _final_answer_marker_value(revision_text)
+        if revision_answer is not None:
+            separator_ids = tokenizer_a.encode(
+                "\n\nVerification:\n",
+                add_special_tokens=False,
+            )
+            token_ids = [
+                *[int(token_id) for token_id in initial_ids],
+                *[int(token_id) for token_id in separator_ids],
+                *[int(token_id) for token_id in revision_ids],
+            ]
+            revision_applied = True
+
+    metadata = {
+        "token_ids": [int(token_id) for token_id in token_ids],
+        "initial_token_ids": [int(token_id) for token_id in initial_ids],
+        "initial_reasoning_text": initial_text,
+        "initial_predicted_answer": initial_answer,
+        "revision_enabled": bool(revision_enabled),
+        "revision_applied": bool(revision_applied),
+        "revision_token_ids": [int(token_id) for token_id in revision_ids],
+        "revision_reasoning_text": revision_text,
+        "revision_predicted_answer": revision_answer,
+    }
+    cache[cache_key] = {
+        **metadata,
+        "token_ids": tuple(metadata["token_ids"]),
+        "initial_token_ids": tuple(metadata["initial_token_ids"]),
+        "revision_token_ids": tuple(metadata["revision_token_ids"]),
+    }
+    return metadata
+
+
+def _generate_reasoner_token_ids(prompt: str, cfg: Any, state: dict[str, Any]) -> list[int]:
+    return list(_generate_reasoner_metadata(prompt, cfg, state)["token_ids"])
 
 
 def _extract_gsm8k_target_answer(text: str) -> Optional[str]:
@@ -363,9 +487,9 @@ def _extract_gsm8k_target_answer(text: str) -> Optional[str]:
 
 
 def _extract_gsm8k_predicted_answer(text: str) -> Optional[str]:
-    marker_match = FINAL_ANSWER_MARKER_REGEX.search(text)
-    if marker_match is not None:
-        return marker_match.group(1)
+    marker_matches = list(FINAL_ANSWER_MARKER_REGEX.finditer(text))
+    if marker_matches:
+        return marker_matches[-1].group(1)
     matches = NUMERIC_ANSWER_REGEX.findall(text)
     if not matches:
         return None
@@ -547,7 +671,7 @@ def _alignment_variant_state(
 
 def _generate_reasoner_text(prompt: str, cfg: Any, state: dict[str, Any]) -> str:
     tokenizer_a = state["tokenizer_a"]
-    generated_ids = _generate_reasoner_token_ids(prompt, cfg, state)
+    generated_ids = _generate_reasoner_metadata(prompt, cfg, state)["token_ids"]
     return tokenizer_a.decode(generated_ids, skip_special_tokens=True)
 
 
@@ -572,6 +696,10 @@ def _sender_generated_trace_payload(
             result["generated_reasoning_final_answer_marker"]
         ),
         "generated_latent_includes_prompt": bool(result["generated_latent_includes_prompt"]),
+        "sender_revision_enabled": bool(result.get("sender_revision_enabled", False)),
+        "sender_revision_applied": bool(result.get("sender_revision_applied", False)),
+        "sender_initial_predicted_answer": result.get("sender_initial_predicted_answer"),
+        "sender_revision_predicted_answer": result.get("sender_revision_predicted_answer"),
     }
 
 
@@ -624,6 +752,10 @@ def _sender_generated_trace_result_from_payload(
             if "generated_reasoning_final_answer_marker" in payload
             else generated_status == "complete"
         ),
+        "sender_revision_enabled": bool(payload.get("sender_revision_enabled", False)),
+        "sender_revision_applied": bool(payload.get("sender_revision_applied", False)),
+        "sender_initial_predicted_answer": payload.get("sender_initial_predicted_answer"),
+        "sender_revision_predicted_answer": payload.get("sender_revision_predicted_answer"),
         "generated_trace_cache_hit": True,
         "generated_trace_cache_path": "" if cache_path is None else str(cache_path),
     }
@@ -668,7 +800,8 @@ def _collect_sender_generated_consensus_state(
     agent_a = state["agent_a"]
     agent_a_device = next(agent_a.parameters()).device
     reasoning_layer_indices, reasoning_layer_weights = _reasoning_alignment_metadata(state)
-    generated_ids = _generate_reasoner_token_ids(prompt, cfg, state)
+    generation_metadata = _generate_reasoner_metadata(prompt, cfg, state)
+    generated_ids = generation_metadata["token_ids"]
 
     encoded = tokenizer_a(
         _format_reasoner_cot_prompt(prompt, tokenizer_a),
@@ -748,6 +881,10 @@ def _collect_sender_generated_consensus_state(
         "generated_reasoning_text": tokenizer_a.decode(generated_ids, skip_special_tokens=True),
         "generated_reasoning_token_count": len(generated_ids),
         "generated_latent_includes_prompt": bool(include_prompt),
+        "sender_revision_enabled": bool(generation_metadata["revision_enabled"]),
+        "sender_revision_applied": bool(generation_metadata["revision_applied"]),
+        "sender_initial_predicted_answer": generation_metadata.get("initial_predicted_answer"),
+        "sender_revision_predicted_answer": generation_metadata.get("revision_predicted_answer"),
     }
     result["generated_reasoning_status"] = _sender_reasoning_status(
         generated_ids,
@@ -1189,7 +1326,7 @@ def _generated_trajectory_adapter_cache_key(
         str(cfg.torch_dtype),
         state.get("global_alignment_cache_key"),
         int(_reasoner_generation_max_new_tokens(cfg)),
-        bool(_answer_only_final_enabled(cfg)),
+        _sender_generation_cache_fingerprint(cfg),
         bool(include_prompt),
         _generated_trajectory_adapter_dataset_name(cfg),
         _generated_trajectory_adapter_train_split(cfg),
@@ -1232,7 +1369,7 @@ def _generated_trajectory_trace_cache_key(
         str(cfg.agent_a_model),
         str(cfg.torch_dtype),
         int(_reasoner_generation_max_new_tokens(cfg)),
-        bool(_answer_only_final_enabled(cfg)),
+        _sender_generation_cache_fingerprint(cfg),
         bool(include_prompt),
         _latent_pooling_mode(cfg),
         tuple(int(index) for index in reasoning_layer_indices),
@@ -1254,7 +1391,7 @@ def _generated_trajectory_adapter_training_rows_cache_key(
         str(cfg.torch_dtype),
         state.get("global_alignment_cache_key"),
         int(_reasoner_generation_max_new_tokens(cfg)),
-        bool(_answer_only_final_enabled(cfg)),
+        _sender_generation_cache_fingerprint(cfg),
         bool(include_prompt),
         _generated_trajectory_adapter_dataset_name(cfg),
         _generated_trajectory_adapter_train_split(cfg),
@@ -1656,7 +1793,8 @@ def _build_generated_trajectory_training_rows(
                 "Generated trajectory rows: "
                 f"{prompt_count}/{train_limit} usable prompts "
                 f"(source row {row_index}/{total_train_rows}, "
-                f"trace cache hits={trace_cache_hit_count}, misses={trace_cache_miss_count})"
+                f"trace cache hits={trace_cache_hit_count}, misses={trace_cache_miss_count})",
+                flush=True,
             )
     if not source_rows:
         raise ValueError("No usable generated trajectories were available for adapter fitting")
@@ -1693,12 +1831,15 @@ def _load_or_build_generated_trajectory_training_rows(
     )
     cached_rows = memory_cache.get(cache_key)
     if cached_rows is not None:
+        print("Generated trajectory rows cache hit in memory", flush=True)
         return {**cached_rows, "training_row_cache_hit": True}
 
     cache_path = _generated_trajectory_adapter_training_rows_cache_path(cfg, cache_key)
+    print(f"Checking generated trajectory rows cache: {cache_path}", flush=True)
     cached_rows = _load_generated_trajectory_training_rows_from_disk(cache_path)
     cache_hit = cached_rows is not None
     if cached_rows is None:
+        print("Generated trajectory rows cache miss; building rows", flush=True)
         cached_rows = _build_generated_trajectory_training_rows(
             cfg,
             state,
@@ -1706,6 +1847,9 @@ def _load_or_build_generated_trajectory_training_rows(
             include_prompt=include_prompt,
         )
         torch.save(cached_rows, cache_path)
+        print(f"Wrote generated trajectory rows cache: {cache_path}", flush=True)
+    else:
+        print(f"Loaded generated trajectory rows cache: {cache_path}", flush=True)
     info = {
         **cached_rows,
         "training_row_cache_hit": cache_hit,
@@ -1799,11 +1943,14 @@ def _load_or_train_generated_trajectory_adapter_state(
     cache_key = _generated_trajectory_adapter_cache_key(cfg, state, include_prompt=include_prompt)
     cached_info = memory_cache.get(cache_key)
     if cached_info is not None:
+        print("Generated trajectory adapter cache hit in memory", flush=True)
         return cached_info
     cache_path = _generated_trajectory_adapter_cache_path(cfg, cache_key)
+    print(f"Checking generated trajectory adapter cache: {cache_path}", flush=True)
     adapter_state = _load_generated_trajectory_adapter_from_disk(cache_path)
     cache_hit = adapter_state is not None
     if adapter_state is None and _generated_trajectory_adapter_train_on_missing(cfg):
+        print("Generated trajectory adapter cache miss; fitting adapter", flush=True)
         adapter_state = _fit_generated_trajectory_adapter_state(
             cfg,
             state,
@@ -1811,6 +1958,7 @@ def _load_or_train_generated_trajectory_adapter_state(
             include_prompt=include_prompt,
         )
         torch.save(adapter_state, cache_path)
+        print(f"Wrote generated trajectory adapter cache: {cache_path}", flush=True)
     if adapter_state is None:
         info = {
             "enabled": False,
@@ -1844,6 +1992,12 @@ def _load_or_train_generated_trajectory_adapter_state(
                 "training_mean_cosine_similarity"
             ),
         }
+        print(
+            "Generated trajectory adapter "
+            f"{info['status']} from {cache_path} "
+            f"(row_cache_hit={info.get('training_row_cache_hit')})",
+            flush=True,
+        )
     memory_cache[cache_key] = info
     return info
 
@@ -1957,6 +2111,14 @@ def _prepare_generated_trajectory_eval_traces(
                     "sender_reasoning_status": sender_state.get("generated_reasoning_status"),
                     "sender_final_answer_marker": sender_state.get(
                         "generated_reasoning_final_answer_marker"
+                    ),
+                    "sender_revision_enabled": sender_state.get("sender_revision_enabled"),
+                    "sender_revision_applied": sender_state.get("sender_revision_applied"),
+                    "sender_initial_predicted_answer": sender_state.get(
+                        "sender_initial_predicted_answer"
+                    ),
+                    "sender_revision_predicted_answer": sender_state.get(
+                        "sender_revision_predicted_answer"
                     ),
                     "sender_reasoning_token_count": sender_state.get(
                         "generated_reasoning_token_count"
@@ -2983,6 +3145,10 @@ def _run_generated_latent_variant(
         "sender_trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
         "sender_trace_cache_path": sender_state.get("generated_trace_cache_path"),
         "sender_final_answer_marker": sender_state["generated_reasoning_final_answer_marker"],
+        "sender_revision_enabled": sender_state.get("sender_revision_enabled"),
+        "sender_revision_applied": sender_state.get("sender_revision_applied"),
+        "sender_initial_predicted_answer": sender_state.get("sender_initial_predicted_answer"),
+        "sender_revision_predicted_answer": sender_state.get("sender_revision_predicted_answer"),
     }
 
 
@@ -3360,6 +3526,8 @@ def _configured_base_cfg(
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
     semantic_min_sender_accuracy_percentage: Optional[float] = None,
+    sender_revision_enabled: Optional[bool] = None,
+    sender_revision_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     max_new_tokens: Optional[int] = None,
     reasoner_max_new_tokens: Optional[int] = None,
@@ -3451,6 +3619,13 @@ def _configured_base_cfg(
         base_cfg.reporting.semantic_smoke.min_sender_accuracy_percentage = float(
             semantic_min_sender_accuracy_percentage
         )
+    if sender_revision_enabled is not None or sender_revision_max_new_tokens is not None:
+        if getattr(base_cfg.benchmark, "sender_revision", None) is None:
+            base_cfg.benchmark.sender_revision = OmegaConf.create({})
+    if sender_revision_enabled is not None:
+        base_cfg.benchmark.sender_revision.enabled = bool(sender_revision_enabled)
+    if sender_revision_max_new_tokens is not None:
+        base_cfg.benchmark.sender_revision.max_new_tokens = int(sender_revision_max_new_tokens)
     if seed is not None:
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
@@ -3548,6 +3723,8 @@ def run_benchmark(
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
     semantic_min_sender_accuracy_percentage: Optional[float] = None,
+    sender_revision_enabled: Optional[bool] = None,
+    sender_revision_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -3592,6 +3769,8 @@ def run_benchmark(
         embedding_manifold_top_k=embedding_manifold_top_k,
         embedding_manifold_blend=embedding_manifold_blend,
         semantic_min_sender_accuracy_percentage=semantic_min_sender_accuracy_percentage,
+        sender_revision_enabled=sender_revision_enabled,
+        sender_revision_max_new_tokens=sender_revision_max_new_tokens,
         seed=seed,
         max_new_tokens=max_new_tokens,
         reasoner_max_new_tokens=reasoner_max_new_tokens,
@@ -3640,7 +3819,8 @@ def run_benchmark(
                 print(
                     f"Running {suite_name}:{method_name} on {dataset_name}/{effective_split} "
                     f"with latent_steps={latent_steps} "
-                    f"(repetition {repetition + 1}/{repetitions})..."
+                    f"(repetition {repetition + 1}/{repetitions})...",
+                    flush=True,
                 )
                 for index, row in enumerate(samples):
                     sample_index = (
@@ -3786,6 +3966,18 @@ def run_benchmark(
                             "sender_trace_cache_path": row_result.get("sender_trace_cache_path"),
                             "sender_final_answer_marker": row_result.get(
                                 "sender_final_answer_marker"
+                            ),
+                            "sender_revision_enabled": row_result.get(
+                                "sender_revision_enabled"
+                            ),
+                            "sender_revision_applied": row_result.get(
+                                "sender_revision_applied"
+                            ),
+                            "sender_initial_predicted_answer": row_result.get(
+                                "sender_initial_predicted_answer"
+                            ),
+                            "sender_revision_predicted_answer": row_result.get(
+                                "sender_revision_predicted_answer"
                             ),
                             "sender_predicted_answer": sender_predicted_answer,
                             "sender_answer_matches_target": sender_answer_matches_target,
@@ -4066,6 +4258,10 @@ def run_benchmark(
         "receiver_context_mode": _receiver_context_mode(base_cfg),
         "answer_only_final": _answer_only_final_enabled(base_cfg),
         "reasoner_max_new_tokens": _reasoner_generation_max_new_tokens(base_cfg),
+        "sender_revision": {
+            "enabled": _sender_revision_enabled(base_cfg),
+            "max_new_tokens": _sender_revision_max_new_tokens(base_cfg),
+        },
         "handoff_adapter": {
             "enabled": bool(getattr(getattr(base_cfg.handoff, "adapter", None), "enabled", False)),
             "train_on_missing": bool(
@@ -4185,6 +4381,8 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    sender_revision_enabled: Optional[bool] = None,
+    sender_revision_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -4224,6 +4422,8 @@ def prepare_generated_trajectory_adapter_cache(
         generated_trajectory_adapter_local_residual_max_memory_rows=(
             generated_trajectory_adapter_local_residual_max_memory_rows
         ),
+        sender_revision_enabled=sender_revision_enabled,
+        sender_revision_max_new_tokens=sender_revision_max_new_tokens,
         seed=seed,
         max_new_tokens=max_new_tokens,
         reasoner_max_new_tokens=reasoner_max_new_tokens,
@@ -4310,6 +4510,10 @@ def prepare_generated_trajectory_adapter_cache(
         "agent_b_model": str(suite_cfg.agent_b_model),
         "answer_only_final": _answer_only_final_enabled(base_cfg),
         "reasoner_max_new_tokens": _reasoner_generation_max_new_tokens(base_cfg),
+        "sender_revision": {
+            "enabled": _sender_revision_enabled(base_cfg),
+            "max_new_tokens": _sender_revision_max_new_tokens(base_cfg),
+        },
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "generated_trajectory_adapter": {
             "enabled": _generated_trajectory_adapter_enabled(base_cfg),
@@ -4638,6 +4842,20 @@ def main() -> None:
         help="Prompt text baselines to return only a final answer.",
     )
     parser.add_argument(
+        "--enable-sender-revision",
+        action="store_true",
+        help=(
+            "Run an opt-in Agent A self-check pass and use it when it produces a "
+            "final-answer marker."
+        ),
+    )
+    parser.add_argument(
+        "--sender-revision-max-new-tokens",
+        type=int,
+        default=None,
+        help="Optional override for benchmark.sender_revision.max_new_tokens.",
+    )
+    parser.add_argument(
         "--semantic-min-sender-accuracy",
         type=float,
         default=None,
@@ -4788,6 +5006,8 @@ def main() -> None:
             generated_trajectory_adapter_local_residual_max_memory_rows=(
                 args.generated_trajectory_local_residual_max_memory_rows
             ),
+            sender_revision_enabled=True if args.enable_sender_revision else None,
+            sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
             seed=args.seed,
             method_names=method_names,
             sample_indices=sample_indices,
@@ -4892,6 +5112,8 @@ def main() -> None:
         embedding_manifold_top_k=args.embedding_manifold_top_k,
         embedding_manifold_blend=args.embedding_manifold_blend,
         semantic_min_sender_accuracy_percentage=args.semantic_min_sender_accuracy,
+        sender_revision_enabled=True if args.enable_sender_revision else None,
+        sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
         seed=args.seed,
         method_names=method_names,
         sample_indices=sample_indices,
