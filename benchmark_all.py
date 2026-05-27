@@ -143,8 +143,16 @@ FINAL_ANSWER_MARKER_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)",
     re.IGNORECASE,
 )
+FINAL_ANSWER_BOXED_REGEX = re.compile(
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?\\boxed\s*\{\s*(-?\d[\d,]*(?:\.\d+)?)\s*\}",
+    re.IGNORECASE,
+)
 FINAL_ANSWER_COMPLETE_REGEX = re.compile(
-    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.]|\.(?!\d))",
+    r"(?:"
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.]|\.(?!\d))"
+    r"|"
+    r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?\\boxed\s*\{\s*-?\d[\d,]*(?:\.\d+)?\s*\}"
+    r")",
     re.IGNORECASE,
 )
 NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
@@ -232,12 +240,33 @@ def _sender_revision_max_new_tokens(cfg: Any) -> int:
     return max(1, int(getattr(_sender_revision_cfg(cfg), "max_new_tokens", 256)))
 
 
+def _sender_revision_disagreement_verifier_enabled(cfg: Any) -> bool:
+    return bool(
+        getattr(_sender_revision_cfg(cfg), "disagreement_verifier_enabled", True)
+    )
+
+
+def _sender_revision_disagreement_verifier_max_new_tokens(cfg: Any) -> int:
+    return max(
+        1,
+        int(
+            getattr(
+                _sender_revision_cfg(cfg),
+                "disagreement_verifier_max_new_tokens",
+                256,
+            )
+        ),
+    )
+
+
 def _sender_generation_cache_fingerprint(cfg: Any) -> tuple[Any, ...]:
     return (
-        "sender_generation_v3",
+        "sender_generation_v5",
         bool(_answer_only_final_enabled(cfg)),
         bool(_sender_revision_enabled(cfg)),
         int(_sender_revision_max_new_tokens(cfg)),
+        bool(_sender_revision_disagreement_verifier_enabled(cfg)),
+        int(_sender_revision_disagreement_verifier_max_new_tokens(cfg)),
     )
 
 
@@ -272,6 +301,25 @@ def _format_reasoner_revision_prompt(
         "'more than', and 'times'. Then translate those copied relationships into "
         "equations and check each arithmetic operation. Write only the copied facts "
         "and essential equations, then end with exactly: Final answer: <answer>."
+    )
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_reasoner_revision_decision_prompt(
+    prompt: str,
+    initial_answer: Optional[str],
+    revision_answer: Optional[str],
+    tokenizer: Any = None,
+) -> str:
+    user_message = (
+        f"{prompt}\n\n"
+        "Two independent solution attempts disagreed.\n"
+        f"Candidate A answer: {initial_answer or 'missing'}\n"
+        f"Candidate B answer: {revision_answer or 'missing'}\n\n"
+        "Resolve the disagreement from the original problem only. Copy each numeric "
+        "quantity and relationship exactly as written, translate the copied facts into "
+        "equations, and check the arithmetic. Do not choose by candidate order. End "
+        "with exactly: Final answer: <answer>."
     )
     return _maybe_apply_chat_template(tokenizer, user_message)
 
@@ -351,10 +399,17 @@ def _trim_generated_ids_to_final_answer(tokenizer: Any, token_ids: Sequence[int]
 
 
 def _final_answer_marker_value(text: str) -> Optional[str]:
-    marker_match = FINAL_ANSWER_MARKER_REGEX.search(str(text))
-    if marker_match is None:
+    marker_candidates = [
+        (match.start(), match.group(1))
+        for match in FINAL_ANSWER_MARKER_REGEX.finditer(str(text))
+    ]
+    marker_candidates.extend(
+        (match.start(), match.group(1))
+        for match in FINAL_ANSWER_BOXED_REGEX.finditer(str(text))
+    )
+    if not marker_candidates:
         return None
-    return marker_match.group(1).strip()
+    return sorted(marker_candidates, key=lambda item: item[0])[-1][1].strip()
 
 
 def _generate_agent_a_token_ids(
@@ -419,6 +474,9 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
         cached_metadata["revision_token_ids"] = list(
             cached_metadata.get("revision_token_ids", ())
         )
+        cached_metadata["revision_decision_token_ids"] = list(
+            cached_metadata.get("revision_decision_token_ids", ())
+        )
         return cached_metadata
 
     initial_ids = _generate_agent_a_token_ids(
@@ -434,6 +492,10 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
     revision_ids: list[int] = []
     revision_text = ""
     revision_answer: Optional[str] = None
+    decision_applied = False
+    decision_ids: list[int] = []
+    decision_text = ""
+    decision_answer: Optional[str] = None
     token_ids = list(initial_ids)
 
     if revision_enabled:
@@ -445,6 +507,26 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
         )
         revision_text = tokenizer_a.decode(revision_ids, skip_special_tokens=True)
         revision_answer = _final_answer_marker_value(revision_text)
+        if (
+            revision_answer is not None
+            and initial_answer is not None
+            and _normalize_numeric_answer(revision_answer)
+            != _normalize_numeric_answer(initial_answer)
+            and _sender_revision_disagreement_verifier_enabled(cfg)
+        ):
+            decision_ids = _generate_agent_a_token_ids(
+                _format_reasoner_revision_decision_prompt(
+                    prompt,
+                    initial_answer,
+                    revision_answer,
+                    tokenizer_a,
+                ),
+                cfg,
+                state,
+                max_new_tokens=_sender_revision_disagreement_verifier_max_new_tokens(cfg),
+            )
+            decision_text = tokenizer_a.decode(decision_ids, skip_special_tokens=True)
+            decision_answer = _final_answer_marker_value(decision_text)
         if revision_answer is not None:
             separator_ids = tokenizer_a.encode(
                 "\n\nVerification:\n",
@@ -456,6 +538,17 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
                 *[int(token_id) for token_id in revision_ids],
             ]
             revision_applied = True
+            if decision_answer is not None:
+                decision_separator_ids = tokenizer_a.encode(
+                    "\n\nVerification decision:\n",
+                    add_special_tokens=False,
+                )
+                token_ids = [
+                    *token_ids,
+                    *[int(token_id) for token_id in decision_separator_ids],
+                    *[int(token_id) for token_id in decision_ids],
+                ]
+                decision_applied = True
 
     metadata = {
         "token_ids": [int(token_id) for token_id in token_ids],
@@ -467,12 +560,17 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
         "revision_token_ids": [int(token_id) for token_id in revision_ids],
         "revision_reasoning_text": revision_text,
         "revision_predicted_answer": revision_answer,
+        "revision_decision_applied": bool(decision_applied),
+        "revision_decision_token_ids": [int(token_id) for token_id in decision_ids],
+        "revision_decision_reasoning_text": decision_text,
+        "revision_decision_predicted_answer": decision_answer,
     }
     cache[cache_key] = {
         **metadata,
         "token_ids": tuple(metadata["token_ids"]),
         "initial_token_ids": tuple(metadata["initial_token_ids"]),
         "revision_token_ids": tuple(metadata["revision_token_ids"]),
+        "revision_decision_token_ids": tuple(metadata["revision_decision_token_ids"]),
     }
     return metadata
 
@@ -487,9 +585,19 @@ def _extract_gsm8k_target_answer(text: str) -> Optional[str]:
 
 
 def _extract_gsm8k_predicted_answer(text: str) -> Optional[str]:
-    marker_matches = list(FINAL_ANSWER_MARKER_REGEX.finditer(text))
-    if marker_matches:
-        return marker_matches[-1].group(1)
+    marker_candidates = [
+        (match.start(), match.group(1))
+        for match in FINAL_ANSWER_MARKER_REGEX.finditer(text)
+    ]
+    marker_candidates.extend(
+        (match.start(), match.group(1))
+        for match in FINAL_ANSWER_BOXED_REGEX.finditer(text)
+    )
+    if marker_candidates:
+        return sorted(marker_candidates, key=lambda item: item[0])[-1][1]
+    boxed_answer = extract_boxed_text(text)
+    if boxed_answer is not None:
+        return boxed_answer
     matches = NUMERIC_ANSWER_REGEX.findall(text)
     if not matches:
         return None
@@ -700,6 +808,12 @@ def _sender_generated_trace_payload(
         "sender_revision_applied": bool(result.get("sender_revision_applied", False)),
         "sender_initial_predicted_answer": result.get("sender_initial_predicted_answer"),
         "sender_revision_predicted_answer": result.get("sender_revision_predicted_answer"),
+        "sender_revision_decision_applied": bool(
+            result.get("sender_revision_decision_applied", False)
+        ),
+        "sender_revision_decision_predicted_answer": result.get(
+            "sender_revision_decision_predicted_answer"
+        ),
     }
 
 
@@ -756,6 +870,12 @@ def _sender_generated_trace_result_from_payload(
         "sender_revision_applied": bool(payload.get("sender_revision_applied", False)),
         "sender_initial_predicted_answer": payload.get("sender_initial_predicted_answer"),
         "sender_revision_predicted_answer": payload.get("sender_revision_predicted_answer"),
+        "sender_revision_decision_applied": bool(
+            payload.get("sender_revision_decision_applied", False)
+        ),
+        "sender_revision_decision_predicted_answer": payload.get(
+            "sender_revision_decision_predicted_answer"
+        ),
         "generated_trace_cache_hit": True,
         "generated_trace_cache_path": "" if cache_path is None else str(cache_path),
     }
@@ -885,6 +1005,12 @@ def _collect_sender_generated_consensus_state(
         "sender_revision_applied": bool(generation_metadata["revision_applied"]),
         "sender_initial_predicted_answer": generation_metadata.get("initial_predicted_answer"),
         "sender_revision_predicted_answer": generation_metadata.get("revision_predicted_answer"),
+        "sender_revision_decision_applied": bool(
+            generation_metadata["revision_decision_applied"]
+        ),
+        "sender_revision_decision_predicted_answer": generation_metadata.get(
+            "revision_decision_predicted_answer"
+        ),
     }
     result["generated_reasoning_status"] = _sender_reasoning_status(
         generated_ids,
@@ -2120,6 +2246,12 @@ def _prepare_generated_trajectory_eval_traces(
                     "sender_revision_predicted_answer": sender_state.get(
                         "sender_revision_predicted_answer"
                     ),
+                    "sender_revision_decision_applied": sender_state.get(
+                        "sender_revision_decision_applied"
+                    ),
+                    "sender_revision_decision_predicted_answer": sender_state.get(
+                        "sender_revision_decision_predicted_answer"
+                    ),
                     "sender_reasoning_token_count": sender_state.get(
                         "generated_reasoning_token_count"
                     ),
@@ -3149,6 +3281,12 @@ def _run_generated_latent_variant(
         "sender_revision_applied": sender_state.get("sender_revision_applied"),
         "sender_initial_predicted_answer": sender_state.get("sender_initial_predicted_answer"),
         "sender_revision_predicted_answer": sender_state.get("sender_revision_predicted_answer"),
+        "sender_revision_decision_applied": sender_state.get(
+            "sender_revision_decision_applied"
+        ),
+        "sender_revision_decision_predicted_answer": sender_state.get(
+            "sender_revision_decision_predicted_answer"
+        ),
     }
 
 
@@ -3528,6 +3666,8 @@ def _configured_base_cfg(
     semantic_min_sender_accuracy_percentage: Optional[float] = None,
     sender_revision_enabled: Optional[bool] = None,
     sender_revision_max_new_tokens: Optional[int] = None,
+    sender_revision_disagreement_verifier_enabled: Optional[bool] = None,
+    sender_revision_disagreement_verifier_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     max_new_tokens: Optional[int] = None,
     reasoner_max_new_tokens: Optional[int] = None,
@@ -3619,13 +3759,26 @@ def _configured_base_cfg(
         base_cfg.reporting.semantic_smoke.min_sender_accuracy_percentage = float(
             semantic_min_sender_accuracy_percentage
         )
-    if sender_revision_enabled is not None or sender_revision_max_new_tokens is not None:
+    if (
+        sender_revision_enabled is not None
+        or sender_revision_max_new_tokens is not None
+        or sender_revision_disagreement_verifier_enabled is not None
+        or sender_revision_disagreement_verifier_max_new_tokens is not None
+    ):
         if getattr(base_cfg.benchmark, "sender_revision", None) is None:
             base_cfg.benchmark.sender_revision = OmegaConf.create({})
     if sender_revision_enabled is not None:
         base_cfg.benchmark.sender_revision.enabled = bool(sender_revision_enabled)
     if sender_revision_max_new_tokens is not None:
         base_cfg.benchmark.sender_revision.max_new_tokens = int(sender_revision_max_new_tokens)
+    if sender_revision_disagreement_verifier_enabled is not None:
+        base_cfg.benchmark.sender_revision.disagreement_verifier_enabled = bool(
+            sender_revision_disagreement_verifier_enabled
+        )
+    if sender_revision_disagreement_verifier_max_new_tokens is not None:
+        base_cfg.benchmark.sender_revision.disagreement_verifier_max_new_tokens = int(
+            sender_revision_disagreement_verifier_max_new_tokens
+        )
     if seed is not None:
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
@@ -3725,6 +3878,8 @@ def run_benchmark(
     semantic_min_sender_accuracy_percentage: Optional[float] = None,
     sender_revision_enabled: Optional[bool] = None,
     sender_revision_max_new_tokens: Optional[int] = None,
+    sender_revision_disagreement_verifier_enabled: Optional[bool] = None,
+    sender_revision_disagreement_verifier_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -3771,6 +3926,12 @@ def run_benchmark(
         semantic_min_sender_accuracy_percentage=semantic_min_sender_accuracy_percentage,
         sender_revision_enabled=sender_revision_enabled,
         sender_revision_max_new_tokens=sender_revision_max_new_tokens,
+        sender_revision_disagreement_verifier_enabled=(
+            sender_revision_disagreement_verifier_enabled
+        ),
+        sender_revision_disagreement_verifier_max_new_tokens=(
+            sender_revision_disagreement_verifier_max_new_tokens
+        ),
         seed=seed,
         max_new_tokens=max_new_tokens,
         reasoner_max_new_tokens=reasoner_max_new_tokens,
@@ -3978,6 +4139,12 @@ def run_benchmark(
                             ),
                             "sender_revision_predicted_answer": row_result.get(
                                 "sender_revision_predicted_answer"
+                            ),
+                            "sender_revision_decision_applied": row_result.get(
+                                "sender_revision_decision_applied"
+                            ),
+                            "sender_revision_decision_predicted_answer": row_result.get(
+                                "sender_revision_decision_predicted_answer"
                             ),
                             "sender_predicted_answer": sender_predicted_answer,
                             "sender_answer_matches_target": sender_answer_matches_target,
@@ -4261,6 +4428,12 @@ def run_benchmark(
         "sender_revision": {
             "enabled": _sender_revision_enabled(base_cfg),
             "max_new_tokens": _sender_revision_max_new_tokens(base_cfg),
+            "disagreement_verifier_enabled": (
+                _sender_revision_disagreement_verifier_enabled(base_cfg)
+            ),
+            "disagreement_verifier_max_new_tokens": (
+                _sender_revision_disagreement_verifier_max_new_tokens(base_cfg)
+            ),
         },
         "handoff_adapter": {
             "enabled": bool(getattr(getattr(base_cfg.handoff, "adapter", None), "enabled", False)),
@@ -4383,6 +4556,8 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     sender_revision_enabled: Optional[bool] = None,
     sender_revision_max_new_tokens: Optional[int] = None,
+    sender_revision_disagreement_verifier_enabled: Optional[bool] = None,
+    sender_revision_disagreement_verifier_max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -4424,6 +4599,12 @@ def prepare_generated_trajectory_adapter_cache(
         ),
         sender_revision_enabled=sender_revision_enabled,
         sender_revision_max_new_tokens=sender_revision_max_new_tokens,
+        sender_revision_disagreement_verifier_enabled=(
+            sender_revision_disagreement_verifier_enabled
+        ),
+        sender_revision_disagreement_verifier_max_new_tokens=(
+            sender_revision_disagreement_verifier_max_new_tokens
+        ),
         seed=seed,
         max_new_tokens=max_new_tokens,
         reasoner_max_new_tokens=reasoner_max_new_tokens,
@@ -4513,6 +4694,12 @@ def prepare_generated_trajectory_adapter_cache(
         "sender_revision": {
             "enabled": _sender_revision_enabled(base_cfg),
             "max_new_tokens": _sender_revision_max_new_tokens(base_cfg),
+            "disagreement_verifier_enabled": (
+                _sender_revision_disagreement_verifier_enabled(base_cfg)
+            ),
+            "disagreement_verifier_max_new_tokens": (
+                _sender_revision_disagreement_verifier_max_new_tokens(base_cfg)
+            ),
         },
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "generated_trajectory_adapter": {
@@ -4856,6 +5043,20 @@ def main() -> None:
         help="Optional override for benchmark.sender_revision.max_new_tokens.",
     )
     parser.add_argument(
+        "--disable-sender-revision-disagreement-verifier",
+        action="store_true",
+        help="Disable the extra verifier pass when initial and revised sender answers disagree.",
+    )
+    parser.add_argument(
+        "--sender-revision-disagreement-verifier-max-new-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for "
+            "benchmark.sender_revision.disagreement_verifier_max_new_tokens."
+        ),
+    )
+    parser.add_argument(
         "--semantic-min-sender-accuracy",
         type=float,
         default=None,
@@ -5008,6 +5209,12 @@ def main() -> None:
             ),
             sender_revision_enabled=True if args.enable_sender_revision else None,
             sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
+            sender_revision_disagreement_verifier_enabled=(
+                False if args.disable_sender_revision_disagreement_verifier else None
+            ),
+            sender_revision_disagreement_verifier_max_new_tokens=(
+                args.sender_revision_disagreement_verifier_max_new_tokens
+            ),
             seed=args.seed,
             method_names=method_names,
             sample_indices=sample_indices,
@@ -5114,6 +5321,12 @@ def main() -> None:
         semantic_min_sender_accuracy_percentage=args.semantic_min_sender_accuracy,
         sender_revision_enabled=True if args.enable_sender_revision else None,
         sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
+        sender_revision_disagreement_verifier_enabled=(
+            False if args.disable_sender_revision_disagreement_verifier else None
+        ),
+        sender_revision_disagreement_verifier_max_new_tokens=(
+            args.sender_revision_disagreement_verifier_max_new_tokens
+        ),
         seed=args.seed,
         method_names=method_names,
         sample_indices=sample_indices,
