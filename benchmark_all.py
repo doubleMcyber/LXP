@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 from omegaconf import OmegaConf
+from transformers import AutoTokenizer
 
 from latent_pipeline import (
     _aggregate_hidden_layers,
@@ -27,11 +28,14 @@ from latent_pipeline import (
     _pool_latent_handoff_step,
     _receiver_context_latent_position,
     _receiver_context_mode,
+    _resolve_reasoning_layer_indices_from_counts,
+    _resolve_reasoning_layer_weights,
     _run_actor_handoff,
     _select_hidden_layers,
     _should_use_receiver_context,
     apply_embedding_manifold_projection,
     apply_handoff_adapter,
+    load_agent,
     run_hybrid_pipeline,
 )
 from src.data.loader import get_dataloader, pick_field
@@ -65,7 +69,11 @@ from src.utils.lm_eval import (
     prepare_receiver_context_latent_prefix_state,
     prepare_text_prefix_state,
 )
-from src.utils.model_compat import load_model_pair_compatibility
+from src.utils.model_compat import (
+    load_model_architecture_summary,
+    load_model_pair_compatibility,
+    summarize_model_config,
+)
 from src.utils.metrics import extract_boxed_text, normalize_answer
 
 DEFAULT_SUITE = "standard"
@@ -128,6 +136,8 @@ GENERATED_LATENT_METHODS = frozenset(
         "generated_context_latent_handoff",
     )
 )
+_SENDER_TRACE_STATE: Optional[dict[str, Any]] = None
+_SENDER_TRACE_STATE_KEY: Optional[tuple[Any, ...]] = None
 GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 FINAL_ANSWER_MARKER_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)",
@@ -403,6 +413,99 @@ def _reasoning_alignment_metadata(state: dict[str, Any]) -> tuple[tuple[int, ...
     )
 
 
+def _model_layer_count_from_loaded_model(model: Any, *, model_id: str) -> int:
+    summary = summarize_model_config(getattr(model, "config", None), model_id=model_id)
+    if summary.num_hidden_layers is not None:
+        return int(summary.num_hidden_layers)
+    model_layers = getattr(getattr(model, "model", None), "layers", None)
+    if model_layers is not None:
+        return int(len(model_layers))
+    raise ValueError(f"Unable to determine transformer layer count for {model_id}")
+
+
+def _resolve_sender_trace_reasoning_metadata_from_layer_counts(
+    cfg: Any,
+    *,
+    sender_layer_count: int,
+    receiver_layer_count: Optional[int],
+) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    effective_receiver_layer_count = (
+        int(receiver_layer_count)
+        if receiver_layer_count is not None
+        else int(sender_layer_count)
+    )
+    reasoning_layer_indices = _resolve_reasoning_layer_indices_from_counts(
+        int(sender_layer_count),
+        effective_receiver_layer_count,
+    )
+    reasoning_layer_weights = _resolve_reasoning_layer_weights(cfg, reasoning_layer_indices)
+    return (
+        tuple(int(index) for index in reasoning_layer_indices),
+        tuple(float(weight) for weight in reasoning_layer_weights),
+    )
+
+
+def _sender_trace_state_key(cfg: Any) -> tuple[Any, ...]:
+    return (
+        str(cfg.agent_a_model),
+        str(cfg.agent_b_model),
+        str(cfg.torch_dtype),
+        str(getattr(cfg, "device_map", "auto")),
+        tuple(float(weight) for weight in getattr(getattr(cfg, "alignment", None), "reasoning_layer_weights", ())),
+    )
+
+
+def _get_sender_trace_state(cfg: Any) -> dict[str, Any]:
+    global _SENDER_TRACE_STATE, _SENDER_TRACE_STATE_KEY
+
+    state_key = _sender_trace_state_key(cfg)
+    if _SENDER_TRACE_STATE is not None and _SENDER_TRACE_STATE_KEY == state_key:
+        return _SENDER_TRACE_STATE
+
+    tokenizer_a = AutoTokenizer.from_pretrained(cfg.agent_a_model, trust_remote_code=True)
+    agent_a = load_agent(
+        str(cfg.agent_a_model),
+        torch_dtype=str(cfg.torch_dtype),
+        device_map=str(getattr(cfg, "device_map", "auto")),
+    )
+    sender_layer_count = _model_layer_count_from_loaded_model(
+        agent_a,
+        model_id=str(cfg.agent_a_model),
+    )
+    receiver_layer_count: Optional[int]
+    receiver_layer_count_source = "sender_fallback"
+    try:
+        receiver_summary = load_model_architecture_summary(str(cfg.agent_b_model))
+        receiver_layer_count = receiver_summary.num_hidden_layers
+        if receiver_layer_count is not None:
+            receiver_layer_count_source = "receiver_config"
+    except Exception:  # noqa: BLE001
+        receiver_layer_count = None
+
+    reasoning_layer_indices, reasoning_layer_weights = (
+        _resolve_sender_trace_reasoning_metadata_from_layer_counts(
+            cfg,
+            sender_layer_count=sender_layer_count,
+            receiver_layer_count=receiver_layer_count,
+        )
+    )
+    _SENDER_TRACE_STATE = {
+        "tokenizer_a": tokenizer_a,
+        "agent_a": agent_a,
+        "global_reasoning_layer_indices": reasoning_layer_indices,
+        "global_reasoning_layer_weights": reasoning_layer_weights,
+        "sender_trace_state_sender_layer_count": int(sender_layer_count),
+        "sender_trace_state_receiver_layer_count": (
+            None if receiver_layer_count is None else int(receiver_layer_count)
+        ),
+        "sender_trace_state_receiver_layer_count_source": receiver_layer_count_source,
+        "_reasoner_token_ids_cache": {},
+        "_generated_sender_consensus_cache": {},
+    }
+    _SENDER_TRACE_STATE_KEY = state_key
+    return _SENDER_TRACE_STATE
+
+
 def _alignment_variant_cfg(
     cfg: Any,
     *,
@@ -448,8 +551,18 @@ def _generate_reasoner_text(prompt: str, cfg: Any, state: dict[str, Any]) -> str
     return tokenizer_a.decode(generated_ids, skip_special_tokens=True)
 
 
-def _sender_generated_trace_payload(result: dict[str, Any]) -> dict[str, Any]:
+def _cache_key_metadata(cache_key: tuple[Any, ...]) -> list[Any]:
+    return json.loads(json.dumps(cache_key, sort_keys=False, default=list))
+
+
+def _sender_generated_trace_payload(
+    result: dict[str, Any],
+    *,
+    cache_key: tuple[Any, ...],
+) -> dict[str, Any]:
     return {
+        "trace_cache_format_version": 2,
+        "cache_key": _cache_key_metadata(cache_key),
         "consensus_hidden_states": result["consensus_hidden_states"].detach().cpu(),
         "generated_token_ids": [int(token_id) for token_id in result["generated_token_ids"]],
         "generated_reasoning_text": str(result["generated_reasoning_text"]),
@@ -537,7 +650,10 @@ def _collect_sender_generated_consensus_state(
     trace_cache_path: Optional[Path] = None
     if _generated_trajectory_adapter_trace_cache_enabled(cfg):
         trace_cache_path = _generated_trajectory_adapter_trace_cache_path(cfg, cache_key)
-        cached_trace = _load_generated_trajectory_trace_from_disk(trace_cache_path)
+        cached_trace = _load_generated_trajectory_trace_from_disk(
+            trace_cache_path,
+            expected_cache_key=cache_key,
+        )
         if cached_trace is not None:
             result = _sender_generated_trace_result_from_payload(
                 cached_trace,
@@ -644,7 +760,7 @@ def _collect_sender_generated_consensus_state(
     result["generated_trace_cache_hit"] = False
     result["generated_trace_cache_path"] = "" if trace_cache_path is None else str(trace_cache_path)
     if trace_cache_path is not None:
-        torch.save(_sender_generated_trace_payload(result), trace_cache_path)
+        torch.save(_sender_generated_trace_payload(result, cache_key=cache_key), trace_cache_path)
     cache[cache_key] = result
     return result
 
@@ -1026,7 +1142,11 @@ def _load_generated_trajectory_training_rows_from_disk(cache_path: Path) -> Opti
     return cached_rows
 
 
-def _load_generated_trajectory_trace_from_disk(cache_path: Path) -> Optional[dict[str, Any]]:
+def _load_generated_trajectory_trace_from_disk(
+    cache_path: Path,
+    *,
+    expected_cache_key: Optional[tuple[Any, ...]] = None,
+) -> Optional[dict[str, Any]]:
     if not cache_path.is_file():
         return None
     try:
@@ -1035,6 +1155,9 @@ def _load_generated_trajectory_trace_from_disk(cache_path: Path) -> Optional[dic
         return None
     if not isinstance(cached_trace, dict):
         return None
+    if expected_cache_key is not None and cached_trace.get("cache_key") is not None:
+        if cached_trace.get("cache_key") != _cache_key_metadata(expected_cache_key):
+            return None
     consensus_hidden_states = cached_trace.get("consensus_hidden_states")
     if not isinstance(consensus_hidden_states, torch.Tensor):
         return None
@@ -1777,6 +1900,89 @@ def _generated_adapter_include_prompt_values(
         if value not in deduped:
             deduped.append(value)
     return tuple(deduped or [False])
+
+
+def _prepare_generated_trajectory_eval_traces(
+    *,
+    dataset_name: str,
+    dataset_split: Optional[str],
+    limit: int,
+    sample_indices: Optional[list[int]],
+    base_cfg: Any,
+    variant_cfg: Any,
+    variant_state: dict[str, Any],
+    method_names: Optional[Sequence[str]],
+) -> dict[str, Any]:
+    semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
+    if sample_indices is None and semantic_smoke_cfg is not None:
+        sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
+    effective_split = dataset_split or _default_split_for_dataset(dataset_name)
+    validation_size = _validation_size(base_cfg, dataset_name)
+    samples = get_dataloader(
+        dataset_name,
+        limit=limit,
+        split=effective_split,
+        validation_size=validation_size,
+        sample_indices=sample_indices,
+    )
+    effective_sample_indices = list(sample_indices) if sample_indices is not None else None
+    if effective_sample_indices is not None:
+        effective_sample_indices = effective_sample_indices[: min(limit, len(effective_sample_indices))]
+
+    prepared_rows: list[dict[str, Any]] = []
+    for include_prompt in _generated_adapter_include_prompt_values(method_names):
+        for index, row in enumerate(samples):
+            sample_index = (
+                effective_sample_indices[index]
+                if effective_sample_indices is not None and index < len(effective_sample_indices)
+                else index
+            )
+            prompt = pick_field(row, ("question", "problem"))
+            if not str(prompt).strip():
+                continue
+            sender_state = _collect_sender_generated_consensus_state(
+                prompt,
+                variant_state,
+                variant_cfg,
+                include_prompt=include_prompt,
+            )
+            prepared_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "dataset_split": effective_split,
+                    "sample_index": int(sample_index),
+                    "include_prompt": bool(include_prompt),
+                    "trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
+                    "trace_cache_path": sender_state.get("generated_trace_cache_path"),
+                    "sender_reasoning_status": sender_state.get("generated_reasoning_status"),
+                    "sender_final_answer_marker": sender_state.get(
+                        "generated_reasoning_final_answer_marker"
+                    ),
+                    "sender_reasoning_token_count": sender_state.get(
+                        "generated_reasoning_token_count"
+                    ),
+                }
+            )
+    trace_cache_values = [
+        bool(row["trace_cache_hit"])
+        for row in prepared_rows
+        if row.get("trace_cache_hit") is not None and row.get("trace_cache_hit") != ""
+    ]
+    return {
+        "dataset": dataset_name,
+        "dataset_split": effective_split,
+        "limit": int(limit),
+        "sample_indices": effective_sample_indices,
+        "trace_count": len(prepared_rows),
+        "trace_cache_hit_count": sum(1 for value in trace_cache_values if value),
+        "trace_cache_miss_count": sum(1 for value in trace_cache_values if not value),
+        "trace_cache_hit_rate_percentage": (
+            100.0 * sum(1 for value in trace_cache_values if value) / len(trace_cache_values)
+            if trace_cache_values
+            else None
+        ),
+        "traces": prepared_rows,
+    }
 
 
 def _maybe_append_answer_suffix_to_prefix_state(
@@ -3153,6 +3359,7 @@ def _configured_base_cfg(
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
+    semantic_min_sender_accuracy_percentage: Optional[float] = None,
     seed: Optional[int] = None,
     max_new_tokens: Optional[int] = None,
     reasoner_max_new_tokens: Optional[int] = None,
@@ -3240,6 +3447,10 @@ def _configured_base_cfg(
         base_cfg.handoff.embedding_manifold.top_k = int(embedding_manifold_top_k)
     if embedding_manifold_blend is not None:
         base_cfg.handoff.embedding_manifold.blend = float(embedding_manifold_blend)
+    if semantic_min_sender_accuracy_percentage is not None:
+        base_cfg.reporting.semantic_smoke.min_sender_accuracy_percentage = float(
+            semantic_min_sender_accuracy_percentage
+        )
     if seed is not None:
         base_cfg.seed = int(seed)
     if max_new_tokens is not None:
@@ -3336,6 +3547,7 @@ def run_benchmark(
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
+    semantic_min_sender_accuracy_percentage: Optional[float] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
     sample_indices: Optional[list[int]] = None,
@@ -3379,6 +3591,7 @@ def run_benchmark(
         embedding_manifold_enabled=embedding_manifold_enabled,
         embedding_manifold_top_k=embedding_manifold_top_k,
         embedding_manifold_blend=embedding_manifold_blend,
+        semantic_min_sender_accuracy_percentage=semantic_min_sender_accuracy_percentage,
         seed=seed,
         max_new_tokens=max_new_tokens,
         reasoner_max_new_tokens=reasoner_max_new_tokens,
@@ -3770,6 +3983,11 @@ def run_benchmark(
             and any(method in GENERATED_LATENT_METHODS for method in latent_methods)
         ):
             min_sender_correct_latent_accuracy = 100.0
+        min_sender_accuracy = getattr(
+            semantic_smoke_cfg,
+            "min_sender_accuracy_percentage",
+            None,
+        )
         min_sender_final_answer_marker_rate = getattr(
             semantic_smoke_cfg,
             "min_sender_final_answer_marker_rate_percentage",
@@ -3800,6 +4018,9 @@ def run_benchmark(
                 None
                 if min_sender_correct_latent_accuracy is None
                 else float(min_sender_correct_latent_accuracy)
+            ),
+            min_sender_accuracy_percentage=(
+                None if min_sender_accuracy is None else float(min_sender_accuracy)
             ),
             min_sender_final_answer_marker_rate_percentage=(
                 None
@@ -3939,6 +4160,9 @@ def run_benchmark(
 def prepare_generated_trajectory_adapter_cache(
     *,
     suite_name: str,
+    dataset_name: str,
+    dataset_split: Optional[str],
+    limit: int,
     report_output_path: Path,
     max_new_tokens: Optional[int] = None,
     reasoner_max_new_tokens: Optional[int] = None,
@@ -3963,6 +4187,9 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     seed: Optional[int] = None,
     method_names: Optional[list[str]] = None,
+    sample_indices: Optional[list[int]] = None,
+    prepare_adapter: bool = True,
+    prepare_eval_traces: bool = False,
     semantic_smoke: bool = False,
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
@@ -4006,50 +4233,78 @@ def prepare_generated_trajectory_adapter_cache(
         answer_only_final=answer_only_final,
     )
     suite_cfg = _suite_cfg(base_cfg, suite_name)
-    state = _get_pipeline_state(suite_cfg)
-    variant_cfg, variant_state = _alignment_variant_state(
-        suite_cfg,
-        state,
-        strategy="hybrid_affine",
-        prompt_calibration_enabled=False,
-    )
-    alignment_state = _generated_adapter_alignment_state_from_variant_state(variant_state)
-    prepared_adapters: list[dict[str, Any]] = []
-    for include_prompt in _generated_adapter_include_prompt_values(method_names):
-        info = _load_or_train_generated_trajectory_adapter_state(
-            variant_cfg,
-            variant_state,
-            alignment_state,
-            include_prompt=include_prompt,
+    if prepare_adapter:
+        state = _get_pipeline_state(suite_cfg)
+        variant_cfg, variant_state = _alignment_variant_state(
+            suite_cfg,
+            state,
+            strategy="hybrid_affine",
+            prompt_calibration_enabled=False,
         )
-        prepared_adapters.append(
-            {
-                "include_prompt": bool(include_prompt),
-                "enabled": bool(info.get("enabled", False)),
-                "status": info.get("status"),
-                "cache_hit": info.get("cache_hit"),
-                "cache_path": info.get("cache_path"),
-                "training_prompt_count": info.get("training_prompt_count"),
-                "training_token_count": info.get("training_token_count"),
-                "training_row_cache_hit": info.get("training_row_cache_hit"),
-                "training_row_cache_path": info.get("training_row_cache_path"),
-                "training_trace_cache_hit_count": info.get(
-                    "training_trace_cache_hit_count"
-                ),
-                "training_trace_cache_miss_count": info.get(
-                    "training_trace_cache_miss_count"
-                ),
-                "training_trace_cache_hit_rate_percentage": info.get(
-                    "training_trace_cache_hit_rate_percentage"
-                ),
-                "training_reconstruction_mse": info.get("training_reconstruction_mse"),
-                "training_mean_cosine_similarity": info.get(
-                    "training_mean_cosine_similarity"
-                ),
-            }
+        alignment_state = _generated_adapter_alignment_state_from_variant_state(variant_state)
+    else:
+        variant_cfg = _alignment_variant_cfg(
+            suite_cfg,
+            strategy="hybrid_affine",
+            prompt_calibration_enabled=False,
+        )
+        variant_state = _get_sender_trace_state(variant_cfg)
+        alignment_state = None
+    prepared_adapters: list[dict[str, Any]] = []
+    if prepare_adapter:
+        for include_prompt in _generated_adapter_include_prompt_values(method_names):
+            if alignment_state is None:
+                raise ValueError("Preparing generated adapters requires a full alignment state")
+            info = _load_or_train_generated_trajectory_adapter_state(
+                variant_cfg,
+                variant_state,
+                alignment_state,
+                include_prompt=include_prompt,
+            )
+            prepared_adapters.append(
+                {
+                    "include_prompt": bool(include_prompt),
+                    "enabled": bool(info.get("enabled", False)),
+                    "status": info.get("status"),
+                    "cache_hit": info.get("cache_hit"),
+                    "cache_path": info.get("cache_path"),
+                    "training_prompt_count": info.get("training_prompt_count"),
+                    "training_token_count": info.get("training_token_count"),
+                    "training_row_cache_hit": info.get("training_row_cache_hit"),
+                    "training_row_cache_path": info.get("training_row_cache_path"),
+                    "training_trace_cache_hit_count": info.get(
+                        "training_trace_cache_hit_count"
+                    ),
+                    "training_trace_cache_miss_count": info.get(
+                        "training_trace_cache_miss_count"
+                    ),
+                    "training_trace_cache_hit_rate_percentage": info.get(
+                        "training_trace_cache_hit_rate_percentage"
+                    ),
+                    "training_reconstruction_mse": info.get("training_reconstruction_mse"),
+                    "training_mean_cosine_similarity": info.get(
+                        "training_mean_cosine_similarity"
+                    ),
+                }
+            )
+    prepared_eval_traces = None
+    if prepare_eval_traces:
+        prepared_eval_traces = _prepare_generated_trajectory_eval_traces(
+            dataset_name=dataset_name,
+            dataset_split=dataset_split,
+            limit=limit,
+            sample_indices=sample_indices,
+            base_cfg=base_cfg,
+            variant_cfg=variant_cfg,
+            variant_state=variant_state,
+            method_names=method_names,
         )
     report_payload = {
         "suite": suite_name,
+        "dataset": dataset_name,
+        "dataset_split": (dataset_split or _default_split_for_dataset(dataset_name)),
+        "limit": int(limit),
+        "sample_indices": sample_indices,
         "methods": list(method_names or ("generated_latent_handoff",)),
         "agent_a_model": str(suite_cfg.agent_a_model),
         "agent_b_model": str(suite_cfg.agent_b_model),
@@ -4078,6 +4333,7 @@ def prepare_generated_trajectory_adapter_cache(
             },
         },
         "prepared_adapters": prepared_adapters,
+        "prepared_eval_traces": prepared_eval_traces,
     }
     write_json(report_output_path, report_payload)
     return report_payload
@@ -4250,6 +4506,11 @@ def main() -> None:
         help="Fit/load generated-trajectory adapter caches and exit before benchmark decoding.",
     )
     parser.add_argument(
+        "--prepare-generated-trajectory-eval-traces",
+        action="store_true",
+        help="Warm generated sender trace caches for the selected eval samples and exit.",
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-train-limit",
         type=int,
         default=None,
@@ -4377,6 +4638,12 @@ def main() -> None:
         help="Prompt text baselines to return only a final answer.",
     )
     parser.add_argument(
+        "--semantic-min-sender-accuracy",
+        type=float,
+        default=None,
+        help="Optional semantic smoke gate for generated sender answer accuracy.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -4404,7 +4671,10 @@ def main() -> None:
             args.methods = ",".join(default_methods)
         if args.receiver_context_mode is None:
             args.receiver_context_mode = "prompt_prefix"
-    if args.prepare_generated_trajectory_adapter and not args.methods:
+    if (
+        args.prepare_generated_trajectory_adapter
+        or args.prepare_generated_trajectory_eval_traces
+    ) and not args.methods:
         args.methods = "generated_latent_handoff"
     if args.limit is None:
         args.limit = DEFAULT_LIMIT
@@ -4421,7 +4691,10 @@ def main() -> None:
     )
     selected_method_set = set(method_names or ())
     uses_generated_latent = any(method in GENERATED_LATENT_METHODS for method in selected_method_set)
-    if args.prepare_generated_trajectory_adapter and uses_generated_latent:
+    if (
+        args.prepare_generated_trajectory_adapter
+        or args.prepare_generated_trajectory_eval_traces
+    ) and uses_generated_latent:
         if not args.disable_generated_trajectory_adapter:
             args.enable_generated_trajectory_adapter = True
         if (
@@ -4467,9 +4740,12 @@ def main() -> None:
         else None
     )
 
-    if args.prepare_generated_trajectory_adapter:
+    if args.prepare_generated_trajectory_adapter or args.prepare_generated_trajectory_eval_traces:
         report_payload = prepare_generated_trajectory_adapter_cache(
             suite_name=args.suite,
+            dataset_name=args.dataset,
+            dataset_split=args.split,
+            limit=args.limit,
             report_output_path=args.report_output,
             max_new_tokens=args.max_new_tokens,
             reasoner_max_new_tokens=args.reasoner_max_new_tokens,
@@ -4514,12 +4790,15 @@ def main() -> None:
             ),
             seed=args.seed,
             method_names=method_names,
+            sample_indices=sample_indices,
+            prepare_adapter=args.prepare_generated_trajectory_adapter,
+            prepare_eval_traces=args.prepare_generated_trajectory_eval_traces,
             semantic_smoke=args.semantic_smoke,
             mvp_smoke=args.mvp_smoke,
             hetero_smoke=args.hetero_smoke,
             answer_only_final=args.answer_only_final,
         )
-        print(f"Wrote generated trajectory adapter prepare report to {args.report_output}")
+        print(f"Wrote generated trajectory prepare report to {args.report_output}")
         for prepared in report_payload["prepared_adapters"]:
             print(
                 "Prepared generated trajectory adapter "
@@ -4528,6 +4807,15 @@ def main() -> None:
                 f"adapter_cache_hit={prepared['cache_hit']} "
                 f"row_cache_hit={prepared['training_row_cache_hit']} "
                 f"trace_hit_rate={prepared['training_trace_cache_hit_rate_percentage']}"
+            )
+        prepared_eval_traces = report_payload.get("prepared_eval_traces")
+        if prepared_eval_traces is not None:
+            print(
+                "Prepared generated trajectory eval traces "
+                f"count={prepared_eval_traces['trace_count']} "
+                f"cache_hit_rate={prepared_eval_traces['trace_cache_hit_rate_percentage']} "
+                f"hits={prepared_eval_traces['trace_cache_hit_count']} "
+                f"misses={prepared_eval_traces['trace_cache_miss_count']}"
             )
         return
 
@@ -4603,6 +4891,7 @@ def main() -> None:
         ),
         embedding_manifold_top_k=args.embedding_manifold_top_k,
         embedding_manifold_blend=args.embedding_manifold_blend,
+        semantic_min_sender_accuracy_percentage=args.semantic_min_sender_accuracy,
         seed=args.seed,
         method_names=method_names,
         sample_indices=sample_indices,

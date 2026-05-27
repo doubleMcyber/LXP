@@ -16,6 +16,7 @@ from benchmark_all import (
     _apply_generated_adapter_local_residual,
     _build_generated_adapter_local_residual_state,
     _answers_match,
+    _cache_key_metadata,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_training_rows_cache_key,
@@ -26,6 +27,7 @@ from benchmark_all import (
     _load_generated_trajectory_trace_from_disk,
     _methods_for_suite,
     _predicted_answer,
+    _resolve_sender_trace_reasoning_metadata_from_layer_counts,
     _select_generated_adapter_memory_rows,
 )
 from src.utils.benchmarking import (
@@ -412,6 +414,57 @@ def test_semantic_smoke_report_flags_sender_correct_latent_regressions() -> None
     )
 
 
+def test_semantic_smoke_report_flags_sender_accuracy_regressions_separately() -> None:
+    report = build_semantic_smoke_report(
+        [
+            {
+                "method": "generated_latent_handoff",
+                "predicted_answer": "42",
+                "target_answer": "42",
+                "correct": True,
+                "decoded_text": "Final answer: 42",
+                "sender_reasoning_text": "Final answer: 42",
+                "sender_reasoning_status": "complete",
+                "sender_final_answer_marker": True,
+                "sender_predicted_answer": "42",
+                "sender_answer_matches_target": True,
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 2.0,
+            },
+            {
+                "method": "generated_latent_handoff",
+                "predicted_answer": "108",
+                "target_answer": "107",
+                "correct": False,
+                "decoded_text": "Final answer: 108",
+                "sender_reasoning_text": "Final answer: 108",
+                "sender_reasoning_status": "complete",
+                "sender_final_answer_marker": True,
+                "sender_predicted_answer": "108",
+                "sender_answer_matches_target": False,
+                "kv_cache_status": "not_provided",
+                "answer_perplexity": 2.0,
+            },
+        ],
+        baseline_methods=(),
+        latent_methods=("generated_latent_handoff",),
+        min_latent_accuracy_percentage=None,
+        min_latent_accuracy_when_sender_correct_percentage=100.0,
+        min_sender_accuracy_percentage=100.0,
+        min_method_accuracy_percentage=None,
+        require_final_answer_marker_methods=("generated_latent_handoff",),
+    )
+
+    assert report["passed"] is False
+    assert report["sender_accuracy_percentage"] == 50.0
+    assert report["latent_accuracy_when_sender_correct_percentage"] == 100.0
+    assert any("Sender accuracy" in item for item in report["missing_requirements"])
+    assert not any(
+        "Latent accuracy when sender is correct" in item
+        for item in report["missing_requirements"]
+    )
+
+
 def test_semantic_smoke_report_flags_incomplete_sender_reasoning() -> None:
     report = build_semantic_smoke_report(
         [
@@ -747,10 +800,25 @@ def test_generated_trajectory_trace_cache_key_tracks_prompt_and_sender_setup() -
     )
 
 
+def test_sender_trace_reasoning_metadata_uses_receiver_layer_bound() -> None:
+    cfg = OmegaConf.create({"alignment": {"reasoning_layer_weights": [0.2, 0.3, 0.5]}})
+
+    indices, weights = _resolve_sender_trace_reasoning_metadata_from_layer_counts(
+        cfg,
+        sender_layer_count=30,
+        receiver_layer_count=18,
+    )
+
+    assert indices == (12, 16)
+    assert weights == pytest.approx((0.4, 0.6))
+
+
 def test_load_generated_trajectory_trace_validates_disk_cache(tmp_path) -> None:
     cache_path = tmp_path / "trace.pt"
+    expected_key = ("generated_trajectory_trace_v1", "model", ["weights"])
     torch.save(
         {
+            "cache_key": _cache_key_metadata(expected_key),
             "consensus_hidden_states": torch.zeros(1, 2, 3),
             "generated_token_ids": [1, 2],
             "generated_reasoning_text": "Final answer: 4",
@@ -758,13 +826,24 @@ def test_load_generated_trajectory_trace_validates_disk_cache(tmp_path) -> None:
         cache_path,
     )
 
-    loaded = _load_generated_trajectory_trace_from_disk(cache_path)
+    loaded = _load_generated_trajectory_trace_from_disk(
+        cache_path,
+        expected_cache_key=expected_key,
+    )
 
     assert loaded is not None
     assert loaded["generated_token_ids"] == [1, 2]
+    assert (
+        _load_generated_trajectory_trace_from_disk(
+            cache_path,
+            expected_cache_key=("generated_trajectory_trace_v1", "other", ["weights"]),
+        )
+        is None
+    )
 
     torch.save(
         {
+            "cache_key": _cache_key_metadata(expected_key),
             "consensus_hidden_states": torch.zeros(2, 3),
             "generated_token_ids": [1, 2],
             "generated_reasoning_text": "Final answer: 4",

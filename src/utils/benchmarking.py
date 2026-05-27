@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 16
+REPORT_SCHEMA_VERSION = 17
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -703,6 +703,7 @@ def build_semantic_smoke_report(
     min_baseline_accuracy_percentage: Optional[float] = None,
     min_latent_accuracy_percentage: Optional[float] = None,
     min_latent_accuracy_when_sender_correct_percentage: Optional[float] = None,
+    min_sender_accuracy_percentage: Optional[float] = None,
     min_sender_final_answer_marker_rate_percentage: Optional[float] = None,
     min_method_accuracy_percentage: Optional[float] = None,
     min_latent_non_empty_decoded_rate_percentage: float = 100.0,
@@ -894,6 +895,15 @@ def build_semantic_smoke_report(
                 f"{latent_accuracy_when_sender_correct:.2f}% is below required "
                 f"{float(min_latent_accuracy_when_sender_correct_percentage):.2f}%."
             )
+    if min_sender_accuracy_percentage is not None:
+        if sender_accuracy_rate is None:
+            missing_requirements.append("No sender correctness rows were provided.")
+        elif sender_accuracy_rate < float(min_sender_accuracy_percentage):
+            missing_requirements.append(
+                "Sender accuracy "
+                f"{sender_accuracy_rate:.2f}% is below required "
+                f"{float(min_sender_accuracy_percentage):.2f}%."
+            )
     if min_sender_final_answer_marker_rate_percentage is not None:
         if sender_final_answer_marker_rate is None:
             missing_requirements.append("No sender reasoning rows were provided.")
@@ -974,6 +984,7 @@ def build_semantic_smoke_report(
             min_sender_final_answer_marker_rate_percentage
         ),
         "sender_accuracy_percentage": sender_accuracy_rate,
+        "min_sender_accuracy_percentage": min_sender_accuracy_percentage,
         "sender_correct_latent_sample_count": len(sender_correct_latent_rows),
         "latent_accuracy_when_sender_correct_percentage": latent_accuracy_when_sender_correct,
         "min_latent_accuracy_when_sender_correct_percentage": (

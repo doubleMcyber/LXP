@@ -34,6 +34,14 @@ Adapter caches can be prepared without benchmark decoding:
 venv/bin/python benchmark_all.py --hetero-smoke --prepare-generated-trajectory-adapter --generated-trajectory-adapter-input-space raw --report-output outputs/generated_adapter_prepare_report.json
 ```
 
+Eval sender traces can also be warmed before a larger semantic gate:
+
+```bash
+venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --prepare-generated-trajectory-eval-traces --generated-trajectory-adapter-input-space raw --report-output outputs/generated_eval_trace_prepare_report.json
+```
+
+For larger generated-latent runs, add `--semantic-min-sender-accuracy 100` when you want the report to distinguish a sender reasoning miss from a latent-transfer miss.
+
 ## Latent Blame
 
 `src/utils/latent_blame.py` contains the first validation harness for git-blame-style latent packet attribution. It records latent packets with sender/receiver/turn/tensor metadata, replays a run through caller-provided replay logic, applies ablation/noise/replacement interventions, ranks packets by causal impact, and emits a concise blame report.
