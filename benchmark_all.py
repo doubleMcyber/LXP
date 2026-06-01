@@ -2226,11 +2226,24 @@ def _prepare_generated_trajectory_eval_traces(
                 variant_cfg,
                 include_prompt=include_prompt,
             )
+            target_answer = _target_answer(dataset_name, row)
+            sender_reasoning_text = str(sender_state.get("generated_reasoning_text", ""))
+            sender_predicted_answer = (
+                _predicted_answer(dataset_name, sender_reasoning_text)
+                if sender_reasoning_text.strip()
+                else None
+            )
+            sender_answer_matches_target = (
+                _answers_match(dataset_name, sender_predicted_answer, target_answer)
+                if sender_predicted_answer is not None and target_answer is not None
+                else None
+            )
             prepared_rows.append(
                 {
                     "dataset": dataset_name,
                     "dataset_split": effective_split,
                     "sample_index": int(sample_index),
+                    "target_answer": target_answer,
                     "include_prompt": bool(include_prompt),
                     "trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
                     "trace_cache_path": sender_state.get("generated_trace_cache_path"),
@@ -2255,12 +2268,20 @@ def _prepare_generated_trajectory_eval_traces(
                     "sender_reasoning_token_count": sender_state.get(
                         "generated_reasoning_token_count"
                     ),
+                    "sender_predicted_answer": sender_predicted_answer,
+                    "sender_answer_matches_target": sender_answer_matches_target,
                 }
             )
     trace_cache_values = [
         bool(row["trace_cache_hit"])
         for row in prepared_rows
         if row.get("trace_cache_hit") is not None and row.get("trace_cache_hit") != ""
+    ]
+    sender_answer_values = [
+        bool(row["sender_answer_matches_target"])
+        for row in prepared_rows
+        if row.get("sender_answer_matches_target") is not None
+        and row.get("sender_answer_matches_target") != ""
     ]
     return {
         "dataset": dataset_name,
@@ -2273,6 +2294,11 @@ def _prepare_generated_trajectory_eval_traces(
         "trace_cache_hit_rate_percentage": (
             100.0 * sum(1 for value in trace_cache_values if value) / len(trace_cache_values)
             if trace_cache_values
+            else None
+        ),
+        "sender_accuracy_percentage": (
+            100.0 * sum(1 for value in sender_answer_values if value) / len(sender_answer_values)
+            if sender_answer_values
             else None
         ),
         "traces": prepared_rows,
