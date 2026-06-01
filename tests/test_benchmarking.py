@@ -17,8 +17,13 @@ from benchmark_all import (
     _build_generated_adapter_local_residual_state,
     _answers_match,
     _cache_key_metadata,
+    _final_answer_tail_needs_scalar_verification,
+    _format_sender_answer_text_handoff_prompt,
+    _format_verified_final_answer_text,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
+    _generated_trajectory_adapter_target_text,
+    _generated_trajectory_adapter_trace_cache_path,
     _generated_trajectory_adapter_training_rows_cache_key,
     _generated_trajectory_trace_cache_key,
     _generated_adapter_include_prompt_values,
@@ -28,6 +33,7 @@ from benchmark_all import (
     _methods_for_suite,
     _predicted_answer,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
+    _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
 )
@@ -645,6 +651,26 @@ def test_gsm8k_prediction_prefers_complete_boxed_final_answer() -> None:
     assert _predicted_answer("gsm8k", decoded) == "28"
 
 
+def test_final_answer_tail_flags_non_scalar_sender_answers() -> None:
+    assert _final_answer_tail_needs_scalar_verification("Final answer: 10 boys") is True
+    assert _final_answer_tail_needs_scalar_verification("Final answer: 17.") is False
+
+
+def test_verified_final_answer_payload_stays_compact() -> None:
+    assert _format_verified_final_answer_text("300") == (
+        "\n\nVerification decision:\nFinal answer: 300.\n"
+    )
+
+
+def test_sender_answer_text_handoff_prompt_is_copy_only() -> None:
+    prompt = _format_sender_answer_text_handoff_prompt("300")
+
+    assert "Verified upstream final answer" in prompt
+    assert "300" in prompt
+    assert prompt.rstrip().endswith("Final answer:")
+    assert "original problem" not in prompt.casefold()
+
+
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
     assert _answers_match("gsm8k", "252.00", "252")
     assert _answers_match("gsm8k", "9,800.0", "9800")
@@ -685,6 +711,93 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
     cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
     with pytest.raises(ValueError, match="generated_text"):
         _generated_trajectory_adapter_target_alignment(cfg)
+
+
+def test_generated_trajectory_final_answer_target_uses_latest_marker() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "target_mode": "final_answer_line",
+                },
+            },
+        }
+    )
+    generated_text = (
+        "Initial attempt.\nFinal answer: 175.\n\n"
+        "Verification decision:\nFinal answer: 300.\n"
+    )
+
+    assert _generated_trajectory_adapter_target_text(cfg, generated_text) == (
+        "Final answer: 300"
+    )
+
+
+def test_text_hybrid_reuses_generated_sender_trace_cache(tmp_path) -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "agent-a",
+            "agent_b_model": "agent-b",
+            "torch_dtype": "bfloat16",
+            "max_new_tokens": 64,
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 64,
+                "sender_revision": {
+                    "enabled": True,
+                    "max_new_tokens": 512,
+                    "disagreement_verifier_enabled": True,
+                    "disagreement_verifier_max_new_tokens": 512,
+                },
+            },
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "trace_cache_enabled": True,
+                    "trace_cache_dir": str(tmp_path),
+                },
+            },
+        }
+    )
+    state = {
+        "global_reasoning_layer_indices": (1, 2),
+        "global_reasoning_layer_weights": (0.4, 0.6),
+    }
+    prompt = "What is 40 + 2?"
+    cache_key = _generated_trajectory_trace_cache_key(
+        cfg,
+        state,
+        prompt,
+        include_prompt=False,
+    )
+    cache_path = _generated_trajectory_adapter_trace_cache_path(cfg, cache_key)
+    torch.save(
+        {
+            "trace_cache_format_version": 2,
+            "cache_key": _cache_key_metadata(cache_key),
+            "consensus_hidden_states": torch.zeros(1, 1, 2),
+            "generated_token_ids": [4, 2],
+            "generated_reasoning_text": "Final answer: 42.",
+            "generated_reasoning_token_count": 2,
+            "generated_reasoning_status": "complete",
+            "generated_reasoning_final_answer_marker": True,
+            "generated_latent_includes_prompt": False,
+            "sender_revision_enabled": True,
+            "sender_revision_applied": True,
+            "sender_initial_predicted_answer": "41",
+            "sender_revision_predicted_answer": "42",
+            "sender_revision_decision_applied": True,
+            "sender_revision_decision_predicted_answer": "42",
+        },
+        cache_path,
+    )
+
+    metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+
+    assert metadata["token_ids"] == [4, 2]
+    assert metadata["reasoning_text"] == "Final answer: 42."
+    assert metadata["trace_cache_hit"] is True
+    assert metadata["trace_cache_path"] == str(cache_path)
+    assert metadata["sender_revision_decision_predicted_answer"] == "42"
 
 
 def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() -> None:
@@ -1166,10 +1279,12 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert phase1_methods == [
         "pure_text_cot",
         "text_text_hybrid",
+        "sender_answer_text_handoff",
         "homogeneous_ridge_latent",
         "homogeneous_orthogonal_latent",
     ]
     assert "text_text_hybrid" in standard_methods
+    assert "sender_answer_text_handoff" in standard_methods
     assert "global_anchor_orthogonal" in standard_methods
     assert "global_anchor_ridge" in standard_methods
     assert "global_anchor_hybrid_affine" in standard_methods

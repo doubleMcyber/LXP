@@ -127,6 +127,13 @@ DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
 DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
     "generated_latent_handoff",
 )
+TEXT_BASELINE_METHODS = frozenset(
+    (
+        "pure_text_cot",
+        "text_text_hybrid",
+        "sender_answer_text_handoff",
+    )
+)
 GENERATED_TRAJECTORY_ADAPTER_INPUT_SPACES = frozenset(("aligned", "raw"))
 GENERATED_TRAJECTORY_ADAPTER_TARGET_ALIGNMENTS = frozenset(("character", "linear"))
 GENERATED_LATENT_METHODS = frozenset(
@@ -261,7 +268,7 @@ def _sender_revision_disagreement_verifier_max_new_tokens(cfg: Any) -> int:
 
 def _sender_generation_cache_fingerprint(cfg: Any) -> tuple[Any, ...]:
     return (
-        "sender_generation_v5",
+        "sender_generation_v7",
         bool(_answer_only_final_enabled(cfg)),
         bool(_sender_revision_enabled(cfg)),
         int(_sender_revision_max_new_tokens(cfg)),
@@ -311,17 +318,25 @@ def _format_reasoner_revision_decision_prompt(
     revision_answer: Optional[str],
     tokenizer: Any = None,
 ) -> str:
+    candidate_b = revision_answer if revision_answer is not None else "missing or incomplete"
     user_message = (
         f"{prompt}\n\n"
-        "Two independent solution attempts disagreed.\n"
+        "Verify the final answer from the original problem only.\n"
         f"Candidate A answer: {initial_answer or 'missing'}\n"
-        f"Candidate B answer: {revision_answer or 'missing'}\n\n"
-        "Resolve the disagreement from the original problem only. Copy each numeric "
+        f"Candidate B answer: {candidate_b}\n\n"
+        "Copy each numeric "
         "quantity and relationship exactly as written, translate the copied facts into "
-        "equations, and check the arithmetic. Do not choose by candidate order. End "
-        "with exactly: Final answer: <answer>."
+        "equations, and check the arithmetic. Do not choose by candidate order. For "
+        "GSM8K-style scoring, the final answer must be one scalar number; if the "
+        "reasoning has multiple category counts and the question asks how many are "
+        "left or how many total, sum the relevant categories. End with exactly: "
+        "Final answer: <answer>."
     )
     return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_verified_final_answer_text(answer: str) -> str:
+    return f"\n\nVerification decision:\nFinal answer: {answer}.\n"
 
 
 def _format_text_cot_prompt(prompt: str, tokenizer: Any = None, cfg: Any = None) -> str:
@@ -375,6 +390,19 @@ def _serialize_text_hybrid_prompt(
     return _maybe_apply_chat_template(tokenizer, user_message)
 
 
+def _format_sender_answer_text_handoff_prompt(
+    sender_answer: str,
+    tokenizer: Any = None,
+) -> str:
+    user_message = (
+        "Verified upstream final answer:\n"
+        f"{sender_answer}\n\n"
+        "Copy that answer exactly. Return one line only.\n"
+        "Final answer:"
+    )
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
 def _maybe_apply_chat_template(tokenizer: Any, user_message: str) -> str:
     if tokenizer is None or not getattr(tokenizer, "chat_template", None):
         return user_message
@@ -410,6 +438,22 @@ def _final_answer_marker_value(text: str) -> Optional[str]:
     if not marker_candidates:
         return None
     return sorted(marker_candidates, key=lambda item: item[0])[-1][1].strip()
+
+
+def _final_answer_marker_tail(text: str) -> str:
+    marker_matches = list(FINAL_ANSWER_MARKER_REGEX.finditer(str(text)))
+    marker_matches.extend(FINAL_ANSWER_BOXED_REGEX.finditer(str(text)))
+    if not marker_matches:
+        return ""
+    latest_match = sorted(marker_matches, key=lambda item: item.start())[-1]
+    return str(text)[latest_match.end() :].splitlines()[0].strip()
+
+
+def _final_answer_tail_needs_scalar_verification(text: str) -> bool:
+    tail = _final_answer_marker_tail(text)
+    if not tail:
+        return False
+    return re.search(r"[A-Za-z]", tail) is not None
 
 
 def _generate_agent_a_token_ids(
@@ -507,13 +551,21 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
         )
         revision_text = tokenizer_a.decode(revision_ids, skip_special_tokens=True)
         revision_answer = _final_answer_marker_value(revision_text)
-        if (
+        answer_disagreement = (
             revision_answer is not None
             and initial_answer is not None
             and _normalize_numeric_answer(revision_answer)
             != _normalize_numeric_answer(initial_answer)
-            and _sender_revision_disagreement_verifier_enabled(cfg)
-        ):
+        )
+        needs_scalar_verification = _final_answer_tail_needs_scalar_verification(
+            revision_text if revision_answer is not None else initial_text
+        )
+        needs_decision = (
+            revision_answer is None
+            or answer_disagreement
+            or needs_scalar_verification
+        )
+        if needs_decision and _sender_revision_disagreement_verifier_enabled(cfg):
             decision_ids = _generate_agent_a_token_ids(
                 _format_reasoner_revision_decision_prompt(
                     prompt,
@@ -538,17 +590,16 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
                 *[int(token_id) for token_id in revision_ids],
             ]
             revision_applied = True
-            if decision_answer is not None:
-                decision_separator_ids = tokenizer_a.encode(
-                    "\n\nVerification decision:\n",
-                    add_special_tokens=False,
-                )
-                token_ids = [
-                    *token_ids,
-                    *[int(token_id) for token_id in decision_separator_ids],
-                    *[int(token_id) for token_id in decision_ids],
-                ]
-                decision_applied = True
+        if decision_answer is not None:
+            compact_decision_ids = tokenizer_a.encode(
+                _format_verified_final_answer_text(decision_answer),
+                add_special_tokens=False,
+            )
+            token_ids = [
+                *[int(token_id) for token_id in initial_ids],
+                *[int(token_id) for token_id in compact_decision_ids],
+            ]
+            decision_applied = True
 
     metadata = {
         "token_ids": [int(token_id) for token_id in token_ids],
@@ -781,6 +832,74 @@ def _generate_reasoner_text(prompt: str, cfg: Any, state: dict[str, Any]) -> str
     tokenizer_a = state["tokenizer_a"]
     generated_ids = _generate_reasoner_metadata(prompt, cfg, state)["token_ids"]
     return tokenizer_a.decode(generated_ids, skip_special_tokens=True)
+
+
+def _reasoner_metadata_for_text_hybrid(
+    prompt: str,
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    trace_cache_path: Optional[Path] = None
+    if _generated_trajectory_adapter_trace_cache_enabled(cfg):
+        cache_key = _generated_trajectory_trace_cache_key(
+            cfg,
+            state,
+            prompt,
+            include_prompt=False,
+        )
+        trace_cache_path = _generated_trajectory_adapter_trace_cache_path(cfg, cache_key)
+        cached_trace = _load_generated_trajectory_trace_from_disk(
+            trace_cache_path,
+            expected_cache_key=cache_key,
+        )
+        if cached_trace is not None:
+            generated_token_ids = [
+                int(token_id) for token_id in cached_trace["generated_token_ids"]
+            ]
+            return {
+                "token_ids": generated_token_ids,
+                "reasoning_text": str(cached_trace["generated_reasoning_text"]),
+                "trace_cache_hit": True,
+                "trace_cache_path": str(trace_cache_path),
+                "sender_revision_enabled": bool(
+                    cached_trace.get("sender_revision_enabled", False)
+                ),
+                "sender_revision_applied": bool(
+                    cached_trace.get("sender_revision_applied", False)
+                ),
+                "sender_initial_predicted_answer": cached_trace.get(
+                    "sender_initial_predicted_answer"
+                ),
+                "sender_revision_predicted_answer": cached_trace.get(
+                    "sender_revision_predicted_answer"
+                ),
+                "sender_revision_decision_applied": bool(
+                    cached_trace.get("sender_revision_decision_applied", False)
+                ),
+                "sender_revision_decision_predicted_answer": cached_trace.get(
+                    "sender_revision_decision_predicted_answer"
+                ),
+            }
+
+    tokenizer_a = state["tokenizer_a"]
+    generation_metadata = _generate_reasoner_metadata(prompt, cfg, state)
+    generated_token_ids = [int(token_id) for token_id in generation_metadata["token_ids"]]
+    return {
+        "token_ids": generated_token_ids,
+        "reasoning_text": tokenizer_a.decode(generated_token_ids, skip_special_tokens=True),
+        "trace_cache_hit": False if trace_cache_path is not None else None,
+        "trace_cache_path": "" if trace_cache_path is None else str(trace_cache_path),
+        "sender_revision_enabled": bool(generation_metadata["revision_enabled"]),
+        "sender_revision_applied": bool(generation_metadata["revision_applied"]),
+        "sender_initial_predicted_answer": generation_metadata.get("initial_predicted_answer"),
+        "sender_revision_predicted_answer": generation_metadata.get("revision_predicted_answer"),
+        "sender_revision_decision_applied": bool(
+            generation_metadata["revision_decision_applied"]
+        ),
+        "sender_revision_decision_predicted_answer": generation_metadata.get(
+            "revision_decision_predicted_answer"
+        ),
+    }
 
 
 def _cache_key_metadata(cache_key: tuple[Any, ...]) -> list[Any]:
@@ -1238,6 +1357,13 @@ def _generated_trajectory_adapter_target_alignment(cfg: Any) -> str:
     return alignment
 
 
+def _generated_trajectory_adapter_target_cache_tag(cfg: Any) -> str:
+    target_mode = _generated_trajectory_adapter_target_mode(cfg)
+    if target_mode == "final_answer_line":
+        return "final_answer_line_latest_marker_v1"
+    return target_mode
+
+
 def _generated_trajectory_adapter_input_space(cfg: Any) -> str:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     input_space = str(getattr(adapter_cfg, "input_space", "aligned")).strip().lower()
@@ -1459,7 +1585,7 @@ def _generated_trajectory_adapter_cache_key(
         _generated_trajectory_adapter_train_limit(cfg),
         _generated_trajectory_adapter_source_mode(cfg),
         _generated_trajectory_adapter_source_tail_tokens(cfg),
-        _generated_trajectory_adapter_target_mode(cfg),
+        _generated_trajectory_adapter_target_cache_tag(cfg),
         _generated_trajectory_adapter_target_alignment(cfg),
         _generated_trajectory_adapter_input_space(cfg),
         str(_generated_trajectory_adapter_value(cfg, "strategy", "hybrid_affine")),
@@ -1524,7 +1650,7 @@ def _generated_trajectory_adapter_training_rows_cache_key(
         _generated_trajectory_adapter_train_limit(cfg),
         _generated_trajectory_adapter_source_mode(cfg),
         _generated_trajectory_adapter_source_tail_tokens(cfg),
-        _generated_trajectory_adapter_target_mode(cfg),
+        _generated_trajectory_adapter_target_cache_tag(cfg),
         _generated_trajectory_adapter_target_alignment(cfg),
         _generated_trajectory_adapter_input_space(cfg),
     )
@@ -1647,9 +1773,9 @@ def _generated_trajectory_adapter_target_text(cfg: Any, generated_text: str) -> 
     if mode == "generated_text":
         return str(generated_text)
     if mode == "final_answer_line":
-        marker_match = FINAL_ANSWER_MARKER_REGEX.search(str(generated_text))
-        if marker_match is not None:
-            return f"Final answer: {marker_match.group(1)}"
+        final_answer = _final_answer_marker_value(str(generated_text))
+        if final_answer is not None:
+            return f"Final answer: {final_answer}"
         return str(generated_text)
     raise ValueError(
         "handoff.generated_trajectory_adapter.target_mode must be one of: "
@@ -2636,9 +2762,11 @@ def run_text_text_hybrid(
 ) -> dict[str, Any]:
     tokenizer_b = state["tokenizer_b"]
     agent_b = state["agent_b"]
-    tokenizer_a = state["tokenizer_a"]
-    reasoning_token_ids = _generate_reasoner_token_ids(prompt, cfg, state)
-    reasoning_text = tokenizer_a.decode(reasoning_token_ids, skip_special_tokens=True)
+    reasoning_metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+    reasoning_token_ids = [
+        int(token_id) for token_id in reasoning_metadata["token_ids"]
+    ]
+    reasoning_text = str(reasoning_metadata["reasoning_text"])
     prefix_text = _serialize_text_hybrid_prompt(prompt, reasoning_text, tokenizer_b, cfg)
     prefix_state = prepare_text_prefix_state(
         model=agent_b,
@@ -2670,6 +2798,22 @@ def run_text_text_hybrid(
             cfg,
         ),
         "sender_final_answer_marker": FINAL_ANSWER_COMPLETE_REGEX.search(reasoning_text) is not None,
+        "sender_trace_cache_hit": reasoning_metadata.get("trace_cache_hit"),
+        "sender_trace_cache_path": reasoning_metadata.get("trace_cache_path"),
+        "sender_revision_enabled": reasoning_metadata.get("sender_revision_enabled"),
+        "sender_revision_applied": reasoning_metadata.get("sender_revision_applied"),
+        "sender_initial_predicted_answer": reasoning_metadata.get(
+            "sender_initial_predicted_answer"
+        ),
+        "sender_revision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_predicted_answer"
+        ),
+        "sender_revision_decision_applied": reasoning_metadata.get(
+            "sender_revision_decision_applied"
+        ),
+        "sender_revision_decision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_decision_predicted_answer"
+        ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
@@ -2681,6 +2825,95 @@ def run_text_text_hybrid(
         "kv_cache_transferred": None,
         "kv_cache_status": "not_applicable",
         "kv_cache_reason": "text_text_baseline",
+        "pre_alignment_l2_distance": None,
+        "pre_alignment_cosine_distance": None,
+        "post_alignment_l2_distance": None,
+        "post_alignment_cosine_distance": None,
+        "raw_handoff_entropy": None,
+        "handoff_uncertainty": None,
+        "confidence_gate_triggered": None,
+        "fallback_discrete_reasoning_steps": None,
+        "latent_trajectory_steps": None,
+        "total_reasoning_steps": None,
+        "continuous_integration_seconds": None,
+    }
+
+
+def run_sender_answer_text_handoff(
+    prompt: str,
+    target_answer_text: Optional[str],
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    tokenizer_b = state["tokenizer_b"]
+    agent_b = state["agent_b"]
+    reasoning_metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+    reasoning_token_ids = [
+        int(token_id) for token_id in reasoning_metadata["token_ids"]
+    ]
+    reasoning_text = str(reasoning_metadata["reasoning_text"])
+    sender_answer = _final_answer_marker_value(reasoning_text)
+    if sender_answer is None:
+        sender_answer = "<missing>"
+    del prompt
+    prefix_state = prepare_text_prefix_state(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_text=_format_sender_answer_text_handoff_prompt(sender_answer, tokenizer_b),
+    )
+    prefix_state["decoded_text_prefix"] = "Final answer:"
+    decode_metrics = greedy_decode_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        max_new_tokens=int(cfg.max_new_tokens),
+        stop_regex=_decode_stop_regex(cfg),
+    )
+    decoded_text = str(decode_metrics["decoded_text"])
+    answer_metrics = compute_answer_metrics_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        answer_text=target_answer_text,
+        answer_variants=_answer_metric_variants(cfg, target_answer_text),
+    )
+    return {
+        "decoded_text": decoded_text,
+        "sender_reasoning_text": reasoning_text,
+        "sender_reasoning_token_count": len(reasoning_token_ids),
+        "sender_reasoning_status": _sender_reasoning_status(
+            reasoning_token_ids,
+            reasoning_text,
+            cfg,
+        ),
+        "sender_final_answer_marker": FINAL_ANSWER_COMPLETE_REGEX.search(reasoning_text) is not None,
+        "sender_trace_cache_hit": reasoning_metadata.get("trace_cache_hit"),
+        "sender_trace_cache_path": reasoning_metadata.get("trace_cache_path"),
+        "sender_revision_enabled": reasoning_metadata.get("sender_revision_enabled"),
+        "sender_revision_applied": reasoning_metadata.get("sender_revision_applied"),
+        "sender_initial_predicted_answer": reasoning_metadata.get(
+            "sender_initial_predicted_answer"
+        ),
+        "sender_revision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_predicted_answer"
+        ),
+        "sender_revision_decision_applied": reasoning_metadata.get(
+            "sender_revision_decision_applied"
+        ),
+        "sender_revision_decision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_decision_predicted_answer"
+        ),
+        "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
+        "answer_token_count": answer_metrics["answer_token_count"],
+        "answer_nll": answer_metrics["answer_nll"],
+        "answer_perplexity": answer_metrics["answer_perplexity"],
+        "alignment_mode": "sender_answer_text_handoff",
+        "handoff_status": "not_applicable",
+        "handoff_surface": "text",
+        "kv_cache_transferred": None,
+        "kv_cache_status": "not_applicable",
+        "kv_cache_reason": "sender_answer_text_baseline",
         "pre_alignment_l2_distance": None,
         "pre_alignment_cosine_distance": None,
         "post_alignment_l2_distance": None,
@@ -3597,6 +3830,7 @@ def _methods_for_suite(
         methods = [
             ("pure_text_cot", run_pure_text_cot),
             ("text_text_hybrid", run_text_text_hybrid),
+            ("sender_answer_text_handoff", run_sender_answer_text_handoff),
             ("homogeneous_ridge_latent", run_homogeneous_ridge_latent),
             ("homogeneous_orthogonal_latent", run_homogeneous_orthogonal_latent),
         ]
@@ -3604,6 +3838,7 @@ def _methods_for_suite(
         methods = [
             ("pure_text_cot", run_pure_text_cot),
             ("text_text_hybrid", run_text_text_hybrid),
+            ("sender_answer_text_handoff", run_sender_answer_text_handoff),
             ("prompt_local_latent", run_prompt_local_latent),
             ("global_anchor_orthogonal", run_global_anchor_orthogonal),
             ("global_anchor_ridge", run_global_anchor_ridge),
@@ -4064,11 +4299,11 @@ def run_benchmark(
                     )
                     handoff_status = row_result.get(
                         "handoff_status",
-                        "not_applicable" if method_name in {"pure_text_cot", "text_text_hybrid"} else "",
+                        "not_applicable" if method_name in TEXT_BASELINE_METHODS else "",
                     )
                     handoff_surface = row_result.get(
                         "handoff_surface",
-                        "text" if method_name in {"pure_text_cot", "text_text_hybrid"} else "input_embedding",
+                        "text" if method_name in TEXT_BASELINE_METHODS else "input_embedding",
                     )
                     kv_cache_transferred = row_result.get("kv_cache_transferred")
                     kv_cache_status = row_result.get(
@@ -4095,7 +4330,7 @@ def run_benchmark(
                     active_kv_cache_source = row_result.get(
                         "active_kv_cache_source",
                         "text_baseline"
-                        if method_name in {"pure_text_cot", "text_text_hybrid"}
+                        if method_name in TEXT_BASELINE_METHODS
                         else "unknown",
                     )
                     sender_reasoning_text = str(row_result.get("sender_reasoning_text") or "")
@@ -4111,17 +4346,17 @@ def run_benchmark(
                     )
                     receiver_context_status = row_result.get(
                         "receiver_context_status",
-                        "not_applicable" if method_name in {"pure_text_cot", "text_text_hybrid"} else "not_used",
+                        "not_applicable" if method_name in TEXT_BASELINE_METHODS else "not_used",
                     )
                     receiver_context_reason = row_result.get(
                         "receiver_context_reason",
-                        "text_baseline" if method_name in {"pure_text_cot", "text_text_hybrid"} else "latent_only",
+                        "text_baseline" if method_name in TEXT_BASELINE_METHODS else "latent_only",
                     )
                     receiver_context_token_count = int(row_result.get("receiver_context_token_count", 0) or 0)
                     receiver_context_latent_position = row_result.get(
                         "receiver_context_latent_position",
                         "not_applicable"
-                        if method_name in {"pure_text_cot", "text_text_hybrid"}
+                        if method_name in TEXT_BASELINE_METHODS
                         else _receiver_context_latent_position(row_cfg),
                     )
                     sample_rows.append(
@@ -4334,19 +4569,19 @@ def run_benchmark(
             required_marker_methods = tuple(str(method) for method in required_marker_methods)
         if method_names is not None:
             selected_method_set = set(method_names)
-            selected_baselines = tuple(method for method in baseline_methods if method in selected_method_set)
-            selected_latents = tuple(method for method in latent_methods if method in selected_method_set)
+            selected_baselines = tuple(
+                method for method in baseline_methods if method in selected_method_set
+            )
+            selected_latents = tuple(
+                method for method in latent_methods if method in selected_method_set
+            )
             if not selected_baselines:
                 selected_baselines = tuple(
-                    method
-                    for method in method_names
-                    if method in {"pure_text_cot", "text_text_hybrid"}
+                    method for method in method_names if method in TEXT_BASELINE_METHODS
                 )
             if not selected_latents:
                 selected_latents = tuple(
-                    method
-                    for method in method_names
-                    if method not in {"pure_text_cot", "text_text_hybrid"}
+                    method for method in method_names if method not in TEXT_BASELINE_METHODS
                 )
             baseline_methods = selected_baselines
             latent_methods = selected_latents
@@ -5071,7 +5306,10 @@ def main() -> None:
     parser.add_argument(
         "--disable-sender-revision-disagreement-verifier",
         action="store_true",
-        help="Disable the extra verifier pass when initial and revised sender answers disagree.",
+        help=(
+            "Disable the extra verifier pass for missing, disagreeing, or non-scalar "
+            "sender revision answers."
+        ),
     )
     parser.add_argument(
         "--sender-revision-disagreement-verifier-max-new-tokens",
