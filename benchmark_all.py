@@ -8,7 +8,7 @@ import re
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 from omegaconf import OmegaConf
@@ -69,6 +69,7 @@ from src.utils.lm_eval import (
     prepare_receiver_context_latent_prefix_state,
     prepare_text_prefix_state,
 )
+from src.utils.latent_blame import build_latent_provenance_report
 from src.utils.model_compat import (
     load_model_architecture_summary,
     load_model_pair_compatibility,
@@ -131,6 +132,8 @@ TEXT_BASELINE_METHODS = frozenset(
     (
         "pure_text_cot",
         "text_text_hybrid",
+        "token_context_handoff",
+        "verified_token_context_handoff",
         "sender_answer_text_handoff",
     )
 )
@@ -398,6 +401,43 @@ def _format_sender_answer_text_handoff_prompt(
         "Verified upstream final answer:\n"
         f"{sender_answer}\n\n"
         "Copy that answer exactly. Return one line only.\n"
+        "Final answer:"
+    )
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_token_context_handoff_prompt(
+    prompt: str,
+    reasoning_text: str,
+    tokenizer: Any = None,
+    cfg: Any = None,
+) -> str:
+    instruction = (
+        "Use the transferred token context from Agent A. Return exactly one line "
+        "in this format: Final answer: <answer>."
+        if _answer_only_final_enabled(cfg)
+        else "Use the transferred token context from Agent A and give the final answer."
+    )
+    user_message = (
+        f"{prompt}\n\n"
+        f"Transferred token context from Agent A:\n{reasoning_text.strip()}\n\n"
+        f"{instruction}"
+    )
+    return _maybe_apply_chat_template(tokenizer, user_message)
+
+
+def _format_verified_token_context_handoff_prompt(
+    sender_answer: str,
+    reasoning_text: str,
+    tokenizer: Any = None,
+) -> str:
+    user_message = (
+        "Verified upstream final answer:\n"
+        f"{sender_answer}\n\n"
+        "Transferred token context from Agent A:\n"
+        f"{reasoning_text.strip()}\n\n"
+        "Use the verified upstream final answer as authoritative. Do not recompute.\n"
+        "Return one line only.\n"
         "Final answer:"
     )
     return _maybe_apply_chat_template(tokenizer, user_message)
@@ -2839,6 +2879,189 @@ def run_text_text_hybrid(
     }
 
 
+def _sender_trace_text_baseline_metadata(
+    *,
+    reasoning_metadata: Mapping[str, Any],
+    reasoning_token_ids: Sequence[int],
+    reasoning_text: str,
+    cfg: Any,
+) -> dict[str, Any]:
+    return {
+        "sender_reasoning_text": reasoning_text,
+        "sender_reasoning_token_count": len(reasoning_token_ids),
+        "sender_reasoning_status": _sender_reasoning_status(
+            reasoning_token_ids,
+            reasoning_text,
+            cfg,
+        ),
+        "sender_final_answer_marker": (
+            FINAL_ANSWER_COMPLETE_REGEX.search(reasoning_text) is not None
+        ),
+        "sender_trace_cache_hit": reasoning_metadata.get("trace_cache_hit"),
+        "sender_trace_cache_path": reasoning_metadata.get("trace_cache_path"),
+        "sender_revision_enabled": reasoning_metadata.get("sender_revision_enabled"),
+        "sender_revision_applied": reasoning_metadata.get("sender_revision_applied"),
+        "sender_initial_predicted_answer": reasoning_metadata.get(
+            "sender_initial_predicted_answer"
+        ),
+        "sender_revision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_predicted_answer"
+        ),
+        "sender_revision_decision_applied": reasoning_metadata.get(
+            "sender_revision_decision_applied"
+        ),
+        "sender_revision_decision_predicted_answer": reasoning_metadata.get(
+            "sender_revision_decision_predicted_answer"
+        ),
+    }
+
+
+def run_token_context_handoff(
+    prompt: str,
+    target_answer_text: Optional[str],
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    tokenizer_b = state["tokenizer_b"]
+    agent_b = state["agent_b"]
+    reasoning_metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+    reasoning_token_ids = [
+        int(token_id) for token_id in reasoning_metadata["token_ids"]
+    ]
+    reasoning_text = str(reasoning_metadata["reasoning_text"])
+    prefix_text = _format_token_context_handoff_prompt(
+        prompt,
+        reasoning_text,
+        tokenizer_b,
+        cfg,
+    )
+    prefix_state = prepare_text_prefix_state(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_text=prefix_text,
+    )
+    decode_metrics = greedy_decode_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        max_new_tokens=int(cfg.max_new_tokens),
+        stop_regex=_decode_stop_regex(cfg),
+    )
+    decoded_text = str(decode_metrics["decoded_text"])
+    answer_metrics = compute_answer_metrics_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        answer_text=target_answer_text,
+        answer_variants=_answer_metric_variants(cfg, target_answer_text),
+    )
+    return {
+        "decoded_text": decoded_text,
+        **_sender_trace_text_baseline_metadata(
+            reasoning_metadata=reasoning_metadata,
+            reasoning_token_ids=reasoning_token_ids,
+            reasoning_text=reasoning_text,
+            cfg=cfg,
+        ),
+        "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
+        "answer_token_count": answer_metrics["answer_token_count"],
+        "answer_nll": answer_metrics["answer_nll"],
+        "answer_perplexity": answer_metrics["answer_perplexity"],
+        "alignment_mode": "token_context_handoff",
+        "handoff_status": "not_applicable",
+        "handoff_surface": "text_token_context",
+        "kv_cache_transferred": None,
+        "kv_cache_status": "not_applicable",
+        "kv_cache_reason": "token_context_baseline",
+        "pre_alignment_l2_distance": None,
+        "pre_alignment_cosine_distance": None,
+        "post_alignment_l2_distance": None,
+        "post_alignment_cosine_distance": None,
+        "raw_handoff_entropy": None,
+        "handoff_uncertainty": None,
+        "confidence_gate_triggered": None,
+        "fallback_discrete_reasoning_steps": None,
+        "latent_trajectory_steps": None,
+        "total_reasoning_steps": None,
+        "continuous_integration_seconds": None,
+    }
+
+
+def run_verified_token_context_handoff(
+    prompt: str,
+    target_answer_text: Optional[str],
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    tokenizer_b = state["tokenizer_b"]
+    agent_b = state["agent_b"]
+    reasoning_metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+    reasoning_token_ids = [
+        int(token_id) for token_id in reasoning_metadata["token_ids"]
+    ]
+    reasoning_text = str(reasoning_metadata["reasoning_text"])
+    sender_answer = _final_answer_marker_value(reasoning_text)
+    if sender_answer is None:
+        sender_answer = "<missing>"
+    prefix_state = prepare_text_prefix_state(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_text=_format_verified_token_context_handoff_prompt(
+            sender_answer,
+            reasoning_text,
+            tokenizer_b,
+        ),
+    )
+    prefix_state["decoded_text_prefix"] = "Final answer:"
+    decode_metrics = greedy_decode_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        max_new_tokens=int(cfg.max_new_tokens),
+        stop_regex=_decode_stop_regex(cfg),
+    )
+    decoded_text = str(decode_metrics["decoded_text"])
+    answer_metrics = compute_answer_metrics_from_prefix(
+        model=agent_b,
+        tokenizer=tokenizer_b,
+        prefix_state=prefix_state,
+        answer_text=target_answer_text,
+        answer_variants=_answer_metric_variants(cfg, target_answer_text),
+    )
+    return {
+        "decoded_text": decoded_text,
+        **_sender_trace_text_baseline_metadata(
+            reasoning_metadata=reasoning_metadata,
+            reasoning_token_ids=reasoning_token_ids,
+            reasoning_text=reasoning_text,
+            cfg=cfg,
+        ),
+        "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
+        "answer_token_count": answer_metrics["answer_token_count"],
+        "answer_nll": answer_metrics["answer_nll"],
+        "answer_perplexity": answer_metrics["answer_perplexity"],
+        "alignment_mode": "verified_token_context_handoff",
+        "handoff_status": "not_applicable",
+        "handoff_surface": "text_verified_token_context",
+        "kv_cache_transferred": None,
+        "kv_cache_status": "not_applicable",
+        "kv_cache_reason": "verified_token_context_baseline",
+        "pre_alignment_l2_distance": None,
+        "pre_alignment_cosine_distance": None,
+        "post_alignment_l2_distance": None,
+        "post_alignment_cosine_distance": None,
+        "raw_handoff_entropy": None,
+        "handoff_uncertainty": None,
+        "confidence_gate_triggered": None,
+        "fallback_discrete_reasoning_steps": None,
+        "latent_trajectory_steps": None,
+        "total_reasoning_steps": None,
+        "continuous_integration_seconds": None,
+    }
+
+
 def run_sender_answer_text_handoff(
     prompt: str,
     target_answer_text: Optional[str],
@@ -2879,29 +3102,11 @@ def run_sender_answer_text_handoff(
     )
     return {
         "decoded_text": decoded_text,
-        "sender_reasoning_text": reasoning_text,
-        "sender_reasoning_token_count": len(reasoning_token_ids),
-        "sender_reasoning_status": _sender_reasoning_status(
-            reasoning_token_ids,
-            reasoning_text,
-            cfg,
-        ),
-        "sender_final_answer_marker": FINAL_ANSWER_COMPLETE_REGEX.search(reasoning_text) is not None,
-        "sender_trace_cache_hit": reasoning_metadata.get("trace_cache_hit"),
-        "sender_trace_cache_path": reasoning_metadata.get("trace_cache_path"),
-        "sender_revision_enabled": reasoning_metadata.get("sender_revision_enabled"),
-        "sender_revision_applied": reasoning_metadata.get("sender_revision_applied"),
-        "sender_initial_predicted_answer": reasoning_metadata.get(
-            "sender_initial_predicted_answer"
-        ),
-        "sender_revision_predicted_answer": reasoning_metadata.get(
-            "sender_revision_predicted_answer"
-        ),
-        "sender_revision_decision_applied": reasoning_metadata.get(
-            "sender_revision_decision_applied"
-        ),
-        "sender_revision_decision_predicted_answer": reasoning_metadata.get(
-            "sender_revision_decision_predicted_answer"
+        **_sender_trace_text_baseline_metadata(
+            reasoning_metadata=reasoning_metadata,
+            reasoning_token_ids=reasoning_token_ids,
+            reasoning_text=reasoning_text,
+            cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
@@ -3830,6 +4035,8 @@ def _methods_for_suite(
         methods = [
             ("pure_text_cot", run_pure_text_cot),
             ("text_text_hybrid", run_text_text_hybrid),
+            ("token_context_handoff", run_token_context_handoff),
+            ("verified_token_context_handoff", run_verified_token_context_handoff),
             ("sender_answer_text_handoff", run_sender_answer_text_handoff),
             ("homogeneous_ridge_latent", run_homogeneous_ridge_latent),
             ("homogeneous_orthogonal_latent", run_homogeneous_orthogonal_latent),
@@ -3838,6 +4045,8 @@ def _methods_for_suite(
         methods = [
             ("pure_text_cot", run_pure_text_cot),
             ("text_text_hybrid", run_text_text_hybrid),
+            ("token_context_handoff", run_token_context_handoff),
+            ("verified_token_context_handoff", run_verified_token_context_handoff),
             ("sender_answer_text_handoff", run_sender_answer_text_handoff),
             ("prompt_local_latent", run_prompt_local_latent),
             ("global_anchor_orthogonal", run_global_anchor_orthogonal),
@@ -4671,6 +4880,24 @@ def run_benchmark(
             max_diagnostic_rows=int(getattr(semantic_smoke_cfg, "max_diagnostic_rows", 5)),
         )
 
+    report_method_names = [name for name, _ in methods]
+    provenance_baseline_methods = tuple(
+        semantic_smoke_report["baseline_methods"]
+        if semantic_smoke_report is not None
+        else [name for name in report_method_names if name in TEXT_BASELINE_METHODS]
+    )
+    provenance_latent_methods = tuple(
+        semantic_smoke_report["latent_methods"]
+        if semantic_smoke_report is not None
+        else [name for name in report_method_names if name not in TEXT_BASELINE_METHODS]
+    )
+    latent_provenance_report = build_latent_provenance_report(
+        sample_rows,
+        baseline_methods=provenance_baseline_methods,
+        latent_methods=provenance_latent_methods,
+        max_rows=int(getattr(semantic_smoke_cfg, "max_diagnostic_rows", 10)),
+    )
+
     write_csv(samples_output_path, sample_rows, STANDARD_SAMPLE_FIELDS)
     write_csv(summary_output_path, summary_rows, STANDARD_SUMMARY_FIELDS)
     report_payload = {
@@ -4779,6 +5006,7 @@ def run_benchmark(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "runtime_smoke_report": runtime_smoke_report,
         "semantic_smoke_report": semantic_smoke_report,
+        "latent_provenance_report": latent_provenance_report,
         "phase_gate_report": phase_gate_report,
         "ode_scaling_report": build_ode_scaling_report(summary_rows),
         "summary_rows": summary_rows,

@@ -306,3 +306,175 @@ def generate_blame_report(
         "suspected_causal_impact": None if suspected is None else suspected.causal_impact,
         "top_results": [result.summary() for result in top_results],
     }
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _short_text(value: Any, *, max_chars: int = 220) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)] + "..."
+
+
+def _unique_non_empty(rows: Sequence[Mapping[str, Any]], key: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        value = str(row.get(key) or "")
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values
+
+
+def _accuracy_percentage(rows: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    values = [
+        value for value in (_optional_bool(row.get("correct")) for row in rows)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return 100.0 * sum(1 for value in values if value) / len(values)
+
+
+def _row_failure_class(row: Mapping[str, Any], baseline_rows: Sequence[Mapping[str, Any]]) -> str:
+    sender_correct = _optional_bool(row.get("sender_answer_matches_target"))
+    if sender_correct is False:
+        return "sender_wrong"
+    if sender_correct is None:
+        return "sender_unmeasured"
+    if any(
+        str(baseline.get("method")) == "sender_answer_text_handoff"
+        and _optional_bool(baseline.get("correct")) is True
+        for baseline in baseline_rows
+    ):
+        return "latent_receiver_gap_verified_answer_available"
+    if any(_optional_bool(baseline.get("correct")) is True for baseline in baseline_rows):
+        return "latent_underperforms_text_context"
+    return "latent_receiver_gap_sender_correct"
+
+
+def build_latent_provenance_report(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    latent_methods: Sequence[str],
+    baseline_methods: Sequence[str] = (),
+    max_rows: int = 10,
+) -> dict[str, Any]:
+    """Summarize static provenance for latent handoff failures.
+
+    This is intentionally separate from intervention replay. It answers: which
+    sender trace, adapter cache, receiver context, and post-processing components
+    produced the latent row that failed?
+    """
+    latent_method_set = set(latent_methods)
+    baseline_method_set = set(baseline_methods)
+    latent_rows = [row for row in rows if row.get("method") in latent_method_set]
+    baseline_rows = [row for row in rows if row.get("method") in baseline_method_set]
+    baseline_by_sample: dict[str, list[Mapping[str, Any]]] = {}
+    for row in baseline_rows:
+        baseline_by_sample.setdefault(str(row.get("sample_index")), []).append(row)
+
+    wrong_rows: list[dict[str, Any]] = []
+    failure_counts: dict[str, int] = {}
+    for row in latent_rows:
+        if _optional_bool(row.get("correct")) is not False:
+            continue
+        sample_baselines = baseline_by_sample.get(str(row.get("sample_index")), [])
+        failure_class = _row_failure_class(row, sample_baselines)
+        failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
+        if len(wrong_rows) >= max(0, int(max_rows)):
+            continue
+        wrong_rows.append(
+            {
+                "method": row.get("method"),
+                "sample_index": row.get("sample_index"),
+                "failure_class": failure_class,
+                "target_answer": row.get("target_answer"),
+                "predicted_answer": row.get("predicted_answer"),
+                "sender_predicted_answer": row.get("sender_predicted_answer"),
+                "sender_answer_matches_target": row.get("sender_answer_matches_target"),
+                "sender_initial_predicted_answer": row.get("sender_initial_predicted_answer"),
+                "sender_revision_predicted_answer": row.get("sender_revision_predicted_answer"),
+                "sender_revision_decision_predicted_answer": row.get(
+                    "sender_revision_decision_predicted_answer"
+                ),
+                "decoded_preview": _short_text(row.get("decoded_text")),
+                "sender_trace_cache_hit": row.get("sender_trace_cache_hit"),
+                "sender_trace_cache_path": row.get("sender_trace_cache_path"),
+                "handoff_adapter_status": row.get("handoff_adapter_status"),
+                "handoff_adapter_cache_path": row.get("handoff_adapter_cache_path"),
+                "handoff_adapter_training_row_cache_path": row.get(
+                    "handoff_adapter_training_row_cache_path"
+                ),
+                "receiver_context_status": row.get("receiver_context_status"),
+                "receiver_context_latent_position": row.get(
+                    "receiver_context_latent_position"
+                ),
+                "active_kv_cache_status": row.get("active_kv_cache_status"),
+                "active_kv_cache_source": row.get("active_kv_cache_source"),
+                "post_alignment_cosine_distance": row.get("post_alignment_cosine_distance"),
+                "embedding_manifold_applied": row.get("embedding_manifold_applied"),
+                "embedding_manifold_unique_token_count": row.get(
+                    "embedding_manifold_unique_token_count"
+                ),
+                "generated_adapter_local_residual_applied": row.get(
+                    "generated_adapter_local_residual_applied"
+                ),
+                "generated_adapter_local_residual_mean_top_similarity": row.get(
+                    "generated_adapter_local_residual_mean_top_similarity"
+                ),
+                "baseline_comparisons": [
+                    {
+                        "method": baseline.get("method"),
+                        "predicted_answer": baseline.get("predicted_answer"),
+                        "correct": baseline.get("correct"),
+                        "decoded_preview": _short_text(baseline.get("decoded_text")),
+                    }
+                    for baseline in sample_baselines
+                ],
+            }
+        )
+
+    method_accuracy = {
+        method: _accuracy_percentage([row for row in rows if row.get("method") == method])
+        for method in [*baseline_methods, *latent_methods]
+    }
+    return {
+        "latent_methods": list(latent_methods),
+        "baseline_methods": list(baseline_methods),
+        "latent_sample_count": len(latent_rows),
+        "baseline_sample_count": len(baseline_rows),
+        "method_accuracy_percentage": method_accuracy,
+        "failure_counts_by_class": failure_counts,
+        "wrong_latent_rows": wrong_rows,
+        "cache_paths": {
+            "sender_trace": _unique_non_empty(latent_rows, "sender_trace_cache_path"),
+            "adapter": _unique_non_empty(latent_rows, "handoff_adapter_cache_path"),
+            "adapter_training_rows": _unique_non_empty(
+                latent_rows,
+                "handoff_adapter_training_row_cache_path",
+            ),
+        },
+        "latent_reader_code_paths": [
+            "benchmark_all.py:_collect_sender_generated_consensus_state",
+            "benchmark_all.py:_run_generated_latent_variant",
+            "benchmark_all.py:_decode_handoff",
+            "src.utils.lm_eval.prepare_latent_prefix_state",
+            "src.utils.lm_eval.prepare_receiver_context_latent_prefix_state",
+            "src.models.handoff_adapter.apply_embedding_manifold_projection",
+        ],
+    }

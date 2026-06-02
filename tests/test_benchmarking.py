@@ -19,6 +19,8 @@ from benchmark_all import (
     _cache_key_metadata,
     _final_answer_tail_needs_scalar_verification,
     _format_sender_answer_text_handoff_prompt,
+    _format_token_context_handoff_prompt,
+    _format_verified_token_context_handoff_prompt,
     _format_verified_final_answer_text,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
@@ -671,6 +673,31 @@ def test_sender_answer_text_handoff_prompt_is_copy_only() -> None:
     assert "original problem" not in prompt.casefold()
 
 
+def test_token_context_handoff_prompt_uses_sender_reasoning() -> None:
+    prompt = _format_token_context_handoff_prompt(
+        "What is 2 + 2?",
+        "Final answer: 4.",
+    )
+
+    assert "What is 2 + 2?" in prompt
+    assert "Transferred token context from Agent A" in prompt
+    assert "Final answer: 4." in prompt
+
+
+def test_verified_token_context_handoff_prompt_prioritizes_verified_answer() -> None:
+    prompt = _format_verified_token_context_handoff_prompt(
+        "4",
+        "Reasoning was noisy. Final answer: 5.",
+    )
+
+    assert "Verified upstream final answer" in prompt
+    assert "4" in prompt
+    assert "Transferred token context from Agent A" in prompt
+    assert "Final answer: 5." in prompt
+    assert "authoritative" in prompt
+    assert prompt.rstrip().endswith("Final answer:")
+
+
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
     assert _answers_match("gsm8k", "252.00", "252")
     assert _answers_match("gsm8k", "9,800.0", "9800")
@@ -1279,11 +1306,15 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert phase1_methods == [
         "pure_text_cot",
         "text_text_hybrid",
+        "token_context_handoff",
+        "verified_token_context_handoff",
         "sender_answer_text_handoff",
         "homogeneous_ridge_latent",
         "homogeneous_orthogonal_latent",
     ]
     assert "text_text_hybrid" in standard_methods
+    assert "token_context_handoff" in standard_methods
+    assert "verified_token_context_handoff" in standard_methods
     assert "sender_answer_text_handoff" in standard_methods
     assert "global_anchor_orthogonal" in standard_methods
     assert "global_anchor_ridge" in standard_methods
