@@ -1462,6 +1462,54 @@ def test_build_training_smoke_report_flags_low_extraction_rate() -> None:
     assert any("Answer extraction rate" in item for item in report["missing_requirements"])
 
 
+def test_build_training_smoke_report_flags_degenerate_predictions() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 1.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["final_heldout_degenerate_prediction"] is True
+    assert any("degenerate" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_detects_degenerate_predictions_from_diagnostics() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+                "heldout_eval_diagnostics": "\n".join(
+                    [
+                        "target=13 | predicted=100000000000000 | source=decode",
+                        "target=42 | predicted=100000000000000 | source=decode",
+                        "target=3x^2 | predicted=100000000000000 | source=decode",
+                    ]
+                ),
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["final_heldout_unique_predicted_answer_count"] == 1
+    assert report["final_heldout_degenerate_prediction"] is True
+
+
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     phase1_methods = [name for name, _ in _methods_for_suite("phase1_homogeneous")]
     standard_methods = [name for name, _ in _methods_for_suite("standard")]

@@ -38,6 +38,11 @@ class CompressionTrainConfig:
     lambda_pref: float = 1.0
     lambda_geom: float = 1.0
     eps: float = 1e-8
+    lambda_answer: float = 4.0
+    answer_suffix_text: str = "\nFinal answer:"
+    answer_max_length: int = 32
+    answer_first_token_weight: float = 2.0
+    evaluate_before_training: bool = False
     wandb_enabled: bool = True
     wandb_project: str = "lxp-stage2"
     wandb_entity: Optional[str] = None
@@ -81,6 +86,13 @@ class CompressionTrainConfig:
             lambda_pref=t.lambda_pref,
             lambda_geom=t.lambda_geom,
             eps=t.eps,
+            lambda_answer=float(getattr(t, "lambda_answer", 4.0)),
+            answer_suffix_text=str(getattr(t, "answer_suffix_text", "\nFinal answer:")),
+            answer_max_length=int(getattr(t, "answer_max_length", 32)),
+            answer_first_token_weight=float(getattr(t, "answer_first_token_weight", 2.0)),
+            evaluate_before_training=bool(
+                getattr(getattr(t, "evaluation", None), "evaluate_before_training", False)
+            ),
             wandb_enabled=bool(wandb_cfg.enabled) if wandb_cfg else False,
             wandb_project=str(wandb_cfg.project) if wandb_cfg else "lxp-stage2",
             wandb_entity=str(wandb_cfg.entity) if wandb_cfg and wandb_cfg.entity else None,
@@ -166,6 +178,191 @@ def _extract_text_batch(batch: dict[str, Any]) -> list[str]:
     if isinstance(texts, str):
         return [texts]
     return [str(text) for text in texts]
+
+
+def _extract_answer_batch(batch: dict[str, Any], *, expected_count: int) -> list[str | None]:
+    answers = batch.get("answers")
+    if answers is None:
+        return [None] * expected_count
+    if isinstance(answers, str) or answers is None:
+        answers = [answers]
+    result = [None if answer is None else str(answer) for answer in answers]
+    if len(result) != expected_count:
+        raise ValueError(
+            "train_reasoner_stage2 expected the answers batch to match the texts batch; "
+            f"got {len(result)} answers for {expected_count} texts"
+        )
+    return result
+
+
+def _extract_prompt_batch(
+    batch: dict[str, Any],
+    *,
+    fallback_texts: Sequence[str],
+) -> list[str]:
+    prompts = batch.get("prompts")
+    if prompts is None:
+        return [str(text) for text in fallback_texts]
+    if isinstance(prompts, str) or prompts is None:
+        prompts = [prompts]
+    if len(prompts) != len(fallback_texts):
+        raise ValueError(
+            "train_reasoner_stage2 expected the prompts batch to match the texts batch; "
+            f"got {len(prompts)} prompts for {len(fallback_texts)} texts"
+        )
+    return [
+        str(prompt) if prompt is not None and str(prompt).strip() else str(fallback_text)
+        for prompt, fallback_text in zip(prompts, fallback_texts)
+    ]
+
+
+def _encode_token_ids(tokenizer: Any, text: str, *, max_length: int | None = None) -> list[int]:
+    if hasattr(tokenizer, "encode"):
+        try:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            token_ids = tokenizer.encode(text)
+    else:
+        encoded = tokenizer(
+            text,
+            padding=False,
+            truncation=max_length is not None,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        token_ids = encoded["input_ids"][0].tolist()
+    token_ids = [int(token_id) for token_id in token_ids]
+    if max_length is not None:
+        return token_ids[:max_length]
+    return token_ids
+
+
+def _format_answer_continuation(answer: str | None, *, suffix_text: str) -> str | None:
+    if answer is None:
+        return None
+    cleaned = str(answer).strip()
+    if not cleaned:
+        return None
+    separator = "" if suffix_text.endswith((" ", "\n", "\t")) else " "
+    return f"{separator}{cleaned}"
+
+
+def _compute_latent_answer_loss(
+    *,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+    first_token_weight: float,
+) -> tuple[torch.Tensor | None, int, float]:
+    valid_indices: list[int] = []
+    encoded_answers: list[list[int]] = []
+    for index, answer in enumerate(answers):
+        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
+        if continuation is None:
+            continue
+        token_ids = _encode_token_ids(
+            actor_tokenizer,
+            continuation,
+            max_length=max(1, int(max_answer_length)),
+        )
+        if not token_ids:
+            continue
+        valid_indices.append(index)
+        encoded_answers.append(token_ids)
+
+    if not encoded_answers:
+        return None, 0, 0.0
+
+    actor_device = _model_device(actor_model)
+    embedding = actor_model.get_input_embeddings()
+    prefix = latent_prefix.index_select(
+        0,
+        torch.tensor(valid_indices, dtype=torch.long, device=latent_prefix.device),
+    ).to(device=actor_device, dtype=embedding.weight.dtype)
+    suffix_ids = _encode_token_ids(actor_tokenizer, suffix_text)
+    suffix_width = len(suffix_ids)
+    answer_width = max(len(token_ids) for token_ids in encoded_answers)
+    pad_token_id = int(
+        getattr(
+            actor_tokenizer,
+            "pad_token_id",
+            getattr(actor_tokenizer, "eos_token_id", 0) or 0,
+        )
+        or 0
+    )
+
+    suffix_tensor = torch.tensor(
+        suffix_ids,
+        dtype=torch.long,
+        device=actor_device,
+    ).unsqueeze(0).expand(prefix.shape[0], suffix_width)
+    answer_tensor = torch.full(
+        (prefix.shape[0], answer_width),
+        pad_token_id,
+        dtype=torch.long,
+        device=actor_device,
+    )
+    answer_mask = torch.zeros(
+        (prefix.shape[0], answer_width),
+        dtype=torch.long,
+        device=actor_device,
+    )
+    token_weights = torch.zeros(
+        (prefix.shape[0], answer_width),
+        dtype=torch.float32,
+        device=actor_device,
+    )
+    for row_index, token_ids in enumerate(encoded_answers):
+        width = len(token_ids)
+        answer_tensor[row_index, :width] = torch.tensor(token_ids, dtype=torch.long, device=actor_device)
+        answer_mask[row_index, :width] = 1
+        token_weights[row_index, :width] = 1.0
+        token_weights[row_index, 0] = max(1.0, float(first_token_weight))
+
+    suffix_embeds = embedding(suffix_tensor) if suffix_width else prefix[:, :0, :]
+    answer_embeds = embedding(answer_tensor)
+    inputs_embeds = torch.cat([prefix, suffix_embeds, answer_embeds], dim=1)
+    attention_mask = torch.cat(
+        [
+            torch.ones(prefix.shape[:2], dtype=torch.long, device=actor_device),
+            torch.ones((prefix.shape[0], suffix_width), dtype=torch.long, device=actor_device),
+            answer_mask,
+        ],
+        dim=1,
+    )
+    outputs = actor_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    answer_start = prefix.shape[1] + suffix_width
+    flat_logits: list[torch.Tensor] = []
+    flat_targets: list[torch.Tensor] = []
+    flat_weights: list[torch.Tensor] = []
+    for row_index, token_ids in enumerate(encoded_answers):
+        width = len(token_ids)
+        prediction_positions = torch.arange(
+            answer_start - 1,
+            answer_start + width - 1,
+            dtype=torch.long,
+            device=actor_device,
+        )
+        flat_logits.append(outputs.logits[row_index].index_select(0, prediction_positions))
+        flat_targets.append(answer_tensor[row_index, :width])
+        flat_weights.append(token_weights[row_index, :width])
+
+    logits = torch.cat(flat_logits, dim=0).float()
+    targets = torch.cat(flat_targets, dim=0)
+    weights = torch.cat(flat_weights, dim=0)
+    token_losses = F.cross_entropy(logits, targets, reduction="none")
+    answer_loss = (token_losses * weights).sum() / weights.sum().clamp_min(1.0)
+    average_answer_tokens = sum(len(token_ids) for token_ids in encoded_answers) / len(encoded_answers)
+    return answer_loss, len(encoded_answers), float(average_answer_tokens)
 
 
 def _ensure_padding_token(tokenizer: Any) -> None:
@@ -508,6 +705,7 @@ def train_reasoner_stage2(
             "l_geom": config.lambda_geom,
             "l_plan": config.lambda_plan,
             "l_contrast": config.lambda_contrast,
+            "l_answer": config.lambda_answer,
         },
         config=AdaptiveLossBalancerConfig(
             enabled=config.adaptive_loss_enabled,
@@ -521,9 +719,34 @@ def train_reasoner_stage2(
     global_step = 0
     total_training_steps = max(1, int(config.num_epochs) * max(1, len(train_dataloader)))
 
+    def record_evaluation(event: str, epoch: float) -> None:
+        nonlocal global_step
+        if evaluation_fn is None:
+            return
+        evaluation_metrics = {
+            key: _coerce_history_value(value)
+            for key, value in evaluation_fn(
+                reasoner_model,
+                actor_model,
+                latest_alignment_context,
+            ).items()
+        }
+        eval_history_entry = {
+            "event": event,
+            "epoch": float(epoch),
+            "step": float(global_step),
+            **evaluation_metrics,
+        }
+        history.append(eval_history_entry)
+        if config.wandb_enabled:
+            wandb.log(_numeric_metrics(evaluation_metrics), step=global_step)
+
     if config.checkpoint_enabled:
         ckpt_dir = Path(config.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    if config.evaluate_before_training:
+        record_evaluation("pretrain_eval", -1.0)
 
     for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -536,9 +759,11 @@ def train_reasoner_stage2(
             latest_alignment_context = alignment_context
             alignment_state = alignment_context["alignment_state"]
             texts = _extract_text_batch(batch)
+            reasoner_texts = _extract_prompt_batch(batch, fallback_texts=texts)
+            answers = _extract_answer_batch(batch, expected_count=len(texts))
             reasoner_batch = _tokenize_text_batch(
                 reasoner_tokenizer,
-                texts,
+                reasoner_texts,
                 device=reasoner_device,
                 max_length=config.reasoner_max_length,
             )
@@ -629,15 +854,25 @@ def train_reasoner_stage2(
                 compressed_latents_aligned,
                 temperature=config.contrast_temperature,
             )
-            total_loss, effective_weights = loss_balancer.combine(
-                {
-                    "l_task": loss_outputs["l_task"],
-                    "l_pref": loss_outputs["l_pref"],
-                    "l_geom": loss_outputs["l_geom"],
-                    "l_plan": l_plan,
-                    "l_contrast": l_contrast,
-                }
+            answer_loss, answer_loss_sample_count, answer_token_count_mean = _compute_latent_answer_loss(
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                latent_prefix=compressed_latents_aligned,
+                answers=answers,
+                suffix_text=config.answer_suffix_text,
+                max_answer_length=config.answer_max_length,
+                first_token_weight=config.answer_first_token_weight,
             )
+            loss_terms = {
+                "l_task": loss_outputs["l_task"],
+                "l_pref": loss_outputs["l_pref"],
+                "l_geom": loss_outputs["l_geom"],
+                "l_plan": l_plan,
+                "l_contrast": l_contrast,
+            }
+            if answer_loss is not None:
+                loss_terms["l_answer"] = answer_loss.to(reasoner_device)
+            total_loss, effective_weights = loss_balancer.combine(loss_terms)
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -655,11 +890,15 @@ def train_reasoner_stage2(
                 "l_geom": float(loss_outputs["l_geom"].detach().cpu().item()),
                 "l_plan": float(l_plan.detach().cpu().item()),
                 "l_contrast": float(l_contrast.detach().cpu().item()),
+                "l_answer": 0.0 if answer_loss is None else float(answer_loss.detach().cpu().item()),
+                "answer_loss_sample_count": float(answer_loss_sample_count),
+                "answer_loss_token_count_mean": float(answer_token_count_mean),
                 "effective_weight_task": effective_weights["l_task"],
                 "effective_weight_pref": effective_weights["l_pref"],
                 "effective_weight_geom": effective_weights["l_geom"],
                 "effective_weight_plan": effective_weights["l_plan"],
                 "effective_weight_contrast": effective_weights["l_contrast"],
+                "effective_weight_answer": effective_weights.get("l_answer", 0.0),
                 "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
                 "projection_scale_mean": projection_metrics["projection_scale_mean"],
                 "projection_scale_std": projection_metrics["projection_scale_std"],
@@ -704,11 +943,15 @@ def train_reasoner_stage2(
                         "l_geom": metrics["l_geom"],
                         "l_plan": metrics["l_plan"],
                         "l_contrast": metrics["l_contrast"],
+                        "l_answer": metrics["l_answer"],
+                        "answer_loss_sample_count": metrics["answer_loss_sample_count"],
+                        "answer_loss_token_count_mean": metrics["answer_loss_token_count_mean"],
                         "effective_weight_task": metrics["effective_weight_task"],
                         "effective_weight_pref": metrics["effective_weight_pref"],
                         "effective_weight_geom": metrics["effective_weight_geom"],
                         "effective_weight_plan": metrics["effective_weight_plan"],
                         "effective_weight_contrast": metrics["effective_weight_contrast"],
+                        "effective_weight_answer": metrics["effective_weight_answer"],
                         "projection_scale_mean": metrics["projection_scale_mean"],
                         "projection_scale_std": metrics["projection_scale_std"],
                         "projection_clip_fraction": metrics["projection_clip_fraction"],
@@ -749,23 +992,7 @@ def train_reasoner_stage2(
 
             global_step += 1
 
-        if evaluation_fn is not None:
-            evaluation_metrics = {
-                key: _coerce_history_value(value)
-                for key, value in evaluation_fn(
-                    reasoner_model,
-                    actor_model,
-                    latest_alignment_context,
-                ).items()
-            }
-            eval_history_entry = {
-                "epoch": float(epoch),
-                "step": float(global_step),
-                **evaluation_metrics,
-            }
-            history.append(eval_history_entry)
-            if config.wandb_enabled:
-                wandb.log(_numeric_metrics(evaluation_metrics), step=global_step)
+        record_evaluation("epoch_eval", float(epoch))
 
         if config.checkpoint_enabled:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"

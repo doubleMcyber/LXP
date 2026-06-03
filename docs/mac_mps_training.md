@@ -45,6 +45,7 @@ Expected behavior:
 - It prints both `training_smoke_passed` and `phase2_gate_passed`.
 - It prints answer extraction diagnostics, including direct decode extraction
   rate and candidate-NLL fallback rate.
+- It prints degenerate-prediction and actor text-baseline diagnostics.
 
 Outputs:
 
@@ -61,6 +62,20 @@ Interpretation:
   the rate at which smoke evaluation had to score known held-out answer
   candidates by NLL instead. Fallback keeps smoke evaluation debuggable, but it
   is labeled separately so it is not confused with generation quality.
+- `unique_predicted_answer_count=1` with low exact-match accuracy means the
+  latent path collapsed to one repeated answer. The smoke gate now fails this
+  case even when answer extraction is `100%`.
+- `actor_text_baseline_accuracy` is the same actor answering from a normal text
+  prompt. If this baseline is non-degenerate while the latent path collapses,
+  the issue is latent injection or the Stage-II objective, not answer parsing.
+- The Stage-II loop includes a latent-prefix answer loss (`l_answer`) so the
+  optimized task matches evaluation: latent prefix plus `Final answer:` should
+  make the frozen actor assign high likelihood to the target answer.
+- Structured training rows feed prompt-only text to the reasoner; answers are
+  used as targets, not as reasoner input.
+- `initial_eval_diagnostics` records the latent path before training. Compare it
+  with final diagnostics: collapse before training points at injection/alignment;
+  collapse after training points at the objective or optimization settings.
 - `phase2_gate_passed=false` is expected for this smoke run because it is not
   real multi-seed training and does not provide a baseline retention score.
 - `final_heldout_exact_match_accuracy=0` on the tiny smoke run is not by itself a

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -1437,6 +1438,32 @@ def build_training_phase2_report(
     return report
 
 
+_TRAINING_DIAGNOSTIC_PREDICTED_REGEX = re.compile(r"(?:^|\|\s*)predicted=([^|]+)")
+
+
+def _unique_training_prediction_count(
+    final_eval: Mapping[str, Any],
+    *,
+    eval_samples: int,
+) -> int | None:
+    unique_prediction_raw = final_eval.get("heldout_unique_predicted_answer_count")
+    if unique_prediction_raw is not None and unique_prediction_raw != "":
+        return int(float(unique_prediction_raw))
+
+    diagnostics = str(final_eval.get("heldout_eval_diagnostics") or "")
+    predicted_answers: list[str] = []
+    for line in diagnostics.splitlines():
+        match = _TRAINING_DIAGNOSTIC_PREDICTED_REGEX.search(line)
+        if match is None:
+            continue
+        predicted = match.group(1).strip().casefold().replace(" ", "")
+        if predicted and predicted != "none":
+            predicted_answers.append(predicted)
+    if eval_samples > 0 and len(predicted_answers) >= eval_samples:
+        return len(set(predicted_answers))
+    return None
+
+
 def build_training_smoke_report(
     history: Sequence[dict[str, Any]],
     *,
@@ -1447,6 +1474,7 @@ def build_training_smoke_report(
 ) -> dict[str, Any]:
     loss_entries = [entry for entry in history if "loss" in entry]
     heldout_entries = [entry for entry in history if "heldout_eval_samples" in entry]
+    initial_eval = heldout_entries[0] if len(heldout_entries) > 1 else {}
     final_eval = heldout_entries[-1] if heldout_entries else {}
     losses = [float(entry["loss"]) for entry in loss_entries if entry.get("loss") is not None]
     finite_losses = [value for value in losses if math.isfinite(value)]
@@ -1458,7 +1486,13 @@ def build_training_smoke_report(
     final_extraction_rate = (
         None if final_extraction_rate_raw is None else float(final_extraction_rate_raw)
     )
+    final_accuracy_raw = final_eval.get("heldout_exact_match_accuracy")
+    final_accuracy = None if final_accuracy_raw is None else float(final_accuracy_raw)
     eval_samples = int(float(final_eval.get("heldout_eval_samples", 0) or 0))
+    unique_prediction_count = _unique_training_prediction_count(
+        final_eval,
+        eval_samples=eval_samples,
+    )
 
     missing_requirements: list[str] = []
     if not loss_entries:
@@ -1489,15 +1523,32 @@ def build_training_smoke_report(
             f"Answer extraction rate {final_extraction_rate:.2f}% is below required "
             f"{min_answer_extraction_rate_percentage:.2f}%."
         )
+    degenerate_prediction = (
+        eval_samples > 1
+        and unique_prediction_count is not None
+        and unique_prediction_count <= 1
+        and final_accuracy is not None
+        and final_accuracy < 100.0
+    )
+    if degenerate_prediction:
+        missing_requirements.append(
+            "Heldout predictions are degenerate: one unique predicted answer was emitted "
+            f"across {eval_samples} samples while exact-match accuracy was {final_accuracy:.2f}%."
+        )
 
     return {
         "phase": "training_smoke",
         "passed": not missing_requirements,
         "loss_entry_count": len(loss_entries),
         "max_loss": None if not finite_losses else max(finite_losses),
-        "final_heldout_exact_match_accuracy": final_eval.get(
+        "initial_heldout_exact_match_accuracy": initial_eval.get(
             "heldout_exact_match_accuracy"
         ),
+        "initial_heldout_unique_predicted_answer_count": initial_eval.get(
+            "heldout_unique_predicted_answer_count"
+        ),
+        "initial_heldout_eval_diagnostics": initial_eval.get("heldout_eval_diagnostics"),
+        "final_heldout_exact_match_accuracy": final_accuracy,
         "final_heldout_answer_extraction_rate_percentage": final_extraction_rate,
         "final_heldout_decode_answer_extraction_rate_percentage": final_eval.get(
             "heldout_decode_answer_extraction_rate_percentage"
@@ -1507,6 +1558,17 @@ def build_training_smoke_report(
         ),
         "final_heldout_extraction_failure_count": final_eval.get(
             "heldout_extraction_failure_count"
+        ),
+        "final_heldout_unique_predicted_answer_count": unique_prediction_count,
+        "final_heldout_degenerate_prediction": degenerate_prediction,
+        "final_heldout_actor_text_baseline_accuracy": final_eval.get(
+            "heldout_actor_text_baseline_accuracy"
+        ),
+        "final_heldout_actor_text_baseline_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_actor_text_baseline_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_actor_text_baseline_unique_predicted_answer_count": final_eval.get(
+            "heldout_actor_text_baseline_unique_predicted_answer_count"
         ),
         "final_heldout_answer_perplexity": final_perplexity,
         "heldout_eval_diagnostics": final_eval.get("heldout_eval_diagnostics"),

@@ -147,6 +147,10 @@ training:
   lambda_geom: 1.0
   lambda_plan: 0.25
   lambda_contrast: 0.1
+  lambda_answer: 4.0
+  answer_suffix_text: "\nFinal answer:"
+  answer_max_length: 32
+  answer_first_token_weight: 2.0
   contrast_temperature: 0.1
   eps: 1.0e-8
   curriculum:
@@ -178,6 +182,7 @@ training:
     max_new_tokens: 16
     baseline_accuracy_percentage: null
     seed_count: 1
+    evaluate_before_training: true
   checkpointing:
     enabled: true
     dir: "checkpoints"

@@ -65,7 +65,20 @@ def _print_report_summary(report_path: Path) -> None:
             "candidate_fallback_rate": smoke_report.get(
                 "final_heldout_candidate_fallback_rate_percentage"
             ),
+            "unique_predicted_answer_count": smoke_report.get(
+                "final_heldout_unique_predicted_answer_count"
+            ),
+            "degenerate_prediction": smoke_report.get(
+                "final_heldout_degenerate_prediction"
+            ),
+            "actor_text_baseline_accuracy": smoke_report.get(
+                "final_heldout_actor_text_baseline_accuracy"
+            ),
+            "actor_text_baseline_unique_predicted_answer_count": smoke_report.get(
+                "final_heldout_actor_text_baseline_unique_predicted_answer_count"
+            ),
             "eval_diagnostics": smoke_report.get("heldout_eval_diagnostics"),
+            "initial_eval_diagnostics": smoke_report.get("initial_heldout_eval_diagnostics"),
             "missing_phase2_requirements": report.get("missing_requirements"),
             "missing_smoke_requirements": smoke_report.get("missing_requirements"),
         },

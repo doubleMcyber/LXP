@@ -10,6 +10,7 @@ from latent_pipeline import _build_alignment_cache_key
 from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
+    _compute_latent_answer_loss,
     _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
@@ -34,6 +35,10 @@ class _TinyTokenizer:
             ((sum(ord(char) for char in piece) + self.offset) % (self.vocab_size - 2)) + 2
             for piece in pieces
         ]
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return self._encode_text(text)
 
     def __call__(
         self,
@@ -129,6 +134,30 @@ def test_training_history_preserves_diagnostic_metrics() -> None:
     assert _numeric_metrics({"loss": 1.0, "diagnostics": "x", "flag": True}) == {"loss": 1.0}
 
 
+def test_latent_answer_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    answer_loss, sample_count, average_tokens = _compute_latent_answer_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        first_token_weight=2.0,
+    )
+
+    assert answer_loss is not None
+    assert sample_count == 2
+    assert average_tokens > 0
+    answer_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
 def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:
     texts = ["alpha beta", "gamma delta"]
     dataloader = DataLoader(
@@ -203,6 +232,56 @@ def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:
 
     assert torch.equal(_CapturingLoss.captured_actor_labels.cpu(), expected_actor_labels)
     assert not torch.equal(expected_actor_labels, reasoner_labels)
+
+
+def test_train_reasoner_stage2_uses_prompt_only_reasoner_inputs() -> None:
+    supervision_texts = ["Question: What is 2 + 2?\nAnswer: 4"]
+    prompts = ["What is 2 + 2?"]
+    dataloader = DataLoader(
+        [
+            {
+                "text": supervision_texts[0],
+                "prompt": prompts[0],
+                "answer": "4",
+            }
+        ],
+        batch_size=1,
+        collate_fn=lambda batch: {
+            "texts": [item["text"] for item in batch],
+            "prompts": [item["prompt"] for item in batch],
+            "answers": [item["answer"] for item in batch],
+        },
+    )
+    reasoner, actor = _make_tiny_models()
+    config = CompressionTrainConfig(
+        compressed_steps=4,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        num_epochs=1,
+        wandb_enabled=False,
+        checkpoint_enabled=False,
+        reasoner_max_length=16,
+        actor_max_length=16,
+    )
+    original_tokenize = _tokenize_text_batch
+    tokenized_text_calls: list[list[str]] = []
+
+    def recording_tokenize(tokenizer, texts, *, device, max_length):
+        tokenized_text_calls.append(list(texts))
+        return original_tokenize(tokenizer, texts, device=device, max_length=max_length)
+
+    with patch("train_compressor._tokenize_text_batch", recording_tokenize):
+        train_reasoner_stage2(
+            reasoner,
+            actor,
+            dataloader,
+            config,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=23),
+        )
+
+    assert tokenized_text_calls[0] == prompts
+    assert tokenized_text_calls[1] == supervision_texts
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:

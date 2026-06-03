@@ -26,6 +26,7 @@ from src.utils.lm_eval import (
     compute_answer_metrics_from_prefix,
     greedy_decode_from_prefix,
     prepare_latent_prefix_state,
+    prepare_text_prefix_state,
 )
 from src.utils.metrics import extract_boxed_text, normalize_answer
 from train_compressor import (
@@ -181,30 +182,51 @@ def _load_model(
     return model
 
 
-def _collate_text_batch(batch: list[str]) -> dict[str, list[str]]:
-    return {"texts": [str(text) for text in batch]}
+def _collate_training_batch(batch: list[Any]) -> dict[str, list[str | None]]:
+    texts: list[str] = []
+    prompts: list[str | None] = []
+    answers: list[str | None] = []
+    for item in batch:
+        if isinstance(item, dict):
+            prompt = item.get("prompt")
+            answer = item.get("answer")
+            text = item.get("supervision_text") or item.get("text") or prompt
+            texts.append(str(text))
+            prompts.append(None if prompt is None else str(prompt))
+            answers.append(None if answer is None else str(answer))
+            continue
+        texts.append(str(item))
+        prompts.append(None)
+        answers.append(None)
+    return {"texts": texts, "prompts": prompts, "answers": answers}
 
 
 def _build_text_dataloader(
-    texts: Iterable[str],
+    rows: Iterable[Any],
     *,
     batch_size: int,
     shuffle: bool,
 ) -> DataLoader:
     return DataLoader(
-        list(texts),
+        list(rows),
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=_collate_text_batch,
+        collate_fn=_collate_training_batch,
     )
 
 
-def _smoke_supervision_texts(num_samples: int) -> list[str]:
-    examples = [
-        f"Question: {example['prompt']}\nAnswer: {example['answer']}"
-        for example in _SMOKE_TRAIN_EXAMPLES
-    ]
-    return [examples[index % len(examples)] for index in range(num_samples)]
+def _smoke_training_examples(num_samples: int) -> list[dict[str, str]]:
+    examples = []
+    for index in range(num_samples):
+        example = _SMOKE_TRAIN_EXAMPLES[index % len(_SMOKE_TRAIN_EXAMPLES)]
+        examples.append(
+            {
+                "prompt": example["prompt"],
+                "answer": example["answer"],
+                "supervision_text": f"Question: {example['prompt']}\nAnswer: {example['answer']}",
+            }
+        )
+    return examples
 
 
 def _extract_gsm8k_target_answer(text: str) -> str | None:
@@ -312,6 +334,44 @@ def _select_candidate_answer_by_nll(
     return best_answer, best_nll
 
 
+def _answer_metric_variants(answer: str | None) -> tuple[str, ...]:
+    if answer is None:
+        return ()
+    cleaned = str(answer).strip()
+    if not cleaned:
+        return ()
+    return (f" {cleaned}",)
+
+
+def _unique_normalized_answer_count(answers: Iterable[str | None]) -> int:
+    normalized_answers = {
+        normalized
+        for normalized in (normalize_answer(answer) for answer in answers)
+        if normalized
+    }
+    return len(normalized_answers)
+
+
+def _prepare_actor_answer_prefix_state(
+    *,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    prompt: str,
+) -> dict[str, Any]:
+    text_prefix_state = prepare_text_prefix_state(
+        model=actor_model,
+        tokenizer=actor_tokenizer,
+        prefix_text=f"Question: {prompt}",
+    )
+    return append_text_to_prefix_state(
+        model=actor_model,
+        tokenizer=actor_tokenizer,
+        prefix_state=text_prefix_state,
+        suffix_text=_ANSWER_SUFFIX_TEXT,
+        decoded_text_prefix="Final answer:",
+    )
+
+
 def _build_real_examples(
     cfg: Any,
     dataset_name: str,
@@ -346,7 +406,7 @@ def _build_training_payloads(cfg: Any) -> tuple[DataLoader, list[dict[str, str |
     if mode == "smoke":
         num_samples = int(getattr(data_cfg, "smoke_num_samples", 16))
         train_loader = _build_text_dataloader(
-            _smoke_supervision_texts(num_samples),
+            _smoke_training_examples(num_samples),
             batch_size=batch_size,
             shuffle=True,
         )
@@ -360,7 +420,7 @@ def _build_training_payloads(cfg: Any) -> tuple[DataLoader, list[dict[str, str |
         train_examples = _build_real_examples(cfg, dataset_name, "train", train_limit)
         eval_examples = _build_real_examples(cfg, dataset_name, eval_split, eval_limit)
         train_loader = _build_text_dataloader(
-            [str(example["supervision_text"]) for example in train_examples],
+            train_examples,
             batch_size=batch_size,
             shuffle=True,
         )
@@ -416,13 +476,40 @@ def _build_evaluation_callback(
         extracted_answer_count = 0
         candidate_fallback_count = 0
         extraction_failure_count = 0
+        baseline_correct_count = 0
+        baseline_extracted_answer_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
+        predicted_answers: list[str | None] = []
+        baseline_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
 
         for example in eval_examples:
             prompt = str(example["prompt"])
             target_answer = example["answer"]
+            actor_text_prefix_state = _prepare_actor_answer_prefix_state(
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                prompt=prompt,
+            )
+            baseline_decode_metrics = greedy_decode_from_prefix(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_state=actor_text_prefix_state,
+                max_new_tokens=max_new_tokens,
+            )
+            baseline_decoded_text = str(baseline_decode_metrics["decoded_text"])
+            baseline_predicted_answer = _predicted_answer_for_target(
+                dataset_name,
+                baseline_decoded_text,
+                target_answer,
+            )
+            baseline_predicted_answers.append(baseline_predicted_answer)
+            if baseline_predicted_answer is not None and str(baseline_predicted_answer).strip():
+                baseline_extracted_answer_count += 1
+            if _answers_match(dataset_name, baseline_predicted_answer, target_answer):
+                baseline_correct_count += 1
+
             input_ids, attention_mask = _tokenize_prompt(
                 reasoner_tokenizer,
                 prompt,
@@ -465,6 +552,7 @@ def _build_evaluation_callback(
                 tokenizer=actor_tokenizer,
                 prefix_state=answer_prefix_state,
                 answer_text=target_answer,
+                answer_variants=_answer_metric_variants(target_answer),
             )
             if answer_metrics["answer_nll"] is not None:
                 token_count = int(answer_metrics["answer_token_count"] or 0)
@@ -496,17 +584,21 @@ def _build_evaluation_callback(
             else:
                 extraction_source = "missing"
                 extraction_failure_count += 1
+            predicted_answers.append(predicted_answer)
             if _answers_match(dataset_name, predicted_answer, target_answer):
                 correct_count += 1
             if len(diagnostic_rows) < 5:
                 decoded_preview = re.sub(r"\s+", " ", decoded_text).strip()[:120]
+                baseline_preview = re.sub(r"\s+", " ", baseline_decoded_text).strip()[:120]
                 diagnostic_rows.append(
                     " | ".join(
                         (
                             f"target={target_answer}",
                             f"predicted={predicted_answer}",
                             f"source={extraction_source}",
+                            f"baseline_predicted={baseline_predicted_answer}",
                             f"decoded={decoded_preview}",
+                            f"baseline_decoded={baseline_preview}",
                         )
                     )
                 )
@@ -527,6 +619,18 @@ def _build_evaluation_callback(
                 100.0 * candidate_fallback_count / len(eval_examples)
             ),
             "heldout_extraction_failure_count": float(extraction_failure_count),
+            "heldout_unique_predicted_answer_count": float(
+                _unique_normalized_answer_count(predicted_answers)
+            ),
+            "heldout_actor_text_baseline_accuracy": (
+                100.0 * baseline_correct_count / len(eval_examples)
+            ),
+            "heldout_actor_text_baseline_answer_extraction_rate_percentage": (
+                100.0 * baseline_extracted_answer_count / len(eval_examples)
+            ),
+            "heldout_actor_text_baseline_unique_predicted_answer_count": float(
+                _unique_normalized_answer_count(baseline_predicted_answers)
+            ),
             "heldout_correct_count": float(correct_count),
             "heldout_answer_nll": heldout_answer_nll,
             "heldout_answer_perplexity": float(torch.exp(torch.tensor(heldout_answer_nll)).item()),
@@ -674,15 +778,18 @@ def main() -> None:
                 f"  epoch={int(entry['epoch'])} step={int(entry['step'])} "
                 f"loss={entry['loss']:.4f} l_task={entry['l_task']:.4f} "
                 f"l_pref={entry['l_pref']:.4f} l_geom={entry['l_geom']:.4f} "
+                f"l_answer={entry.get('l_answer', 0.0):.4f} "
             )
             continue
         print(
-            f"  epoch={int(entry['epoch'])} step={int(entry['step'])} "
+            f"  event={entry.get('event', 'eval')} epoch={int(entry['epoch'])} step={int(entry['step'])} "
             f"heldout_exact_match_accuracy={entry['heldout_exact_match_accuracy']:.2f} "
             f"heldout_eval_samples={entry['heldout_eval_samples']:.0f} "
             f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f} "
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
-            f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f}"
+            f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
+            f"unique_predictions={entry.get('heldout_unique_predicted_answer_count', 0.0):.0f} "
+            f"actor_text_baseline_accuracy={entry.get('heldout_actor_text_baseline_accuracy', 0.0):.2f}"
         )
 
     print(f"Wrote training history to {history_output_path}")
