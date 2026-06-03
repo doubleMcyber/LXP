@@ -16,7 +16,11 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from src.data.loader import get_dataset_split, pick_field
 from src.utils.alignment import apply_alignment
-from src.utils.benchmarking import build_training_phase2_report, write_json
+from src.utils.benchmarking import (
+    build_training_phase2_report,
+    build_training_smoke_report,
+    write_json,
+)
 from src.utils.lm_eval import (
     build_position_ids,
     compute_answer_metrics_from_prefix,
@@ -39,6 +43,10 @@ _DTYPE_MAP = {
 _DTYPE_NAME_BY_VALUE = {value: key for key, value in _DTYPE_MAP.items()}
 _GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 _NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_FINAL_ANSWER_MARKER_REGEX = re.compile(
+    r"final\s+answer\s*[:=]\s*\$?([^.\n]+)",
+    re.IGNORECASE,
+)
 _SMOKE_TRAIN_EXAMPLES: tuple[dict[str, str], ...] = (
     {"prompt": "What is 2 + 2?", "answer": "4"},
     {"prompt": "What is 7 * 6?", "answer": "42"},
@@ -231,6 +239,34 @@ def _predicted_answer(dataset_name: str, decoded_text: str) -> str | None:
     return extract_boxed_text(decoded_text)
 
 
+def _is_numeric_answer(answer: str | None) -> bool:
+    if answer is None:
+        return False
+    return _NUMERIC_ANSWER_REGEX.fullmatch(str(answer).strip()) is not None
+
+
+def _final_answer_marker_value(decoded_text: str) -> str | None:
+    match = _FINAL_ANSWER_MARKER_REGEX.search(decoded_text)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _predicted_answer_for_target(
+    dataset_name: str,
+    decoded_text: str,
+    target_answer: str | None,
+) -> str | None:
+    if dataset_name != "smoke":
+        return _predicted_answer(dataset_name, decoded_text)
+    marked_answer = _final_answer_marker_value(decoded_text)
+    if marked_answer is not None:
+        return marked_answer
+    if _is_numeric_answer(target_answer):
+        return _extract_gsm8k_predicted_answer(decoded_text)
+    return normalize_answer(decoded_text)
+
+
 def _answers_match(dataset_name: str, predicted_answer: str | None, target_answer: str | None) -> bool:
     if dataset_name == "gsm8k":
         return _normalize_numeric_answer(predicted_answer) == _normalize_numeric_answer(target_answer)
@@ -390,6 +426,7 @@ def _build_evaluation_callback(
         reasoner_backbone = _model_backbone(reasoner_model)
         alignment_state = alignment_context["alignment_state"]
         correct_count = 0
+        extracted_answer_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
 
@@ -435,9 +472,13 @@ def _build_evaluation_callback(
                 token_count = int(answer_metrics["answer_token_count"] or 0)
                 total_answer_tokens += token_count
                 total_answer_nll += float(answer_metrics["answer_nll"]) * token_count
-            predicted_answer = _predicted_answer(dataset_name, decoded_text)
-            if dataset_name == "smoke":
-                predicted_answer = normalize_answer(decoded_text)
+            predicted_answer = _predicted_answer_for_target(
+                dataset_name,
+                decoded_text,
+                target_answer,
+            )
+            if predicted_answer is not None and str(predicted_answer).strip():
+                extracted_answer_count += 1
             if _answers_match(dataset_name, predicted_answer, target_answer):
                 correct_count += 1
 
@@ -447,6 +488,10 @@ def _build_evaluation_callback(
         return {
             "heldout_exact_match_accuracy": 100.0 * correct_count / len(eval_examples),
             "heldout_eval_samples": float(len(eval_examples)),
+            "heldout_answer_extraction_rate_percentage": (
+                100.0 * extracted_answer_count / len(eval_examples)
+            ),
+            "heldout_correct_count": float(correct_count),
             "heldout_answer_nll": heldout_answer_nll,
             "heldout_answer_perplexity": float(torch.exp(torch.tensor(heldout_answer_nll)).item()),
         }
@@ -550,6 +595,16 @@ def main() -> None:
     history_output_path.parent.mkdir(parents=True, exist_ok=True)
     report_output_path.parent.mkdir(parents=True, exist_ok=True)
     _write_history_csv(history_output_path, history)
+    runtime_metadata = {
+        "requested_device": _runtime_device_request(cfg),
+        "effective_device": str(device),
+        "device_map": "none" if device_map is None else str(device_map),
+        "configured_torch_dtype": str(getattr(cfg, "torch_dtype", "")),
+        "effective_torch_dtype": _DTYPE_NAME_BY_VALUE.get(torch_dtype, str(torch_dtype)),
+        "mps_available": torch.backends.mps.is_available(),
+        "mps_fallback_env": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
+    }
+    training_smoke_report = build_training_smoke_report(history)
     training_report = build_training_phase2_report(
         history=history,
         cfg=cfg,
@@ -564,7 +619,9 @@ def main() -> None:
         baseline_accuracy_percentage=None
         if baseline_accuracy_percentage is None
         else float(baseline_accuracy_percentage),
+        runtime_metadata=runtime_metadata,
     )
+    training_report["training_smoke_report"] = training_smoke_report
     write_json(report_output_path, training_report)
 
     print(f"\nTraining complete — {len(history)} logged entries")
@@ -580,17 +637,18 @@ def main() -> None:
                 f"  epoch={int(entry['epoch'])} step={int(entry['step'])} "
                 f"loss={entry['loss']:.4f} l_task={entry['l_task']:.4f} "
                 f"l_pref={entry['l_pref']:.4f} l_geom={entry['l_geom']:.4f} "
-                f"heldout_exact_match_accuracy={entry.get('heldout_exact_match_accuracy', float('nan')):.2f}"
             )
             continue
         print(
             f"  epoch={int(entry['epoch'])} step={int(entry['step'])} "
             f"heldout_exact_match_accuracy={entry['heldout_exact_match_accuracy']:.2f} "
-            f"heldout_eval_samples={entry['heldout_eval_samples']:.0f}"
+            f"heldout_eval_samples={entry['heldout_eval_samples']:.0f} "
+            f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f}"
         )
 
     print(f"Wrote training history to {history_output_path}")
     print(f"Wrote phase-2 training report to {report_output_path}")
+    print(f"Training smoke passed: {training_smoke_report['passed']}")
     print(f"Phase 2 gate passed: {training_report['passed']}")
 
 

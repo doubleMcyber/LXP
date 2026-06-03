@@ -8,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 
 from run_training import (
+    _predicted_answer_for_target,
     _resolve_training_device,
     _resolve_training_torch_dtype,
     _training_device_map,
@@ -52,6 +53,12 @@ def test_mps_dtype_uses_runtime_override_and_device_map_none() -> None:
     cfg = _cfg("mps")
     assert _resolve_training_torch_dtype(cfg, torch.device("mps")) == torch.float32
     assert _training_device_map(cfg, torch.device("mps")) is None
+
+
+def test_smoke_answer_extraction_is_target_aware() -> None:
+    assert _predicted_answer_for_target("smoke", "Final answer: 13.", "13") == "13"
+    assert _predicted_answer_for_target("smoke", "The answer is 42.", "42") == "42"
+    assert _predicted_answer_for_target("smoke", "3x^2", "3x^2") == "3x^2"
 
 
 def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:

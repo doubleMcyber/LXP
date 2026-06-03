@@ -55,6 +55,7 @@ from src.utils.benchmarking import (
     build_semantic_smoke_report,
     build_standard_row_base,
     build_training_phase2_report,
+    build_training_smoke_report,
 )
 
 
@@ -1384,11 +1385,54 @@ def test_build_training_phase2_report_flags_missing_real_mode_requirements() -> 
         required_seed_count=3,
         min_accuracy_retention_ratio=0.85,
         baseline_accuracy_percentage=None,
+        runtime_metadata={
+            "effective_device": "mps",
+            "effective_torch_dtype": "float32",
+        },
     )
 
     assert report["passed"] is False
     assert report["final_heldout_exact_match_accuracy"] == 60.0
+    assert report["effective_device"] == "mps"
+    assert report["effective_torch_dtype"] == "float32"
     assert "Training mode is not 'real'." in report["missing_requirements"]
+
+
+def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_answer_perplexity": 250.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is True
+    assert report["final_heldout_exact_match_accuracy"] == 0.0
+    assert report["final_heldout_answer_extraction_rate_percentage"] == 100.0
+
+
+def test_build_training_smoke_report_flags_nonfinite_loss() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": float("nan")},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 1.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert any("non-finite" in item for item in report["missing_requirements"])
 
 
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:

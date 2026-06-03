@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -36,6 +37,33 @@ def _print_command(command: Sequence[str]) -> None:
     print(" ".join(command), flush=True)
 
 
+def _print_report_summary(report_path: Path) -> None:
+    if not report_path.is_file():
+        return
+    with report_path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    smoke_report = report.get("training_smoke_report") or {}
+    print("\nMac MPS smoke summary", flush=True)
+    print(json.dumps(
+        {
+            "training_smoke_passed": smoke_report.get("passed"),
+            "phase2_gate_passed": report.get("passed"),
+            "effective_device": report.get("effective_device"),
+            "effective_torch_dtype": report.get("effective_torch_dtype"),
+            "final_heldout_exact_match_accuracy": report.get(
+                "final_heldout_exact_match_accuracy"
+            ),
+            "final_heldout_answer_perplexity": report.get(
+                "final_heldout_answer_perplexity"
+            ),
+            "missing_phase2_requirements": report.get("missing_requirements"),
+            "missing_smoke_requirements": smoke_report.get("missing_requirements"),
+        },
+        indent=2,
+        sort_keys=True,
+    ), flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -66,6 +94,7 @@ def main() -> int:
     if not torch.backends.mps.is_available() and not args.allow_cpu_fallback:
         raise SystemExit("MPS is unavailable. Re-run with --allow-cpu-fallback to test CPU only.")
     subprocess.run(command, check=True)
+    _print_report_summary(Path(args.output_dir) / "mac_mps_training_report.json")
     return 0
 
 

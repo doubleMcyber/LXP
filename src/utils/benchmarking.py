@@ -4,7 +4,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 REPORT_SCHEMA_VERSION = 19
 
@@ -1375,6 +1375,7 @@ def build_training_phase2_report(
     required_seed_count: int,
     min_accuracy_retention_ratio: float,
     baseline_accuracy_percentage: Optional[float] = None,
+    runtime_metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     heldout_entries = [entry for entry in history if "heldout_exact_match_accuracy" in entry]
     final_heldout_accuracy = None if not heldout_entries else float(heldout_entries[-1]["heldout_exact_match_accuracy"])
@@ -1400,7 +1401,7 @@ def build_training_phase2_report(
             f"is below required {min_accuracy_retention_ratio:.4f}."
         )
 
-    return {
+    report = {
         "evaluation_surface": "run_training",
         "method": "stage2_compression_training",
         "phase": "phase_2",
@@ -1425,6 +1426,71 @@ def build_training_phase2_report(
             alignment_context.get("reasoning_layer_weights")
         ),
         "model_pair": f"{_cfg_value(cfg, 'agent_a_model', '')} -> {_cfg_value(cfg, 'agent_b_model', '')}",
+        "missing_requirements": missing_requirements,
+    }
+    if runtime_metadata is not None:
+        report["runtime"] = dict(runtime_metadata)
+        if runtime_metadata.get("effective_torch_dtype"):
+            report["effective_torch_dtype"] = str(runtime_metadata["effective_torch_dtype"])
+        if runtime_metadata.get("effective_device"):
+            report["effective_device"] = str(runtime_metadata["effective_device"])
+    return report
+
+
+def build_training_smoke_report(
+    history: Sequence[dict[str, Any]],
+    *,
+    min_eval_samples: int = 1,
+    max_loss: float = 1000.0,
+    max_answer_perplexity: float = 10000.0,
+) -> dict[str, Any]:
+    loss_entries = [entry for entry in history if "loss" in entry]
+    heldout_entries = [entry for entry in history if "heldout_eval_samples" in entry]
+    final_eval = heldout_entries[-1] if heldout_entries else {}
+    losses = [float(entry["loss"]) for entry in loss_entries if entry.get("loss") is not None]
+    finite_losses = [value for value in losses if math.isfinite(value)]
+    final_perplexity_raw = final_eval.get("heldout_answer_perplexity")
+    final_perplexity = (
+        None if final_perplexity_raw is None else float(final_perplexity_raw)
+    )
+    eval_samples = int(float(final_eval.get("heldout_eval_samples", 0) or 0))
+
+    missing_requirements: list[str] = []
+    if not loss_entries:
+        missing_requirements.append("No training loss entries were logged.")
+    if len(finite_losses) != len(losses):
+        missing_requirements.append("At least one logged training loss is non-finite.")
+    if finite_losses and max(finite_losses) > max_loss:
+        missing_requirements.append(
+            f"Maximum training loss {max(finite_losses):.4f} exceeds smoke limit {max_loss:.4f}."
+        )
+    if not heldout_entries:
+        missing_requirements.append("No heldout evaluation entry was logged.")
+    if eval_samples < min_eval_samples:
+        missing_requirements.append(
+            f"Heldout eval samples {eval_samples} is below required {min_eval_samples}."
+        )
+    if final_perplexity is None or not math.isfinite(final_perplexity):
+        missing_requirements.append("Final heldout answer perplexity is missing or non-finite.")
+    elif final_perplexity > max_answer_perplexity:
+        missing_requirements.append(
+            f"Final heldout answer perplexity {final_perplexity:.4f} exceeds smoke limit "
+            f"{max_answer_perplexity:.4f}."
+        )
+
+    return {
+        "phase": "training_smoke",
+        "passed": not missing_requirements,
+        "loss_entry_count": len(loss_entries),
+        "max_loss": None if not finite_losses else max(finite_losses),
+        "final_heldout_exact_match_accuracy": final_eval.get(
+            "heldout_exact_match_accuracy"
+        ),
+        "final_heldout_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_answer_perplexity": final_perplexity,
+        "heldout_eval_samples": eval_samples,
         "missing_requirements": missing_requirements,
     }
 

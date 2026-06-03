@@ -42,11 +42,22 @@ Expected behavior:
 - It uses `device_map=none`, then moves models onto MPS explicitly.
 - It disables checkpoints.
 - It runs tiny smoke data: batch size `1`, `4` samples, max length `64`.
+- It prints both `training_smoke_passed` and `phase2_gate_passed`.
 
 Outputs:
 
 - `outputs/mac_mps/mac_mps_training_history.csv`
 - `outputs/mac_mps/mac_mps_training_report.json`
+
+Interpretation:
+
+- `training_smoke_passed=true` means the local training loop, alignment,
+  evaluation, and reporting completed without structural failures.
+- `phase2_gate_passed=false` is expected for this smoke run because it is not
+  real multi-seed training and does not provide a baseline retention score.
+- `final_heldout_exact_match_accuracy=0` on the tiny smoke run is not by itself a
+  blocker. It means the model did not learn a useful semantic handoff in a few
+  tiny steps. Use the smoke for code correctness, not final quality.
 
 ## If The First Smoke Passes
 
