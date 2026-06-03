@@ -417,8 +417,14 @@ def build_latent_provenance_report(
                 "sender_trace_cache_path": row.get("sender_trace_cache_path"),
                 "handoff_adapter_status": row.get("handoff_adapter_status"),
                 "handoff_adapter_cache_path": row.get("handoff_adapter_cache_path"),
+                "handoff_adapter_cache_key_digest": row.get(
+                    "handoff_adapter_cache_key_digest"
+                ),
                 "handoff_adapter_training_row_cache_path": row.get(
                     "handoff_adapter_training_row_cache_path"
+                ),
+                "handoff_adapter_training_rows_cache_key_digest": row.get(
+                    "handoff_adapter_training_rows_cache_key_digest"
                 ),
                 "receiver_context_status": row.get("receiver_context_status"),
                 "receiver_context_latent_position": row.get(

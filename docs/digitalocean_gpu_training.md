@@ -58,6 +58,23 @@ existing adapter family scales beyond the local 20-sample result. If it still
 plateaus below target accuracy, move to a receiver-side learned latent-to-answer
 objective.
 
+The repo includes a bounded pilot runner. Locally, inspect the exact command
+sequence without running it:
+
+```bash
+venv/bin/python scripts/do_gpu_pilot.py
+```
+
+On the GPU host, run:
+
+```bash
+venv/bin/python scripts/do_gpu_pilot.py --execute
+```
+
+The pilot runs unit tests, warms eval sender traces, prepares one 128-row raw
+generated-trajectory adapter, then evaluates locked rows against token and latent
+controls with `--generated-trajectory-adapter-no-train-on-missing`.
+
 ## Setup
 
 ```bash
@@ -118,7 +135,8 @@ venv/bin/python benchmark_all.py \
   --generated-trajectory-adapter-input-space raw \
   --enable-sender-revision \
   --prepare-generated-trajectory-eval-traces \
-  --report-output outputs/do_eval_trace_warm_20.json
+  --report-output outputs/do_eval_trace_warm_20.json \
+  --write-eval-manifest outputs/do_eval_trace_manifest_20.json
 ```
 
 This should populate `.cache/generated_trajectory_traces` and make later method
@@ -170,7 +188,8 @@ venv/bin/python benchmark_all.py \
   --generated-trajectory-adapter-no-train-on-missing \
   --report-output outputs/do_context_vs_latent_20_report.json \
   --samples-output outputs/do_context_vs_latent_20_samples.csv \
-  --summary-output outputs/do_context_vs_latent_20_summary.csv
+  --summary-output outputs/do_context_vs_latent_20_summary.csv \
+  --write-eval-manifest outputs/do_context_vs_latent_manifest_20.json
 ```
 
 Inspect the run:
@@ -178,6 +197,20 @@ Inspect the run:
 ```bash
 jq '.semantic_smoke_report | {passed, method_accuracy_percentage, missing_requirements}' outputs/do_context_vs_latent_20_report.json
 jq '.latent_provenance_report | {method_accuracy_percentage, failure_counts_by_class, cache_paths}' outputs/do_context_vs_latent_20_report.json
+jq '.eval_manifest | {manifest_digest, sample_indices, methods}' outputs/do_context_vs_latent_20_report.json
+```
+
+To replay the exact same eval lock, use:
+
+```bash
+venv/bin/python benchmark_all.py \
+  --eval-manifest outputs/do_context_vs_latent_manifest_20.json \
+  --generated-trajectory-adapter-input-space raw \
+  --enable-sender-revision \
+  --generated-trajectory-adapter-no-train-on-missing \
+  --report-output outputs/do_context_vs_latent_20_replay_report.json \
+  --samples-output outputs/do_context_vs_latent_20_replay_samples.csv \
+  --summary-output outputs/do_context_vs_latent_20_replay_summary.csv
 ```
 
 Pass criteria for this stage:
@@ -212,6 +245,7 @@ Save these files from each paid run:
 - `outputs/*_report.json`
 - `outputs/*_samples.csv`
 - `outputs/*_summary.csv`
+- `outputs/*manifest*.json`
 - `.cache/generated_trajectory_adapter/*.pt`
 - `.cache/generated_trajectory_rows/*.pt`
 - `.cache/generated_trajectory_traces/*.pt` if you want exact reruns

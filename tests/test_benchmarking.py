@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from omegaconf import OmegaConf
 import pytest
 import torch
@@ -15,7 +17,9 @@ from benchmark_all import (
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
     _build_generated_adapter_local_residual_state,
+    _build_eval_manifest,
     _answers_match,
+    _cache_key_digest,
     _cache_key_metadata,
     _final_answer_tail_needs_scalar_verification,
     _format_sender_answer_text_handoff_prompt,
@@ -32,6 +36,8 @@ from benchmark_all import (
     _handoff_decode_prompt,
     _load_generated_trajectory_training_rows_from_disk,
     _load_generated_trajectory_trace_from_disk,
+    _load_eval_manifest,
+    _load_generated_trajectory_adapter_from_disk,
     _methods_for_suite,
     _predicted_answer,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
@@ -698,6 +704,36 @@ def test_verified_token_context_handoff_prompt_prioritizes_verified_answer() -> 
     assert prompt.rstrip().endswith("Final answer:")
 
 
+def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
+    manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="gsm8k",
+        dataset_split="validation",
+        limit=3,
+        sample_indices=[9, 11, 19],
+        methods=("sender_answer_text_handoff", "generated_context_latent_handoff"),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=7,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+    )
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = _load_eval_manifest(path)
+
+    assert loaded["manifest_digest"] == manifest["manifest_digest"]
+    assert loaded["sample_indices"] == [9, 11, 19]
+
+    tampered = dict(manifest)
+    tampered["sample_indices"] = [9, 11, 18]
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        _load_eval_manifest(path)
+
+
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
     assert _answers_match("gsm8k", "252.00", "252")
     assert _answers_match("gsm8k", "9,800.0", "9800")
@@ -909,23 +945,79 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
 
 def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) -> None:
     cache_path = tmp_path / "rows.pt"
+    expected_key = ("rows", "expected")
     torch.save(
         {
             "source_matrix": torch.zeros(2, 3),
             "target_matrix": torch.ones(2, 4),
             "training_prompt_count": 1,
             "training_token_count": 2,
+            "training_rows_cache_key_digest": _cache_key_digest(expected_key),
         },
         cache_path,
     )
 
-    loaded = _load_generated_trajectory_training_rows_from_disk(cache_path)
+    loaded = _load_generated_trajectory_training_rows_from_disk(
+        cache_path,
+        expected_cache_key=expected_key,
+    )
 
     assert loaded is not None
     assert loaded["source_matrix"].shape == (2, 3)
 
+    torch.save(
+        {
+            "source_matrix": torch.zeros(2, 3),
+            "target_matrix": torch.ones(2, 4),
+            "training_rows_cache_key_digest": _cache_key_digest(("rows", "other")),
+        },
+        cache_path,
+    )
+    assert (
+        _load_generated_trajectory_training_rows_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is None
+    )
+
     torch.save({"source_matrix": torch.zeros(2, 3), "target_matrix": torch.ones(3, 4)}, cache_path)
     assert _load_generated_trajectory_training_rows_from_disk(cache_path) is None
+
+
+def test_load_generated_trajectory_adapter_rejects_digest_mismatch(tmp_path) -> None:
+    cache_path = tmp_path / "adapter.pt"
+    expected_key = ("adapter", "expected")
+    torch.save(
+        {
+            "mapping_matrix": torch.eye(2),
+            "adapter_cache_key_digest": _cache_key_digest(("adapter", "other")),
+        },
+        cache_path,
+    )
+
+    assert (
+        _load_generated_trajectory_adapter_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is None
+    )
+
+    torch.save(
+        {
+            "mapping_matrix": torch.eye(2),
+            "adapter_cache_key_digest": _cache_key_digest(expected_key),
+        },
+        cache_path,
+    )
+    assert (
+        _load_generated_trajectory_adapter_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is not None
+    )
 
 
 def test_generated_trajectory_trace_cache_key_tracks_prompt_and_sender_setup() -> None:

@@ -40,6 +40,29 @@ Eval sender traces can also be warmed before a larger semantic gate:
 venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --prepare-generated-trajectory-eval-traces --generated-trajectory-adapter-input-space raw --report-output outputs/generated_eval_trace_prepare_report.json
 ```
 
+Benchmark reports include an `eval_manifest` with resolved dataset, split, sample
+indices, method list, model pair, seed, smoke profile, and a stable digest. Write
+the same lock file separately with `--write-eval-manifest`, then replay it with
+`--eval-manifest` before any paid GPU run:
+
+```bash
+venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --methods token_context_handoff,verified_token_context_handoff,sender_answer_text_handoff,generated_context_latent_handoff --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing --write-eval-manifest outputs/locked_eval_manifest_5.json
+venv/bin/python benchmark_all.py --eval-manifest outputs/locked_eval_manifest_5.json --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing
+```
+
+For a bounded DigitalOcean pilot, inspect the planned commands locally first:
+
+```bash
+venv/bin/python scripts/do_gpu_pilot.py
+```
+
+On the GPU host, run the same pilot with `--execute`.
+
+Autonomous research loops should use the guardrails in
+[`docs/autoresearch_readiness.md`](docs/autoresearch_readiness.md): keep eval
+manifests/reporting/token controls locked, restrict the editable module set, and
+promote only changes that improve a held-out locked manifest.
+
 For larger generated-latent runs, add `--semantic-min-sender-accuracy 100` when you want the report to distinguish a sender reasoning miss from a latent-transfer miss.
 
 ## Latent Blame
