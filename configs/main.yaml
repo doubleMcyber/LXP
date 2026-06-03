@@ -183,6 +183,8 @@ training:
     baseline_accuracy_percentage: null
     seed_count: 1
     evaluate_before_training: true
+    baseline_few_shot_examples: 6
+    smoke_eval_set: heldout
   checkpointing:
     enabled: true
     dir: "checkpoints"

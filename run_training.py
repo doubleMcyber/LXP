@@ -323,6 +323,7 @@ def _select_candidate_answer_by_nll(
             tokenizer=tokenizer,
             prefix_state=prefix_state,
             answer_text=answer,
+            answer_variants=_answer_metric_variants(answer),
         )
         answer_nll = metrics.get("answer_nll")
         if answer_nll is None:
@@ -352,16 +353,48 @@ def _unique_normalized_answer_count(answers: Iterable[str | None]) -> int:
     return len(normalized_answers)
 
 
+def _format_actor_answer_prompt(
+    prompt: str,
+    *,
+    baseline_examples: list[dict[str, str | None]],
+) -> str:
+    lines: list[str] = [
+        "Answer each question with exactly one final-answer line.",
+    ]
+    current_prompt = normalize_answer(prompt)
+    for example in baseline_examples:
+        example_prompt = example.get("prompt")
+        example_answer = example.get("answer")
+        if example_prompt is None or example_answer is None:
+            continue
+        if normalize_answer(str(example_prompt)) == current_prompt:
+            continue
+        lines.extend(
+            [
+                "",
+                f"Question: {str(example_prompt).strip()}",
+                f"Final answer: {str(example_answer).strip()}",
+            ]
+        )
+    lines.extend(["", f"Question: {prompt.strip()}"])
+    return "\n".join(lines)
+
+
 def _prepare_actor_answer_prefix_state(
     *,
     actor_model: AutoModelForCausalLM,
     actor_tokenizer: Any,
     prompt: str,
+    baseline_examples: list[dict[str, str | None]],
 ) -> dict[str, Any]:
+    prefix_text = _format_actor_answer_prompt(
+        prompt,
+        baseline_examples=baseline_examples,
+    )
     text_prefix_state = prepare_text_prefix_state(
         model=actor_model,
         tokenizer=actor_tokenizer,
-        prefix_text=f"Question: {prompt}",
+        prefix_text=prefix_text,
     )
     return append_text_to_prefix_state(
         model=actor_model,
@@ -398,19 +431,45 @@ def _build_real_examples(
     return examples
 
 
-def _build_training_payloads(cfg: Any) -> tuple[DataLoader, list[dict[str, str | None]], str]:
+def _training_evaluation_cfg(cfg: Any) -> Any:
+    return getattr(getattr(cfg, "training", None), "evaluation", None)
+
+
+def _baseline_few_shot_count(cfg: Any) -> int:
+    return int(getattr(_training_evaluation_cfg(cfg), "baseline_few_shot_examples", 6))
+
+
+def _smoke_eval_set(cfg: Any) -> str:
+    return str(getattr(_training_evaluation_cfg(cfg), "smoke_eval_set", "heldout")).lower()
+
+
+def _build_training_payloads(
+    cfg: Any,
+) -> tuple[DataLoader, list[dict[str, str | None]], list[dict[str, str | None]], str]:
     data_cfg = getattr(cfg.training, "data", None)
     mode = str(getattr(data_cfg, "mode", "smoke")).lower()
     batch_size = int(getattr(data_cfg, "batch_size", 2))
 
     if mode == "smoke":
         num_samples = int(getattr(data_cfg, "smoke_num_samples", 16))
+        train_examples = _smoke_training_examples(num_samples)
         train_loader = _build_text_dataloader(
-            _smoke_training_examples(num_samples),
+            train_examples,
             batch_size=batch_size,
             shuffle=True,
         )
-        return train_loader, list(_SMOKE_EVAL_EXAMPLES), "smoke"
+        if _smoke_eval_set(cfg) in {"train", "train_overfit", "overfit"}:
+            eval_examples = [
+                {"prompt": example["prompt"], "answer": example["answer"]}
+                for example in train_examples[: max(1, min(len(train_examples), 3))]
+            ]
+        else:
+            eval_examples = list(_SMOKE_EVAL_EXAMPLES)
+        baseline_examples = [
+            {"prompt": example["prompt"], "answer": example["answer"]}
+            for example in train_examples[: _baseline_few_shot_count(cfg)]
+        ]
+        return train_loader, eval_examples, baseline_examples, "smoke"
 
     if mode == "real":
         dataset_name = str(getattr(data_cfg, "dataset_name", "gsm8k")).lower()
@@ -424,7 +483,11 @@ def _build_training_payloads(cfg: Any) -> tuple[DataLoader, list[dict[str, str |
             batch_size=batch_size,
             shuffle=True,
         )
-        return train_loader, eval_examples, dataset_name
+        baseline_examples = [
+            {"prompt": example["prompt"], "answer": example["answer"]}
+            for example in train_examples[: _baseline_few_shot_count(cfg)]
+        ]
+        return train_loader, eval_examples, baseline_examples, dataset_name
 
     raise ValueError("training.data.mode must be either 'smoke' or 'real'")
 
@@ -449,6 +512,7 @@ def _tokenize_prompt(
 def _build_evaluation_callback(
     *,
     eval_examples: list[dict[str, str | None]],
+    baseline_examples: list[dict[str, str | None]],
     dataset_name: str,
     reasoner_tokenizer: Any,
     actor_tokenizer: Any,
@@ -478,10 +542,12 @@ def _build_evaluation_callback(
         extraction_failure_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
+        baseline_candidate_correct_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
         predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
+        baseline_candidate_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
 
         for example in eval_examples:
@@ -491,6 +557,7 @@ def _build_evaluation_callback(
                 actor_model=actor_model,
                 actor_tokenizer=actor_tokenizer,
                 prompt=prompt,
+                baseline_examples=baseline_examples,
             )
             baseline_decode_metrics = greedy_decode_from_prefix(
                 model=actor_model,
@@ -509,6 +576,17 @@ def _build_evaluation_callback(
                 baseline_extracted_answer_count += 1
             if _answers_match(dataset_name, baseline_predicted_answer, target_answer):
                 baseline_correct_count += 1
+            baseline_candidate_predicted_answer = None
+            if candidate_answers:
+                baseline_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_state=actor_text_prefix_state,
+                    candidate_answers=candidate_answers,
+                )
+                baseline_candidate_predicted_answers.append(baseline_candidate_predicted_answer)
+                if _answers_match(dataset_name, baseline_candidate_predicted_answer, target_answer):
+                    baseline_candidate_correct_count += 1
 
             input_ids, attention_mask = _tokenize_prompt(
                 reasoner_tokenizer,
@@ -597,6 +675,7 @@ def _build_evaluation_callback(
                             f"predicted={predicted_answer}",
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
+                            f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
                             f"decoded={decoded_preview}",
                             f"baseline_decoded={baseline_preview}",
                         )
@@ -630,6 +709,16 @@ def _build_evaluation_callback(
             ),
             "heldout_actor_text_baseline_unique_predicted_answer_count": float(
                 _unique_normalized_answer_count(baseline_predicted_answers)
+            ),
+            "heldout_actor_text_baseline_candidate_accuracy": (
+                100.0 * baseline_candidate_correct_count / len(eval_examples)
+                if candidate_answers
+                else None
+            ),
+            "heldout_actor_text_baseline_candidate_unique_predicted_answer_count": (
+                float(_unique_normalized_answer_count(baseline_candidate_predicted_answers))
+                if candidate_answers
+                else None
             ),
             "heldout_correct_count": float(correct_count),
             "heldout_answer_nll": heldout_answer_nll,
@@ -704,10 +793,11 @@ def main() -> None:
     )
 
     print("Building text-first dataloaders...")
-    train_loader, eval_examples, dataset_name = _build_training_payloads(cfg)
+    train_loader, eval_examples, baseline_examples, dataset_name = _build_training_payloads(cfg)
     evaluation_max_new_tokens = int(getattr(getattr(cfg.training, "evaluation", None), "max_new_tokens", 16))
     evaluation_fn = _build_evaluation_callback(
         eval_examples=eval_examples,
+        baseline_examples=baseline_examples,
         dataset_name=dataset_name,
         reasoner_tokenizer=reasoner_tokenizer,
         actor_tokenizer=actor_tokenizer,

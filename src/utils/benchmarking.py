@@ -1493,6 +1493,16 @@ def build_training_smoke_report(
         final_eval,
         eval_samples=eval_samples,
     )
+    actor_baseline_accuracy_raw = final_eval.get("heldout_actor_text_baseline_accuracy")
+    actor_baseline_accuracy = (
+        None if actor_baseline_accuracy_raw is None else float(actor_baseline_accuracy_raw)
+    )
+    actor_baseline_unique_raw = final_eval.get(
+        "heldout_actor_text_baseline_unique_predicted_answer_count"
+    )
+    actor_baseline_unique_count = (
+        None if actor_baseline_unique_raw is None else int(float(actor_baseline_unique_raw))
+    )
 
     missing_requirements: list[str] = []
     if not loss_entries:
@@ -1535,6 +1545,19 @@ def build_training_smoke_report(
             "Heldout predictions are degenerate: one unique predicted answer was emitted "
             f"across {eval_samples} samples while exact-match accuracy was {final_accuracy:.2f}%."
         )
+    actor_text_baseline_degenerate = (
+        eval_samples > 1
+        and actor_baseline_unique_count is not None
+        and actor_baseline_unique_count <= 1
+        and actor_baseline_accuracy is not None
+        and actor_baseline_accuracy < 100.0
+    )
+    if actor_text_baseline_degenerate:
+        missing_requirements.append(
+            "Actor text baseline is degenerate: one unique predicted answer was emitted "
+            f"across {eval_samples} samples while baseline accuracy was "
+            f"{actor_baseline_accuracy:.2f}%."
+        )
 
     return {
         "phase": "training_smoke",
@@ -1561,15 +1584,19 @@ def build_training_smoke_report(
         ),
         "final_heldout_unique_predicted_answer_count": unique_prediction_count,
         "final_heldout_degenerate_prediction": degenerate_prediction,
-        "final_heldout_actor_text_baseline_accuracy": final_eval.get(
-            "heldout_actor_text_baseline_accuracy"
-        ),
+        "final_heldout_actor_text_baseline_accuracy": actor_baseline_accuracy,
         "final_heldout_actor_text_baseline_answer_extraction_rate_percentage": final_eval.get(
             "heldout_actor_text_baseline_answer_extraction_rate_percentage"
         ),
-        "final_heldout_actor_text_baseline_unique_predicted_answer_count": final_eval.get(
-            "heldout_actor_text_baseline_unique_predicted_answer_count"
+        "final_heldout_actor_text_baseline_unique_predicted_answer_count": actor_baseline_unique_count,
+        "final_heldout_actor_text_baseline_degenerate_prediction": actor_text_baseline_degenerate,
+        "final_heldout_actor_text_baseline_candidate_accuracy": final_eval.get(
+            "heldout_actor_text_baseline_candidate_accuracy"
         ),
+        "final_heldout_actor_text_baseline_candidate_unique_predicted_answer_count": final_eval.get(
+            "heldout_actor_text_baseline_candidate_unique_predicted_answer_count"
+        ),
+        "latent_training_ready": not missing_requirements,
         "final_heldout_answer_perplexity": final_perplexity,
         "heldout_eval_diagnostics": final_eval.get("heldout_eval_diagnostics"),
         "heldout_eval_samples": eval_samples,

@@ -1510,6 +1510,30 @@ def test_build_training_smoke_report_detects_degenerate_predictions_from_diagnos
     assert report["final_heldout_degenerate_prediction"] is True
 
 
+def test_build_training_smoke_report_flags_degenerate_actor_text_baseline() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 100.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 3.0,
+                "heldout_actor_text_baseline_accuracy": 0.0,
+                "heldout_actor_text_baseline_unique_predicted_answer_count": 1.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["latent_training_ready"] is False
+    assert report["final_heldout_actor_text_baseline_degenerate_prediction"] is True
+    assert any("Actor text baseline is degenerate" in item for item in report["missing_requirements"])
+
+
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     phase1_methods = [name for name, _ in _methods_for_suite("phase1_homogeneous")]
     standard_methods = [name for name, _ in _methods_for_suite("standard")]

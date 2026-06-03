@@ -8,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 
 from run_training import (
+    _format_actor_answer_prompt,
     _predicted_answer_for_target,
     _resolve_training_device,
     _resolve_training_torch_dtype,
@@ -75,6 +76,22 @@ def test_smoke_candidate_answers_are_unique_and_ordered() -> None:
     assert candidates == ("13", "42")
 
 
+def test_actor_answer_prompt_uses_few_shot_examples_without_target_leak() -> None:
+    prompt = _format_actor_answer_prompt(
+        "What is 8 + 5?",
+        baseline_examples=[
+            {"prompt": "What is 2 + 2?", "answer": "4"},
+            {"prompt": "What is 8 + 5?", "answer": "13"},
+            {"prompt": "What is 6 * 7?", "answer": "42"},
+        ],
+    )
+
+    assert "Question: What is 2 + 2?\nFinal answer: 4" in prompt
+    assert "Question: What is 6 * 7?\nFinal answer: 42" in prompt
+    assert "Final answer: 13" not in prompt
+    assert prompt.rstrip().endswith("Question: What is 8 + 5?")
+
+
 def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:
     args = argparse.Namespace(
         python="venv/bin/python",
@@ -86,6 +103,8 @@ def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:
         max_length=64,
         compressed_steps=8,
         epochs=1,
+        baseline_few_shot_examples=6,
+        eval_on_train=False,
         allow_cpu_fallback=False,
     )
 
@@ -97,5 +116,28 @@ def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:
     assert "runtime.mps.torch_dtype=float32" in command
     assert "training.data.batch_size=1" in command
     assert "training.data.smoke_num_samples=4" in command
+    assert "training.evaluation.baseline_few_shot_examples=6" in command
     assert "agent_a_model=Qwen/Qwen3.5-0.8B" in command
     assert "agent_b_model=Qwen/Qwen3.5-0.8B" in command
+
+
+def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
+    args = argparse.Namespace(
+        python="venv/bin/python",
+        output_dir="outputs/mac_mps",
+        agent_a_model="Qwen/Qwen3.5-0.8B",
+        agent_b_model="Qwen/Qwen3.5-0.8B",
+        batch_size=1,
+        smoke_samples=4,
+        max_length=64,
+        compressed_steps=8,
+        epochs=3,
+        baseline_few_shot_examples=4,
+        eval_on_train=True,
+        allow_cpu_fallback=False,
+    )
+
+    command = build_command(args)
+
+    assert "training.evaluation.smoke_eval_set=train_overfit" in command
+    assert "training.evaluation.baseline_few_shot_examples=4" in command

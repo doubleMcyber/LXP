@@ -46,6 +46,9 @@ Expected behavior:
 - It prints answer extraction diagnostics, including direct decode extraction
   rate and candidate-NLL fallback rate.
 - It prints degenerate-prediction and actor text-baseline diagnostics.
+- The actor text baseline uses a few-shot final-answer prompt. If it is still
+  degenerate, fix prompt construction or model choice before interpreting
+  latent training quality.
 
 Outputs:
 
@@ -68,6 +71,12 @@ Interpretation:
 - `actor_text_baseline_accuracy` is the same actor answering from a normal text
   prompt. If this baseline is non-degenerate while the latent path collapses,
   the issue is latent injection or the Stage-II objective, not answer parsing.
+- `actor_text_baseline_candidate_accuracy` scores known smoke answer candidates
+  by NLL. If candidate accuracy is healthy while greedy baseline generation is
+  degenerate, the model has answer likelihood signal but needs a better decode
+  or prompting surface.
+- `latent_training_ready=true` means the local smoke did not find structural
+  extraction, degenerate decode, or actor-baseline blockers.
 - The Stage-II loop includes a latent-prefix answer loss (`l_answer`) so the
   optimized task matches evaluation: latent prefix plus `Final answer:` should
   make the frozen actor assign high likelihood to the target answer.
@@ -114,6 +123,24 @@ venv/bin/python scripts/mac_mps_stage2_smoke.py \
 
 If that fails on memory, go back to `0.8B -> 0.8B` and use MPS for code-level
 iteration only.
+
+## Overfit Readiness Smoke
+
+Before spending time on held-out quality, verify that Stage II can overfit a tiny
+prompt-only smoke set:
+
+```bash
+venv/bin/python scripts/mac_mps_stage2_smoke.py \
+  --execute \
+  --eval-on-train \
+  --epochs 3 \
+  --smoke-samples 8
+```
+
+Use this as a readiness check. If actor text baseline is non-degenerate but
+latent outputs still collapse on train-overfit eval, focus on latent injection,
+answer loss weight, and optimization. If the actor text baseline itself is
+degenerate, fix prompt/model construction first.
 
 ## Direct `run_training.py` Command
 

@@ -11,7 +11,7 @@ import torch
 
 def build_command(args: argparse.Namespace) -> list[str]:
     output_dir = Path(args.output_dir)
-    return [
+    command = [
         args.python,
         "run_training.py",
         "runtime.device=mps",
@@ -27,10 +27,14 @@ def build_command(args: argparse.Namespace) -> list[str]:
         f"training.actor_max_length={args.max_length}",
         f"training.compressed_steps={args.compressed_steps}",
         f"training.num_epochs={args.epochs}",
+        f"training.evaluation.baseline_few_shot_examples={args.baseline_few_shot_examples}",
         "training.checkpointing.enabled=false",
         f"reporting.training.history_output={output_dir / 'mac_mps_training_history.csv'}",
         f"reporting.training.report_output={output_dir / 'mac_mps_training_report.json'}",
     ]
+    if args.eval_on_train:
+        command.append("training.evaluation.smoke_eval_set=train_overfit")
+    return command
 
 
 def _print_command(command: Sequence[str]) -> None:
@@ -74,9 +78,16 @@ def _print_report_summary(report_path: Path) -> None:
             "actor_text_baseline_accuracy": smoke_report.get(
                 "final_heldout_actor_text_baseline_accuracy"
             ),
+            "actor_text_baseline_degenerate_prediction": smoke_report.get(
+                "final_heldout_actor_text_baseline_degenerate_prediction"
+            ),
             "actor_text_baseline_unique_predicted_answer_count": smoke_report.get(
                 "final_heldout_actor_text_baseline_unique_predicted_answer_count"
             ),
+            "actor_text_baseline_candidate_accuracy": smoke_report.get(
+                "final_heldout_actor_text_baseline_candidate_accuracy"
+            ),
+            "latent_training_ready": smoke_report.get("latent_training_ready"),
             "eval_diagnostics": smoke_report.get("heldout_eval_diagnostics"),
             "initial_eval_diagnostics": smoke_report.get("initial_heldout_eval_diagnostics"),
             "missing_phase2_requirements": report.get("missing_requirements"),
@@ -103,6 +114,8 @@ def main() -> int:
     parser.add_argument("--max-length", type=int, default=64)
     parser.add_argument("--compressed-steps", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--baseline-few-shot-examples", type=int, default=6)
+    parser.add_argument("--eval-on-train", action="store_true")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
