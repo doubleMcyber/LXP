@@ -8,6 +8,13 @@ simulated_continuous_steps: 50
 device_map: "auto"
 torch_dtype: "bfloat16"
 
+runtime:
+  device: "auto"  # auto, mps, cuda, cpu
+  mps:
+    enabled: true
+    fallback_to_cpu: true
+    torch_dtype: "float32"
+
 datasets:
   gsm8k:
     validation_size: 256

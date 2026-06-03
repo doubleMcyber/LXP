@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 from omegaconf import OmegaConf
@@ -33,6 +36,7 @@ _DTYPE_MAP = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+_DTYPE_NAME_BY_VALUE = {value: key for key, value in _DTYPE_MAP.items()}
 _GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 _NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 _SMOKE_TRAIN_EXAMPLES: tuple[dict[str, str], ...] = (
@@ -86,17 +90,86 @@ def _model_backbone(model: AutoModelForCausalLM) -> Any:
     return model
 
 
-def _load_model(model_name: str, *, torch_dtype: torch.dtype, device_map: str) -> AutoModelForCausalLM:
+def _runtime_cfg(cfg: Any) -> Any:
+    return getattr(cfg, "runtime", None)
+
+
+def _runtime_device_request(cfg: Any) -> str:
+    return str(getattr(_runtime_cfg(cfg), "device", "auto")).lower()
+
+
+def _mps_runtime_cfg(cfg: Any) -> Any:
+    return getattr(_runtime_cfg(cfg), "mps", None)
+
+
+def _mps_fallback_to_cpu(cfg: Any) -> bool:
+    return bool(getattr(_mps_runtime_cfg(cfg), "fallback_to_cpu", True))
+
+
+def _resolve_training_device(cfg: Any) -> torch.device:
+    requested = _runtime_device_request(cfg)
+    if requested == "auto":
+        if bool(getattr(_mps_runtime_cfg(cfg), "enabled", True)) and torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    if requested == "mps":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if _mps_fallback_to_cpu(cfg):
+            return torch.device("cpu")
+        raise RuntimeError("runtime.device=mps was requested, but torch.backends.mps is unavailable")
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        raise RuntimeError("runtime.device=cuda was requested, but torch.cuda is unavailable")
+    if requested == "cpu":
+        return torch.device("cpu")
+    raise ValueError("runtime.device must be one of: auto, mps, cuda, cpu")
+
+
+def _resolve_training_torch_dtype(cfg: Any, device: torch.device) -> torch.dtype:
+    configured_dtype = _DTYPE_MAP.get(str(getattr(cfg, "torch_dtype", "bfloat16")), torch.bfloat16)
+    if device.type != "mps":
+        return configured_dtype
+    mps_dtype_name = getattr(_mps_runtime_cfg(cfg), "torch_dtype", None)
+    if mps_dtype_name is not None:
+        return _DTYPE_MAP.get(str(mps_dtype_name), torch.float32)
+    if configured_dtype == torch.bfloat16:
+        return torch.float32
+    return configured_dtype
+
+
+def _training_device_map(cfg: Any, device: torch.device) -> str | None:
+    configured = str(getattr(cfg, "device_map", "auto"))
+    if configured.lower() in {"none", "null", ""}:
+        return None
+    if device.type in {"mps", "cpu"}:
+        return None
+    return configured
+
+
+def _load_model(
+    model_name: str,
+    *,
+    torch_dtype: torch.dtype,
+    device: torch.device,
+    device_map: str | None,
+) -> AutoModelForCausalLM:
     model_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     if hasattr(model_cfg, "text_config"):
         model_cfg = model_cfg.text_config
-    return AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=model_cfg,
         torch_dtype=torch_dtype,
         device_map=device_map,
         trust_remote_code=True,
     )
+    if device_map is None:
+        model = model.to(device)
+    return model
 
 
 def _collate_text_batch(batch: list[str]) -> dict[str, list[str]]:
@@ -395,8 +468,9 @@ def main() -> None:
     cfg = _load_cfg()
     torch.manual_seed(int(getattr(cfg, "seed", 0)))
     config = CompressionTrainConfig.from_cfg(cfg)
-    torch_dtype = _DTYPE_MAP.get(cfg.torch_dtype, torch.bfloat16)
-    device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_training_device(cfg)
+    torch_dtype = _resolve_training_torch_dtype(cfg, device)
+    device_map = _training_device_map(cfg, device)
     data_cfg = getattr(cfg.training, "data", None)
     training_mode = str(getattr(data_cfg, "mode", "smoke")).lower()
     reporting_cfg = _reporting_cfg(cfg)
@@ -410,8 +484,10 @@ def main() -> None:
     )
     seed_count = int(getattr(getattr(cfg.training, "evaluation", None), "seed_count", 1))
 
-    print(f"Device: {device}")
-    print(f"Dtype: {torch_dtype}")
+    print(f"Requested device: {_runtime_device_request(cfg)}")
+    print(f"Effective device: {device}")
+    print(f"Device map: {device_map}")
+    print(f"Dtype: {_DTYPE_NAME_BY_VALUE.get(torch_dtype, str(torch_dtype))}")
     print(f"Reasoner (Agent A): {cfg.agent_a_model}")
     print(f"Actor (Agent B): {cfg.agent_b_model}")
     print(f"Training mode: {training_mode}")
@@ -426,10 +502,20 @@ def main() -> None:
     _ensure_padding_token(actor_tokenizer)
 
     print("Loading reasoner model...")
-    reasoner = _load_model(cfg.agent_a_model, torch_dtype=torch_dtype, device_map=device)
+    reasoner = _load_model(
+        cfg.agent_a_model,
+        torch_dtype=torch_dtype,
+        device=device,
+        device_map=device_map,
+    )
 
     print("Loading actor model...")
-    actor = _load_model(cfg.agent_b_model, torch_dtype=torch_dtype, device_map=device)
+    actor = _load_model(
+        cfg.agent_b_model,
+        torch_dtype=torch_dtype,
+        device=device,
+        device_map=device_map,
+    )
 
     print("Building text-first dataloaders...")
     train_loader, eval_examples, dataset_name = _build_training_payloads(cfg)

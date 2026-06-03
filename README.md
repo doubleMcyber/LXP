@@ -58,6 +58,15 @@ venv/bin/python scripts/do_gpu_pilot.py
 
 On the GPU host, run the same pilot with `--execute`.
 
+If cloud GPUs are unavailable, use the local Apple Silicon path in
+[`docs/mac_mps_training.md`](docs/mac_mps_training.md). It supports a small MPS
+Stage-II smoke first:
+
+```bash
+venv/bin/python scripts/mac_mps_stage2_smoke.py
+venv/bin/python scripts/mac_mps_stage2_smoke.py --execute
+```
+
 Autonomous research loops should use the guardrails in
 [`docs/autoresearch_readiness.md`](docs/autoresearch_readiness.md): keep eval
 manifests/reporting/token controls locked, restrict the editable module set, and
