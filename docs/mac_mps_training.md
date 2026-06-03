@@ -43,6 +43,8 @@ Expected behavior:
 - It disables checkpoints.
 - It runs tiny smoke data: batch size `1`, `4` samples, max length `64`.
 - It prints both `training_smoke_passed` and `phase2_gate_passed`.
+- It prints answer extraction diagnostics, including direct decode extraction
+  rate and candidate-NLL fallback rate.
 
 Outputs:
 
@@ -52,7 +54,13 @@ Outputs:
 Interpretation:
 
 - `training_smoke_passed=true` means the local training loop, alignment,
-  evaluation, and reporting completed without structural failures.
+  evaluation, answer extraction, and reporting completed without structural
+  failures.
+- `decode_answer_extraction_rate` is the rate at which greedy continuation from
+  the latent prefix produced a parseable answer. `candidate_fallback_rate` is
+  the rate at which smoke evaluation had to score known held-out answer
+  candidates by NLL instead. Fallback keeps smoke evaluation debuggable, but it
+  is labeled separately so it is not confused with generation quality.
 - `phase2_gate_passed=false` is expected for this smoke run because it is not
   real multi-seed training and does not provide a baseline retention score.
 - `final_heldout_exact_match_accuracy=0` on the tiny smoke run is not by itself a

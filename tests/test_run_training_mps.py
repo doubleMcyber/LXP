@@ -11,6 +11,7 @@ from run_training import (
     _predicted_answer_for_target,
     _resolve_training_device,
     _resolve_training_torch_dtype,
+    _unique_candidate_answers,
     _training_device_map,
 )
 from scripts.mac_mps_stage2_smoke import build_command
@@ -59,6 +60,19 @@ def test_smoke_answer_extraction_is_target_aware() -> None:
     assert _predicted_answer_for_target("smoke", "Final answer: 13.", "13") == "13"
     assert _predicted_answer_for_target("smoke", "The answer is 42.", "42") == "42"
     assert _predicted_answer_for_target("smoke", "3x^2", "3x^2") == "3x^2"
+
+
+def test_smoke_candidate_answers_are_unique_and_ordered() -> None:
+    candidates = _unique_candidate_answers(
+        [
+            {"prompt": "a", "answer": "13"},
+            {"prompt": "b", "answer": "42"},
+            {"prompt": "c", "answer": "13"},
+            {"prompt": "d", "answer": None},
+        ]
+    )
+
+    assert candidates == ("13", "42")
 
 
 def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:

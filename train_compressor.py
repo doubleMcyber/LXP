@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import hydra
 import torch
@@ -24,7 +24,7 @@ from src.models.losses import (
 )
 from src.utils.alignment import apply_alignment
 
-EvaluationFn = Callable[[AutoModelForCausalLM, AutoModelForCausalLM, dict[str, Any]], dict[str, float]]
+EvaluationFn = Callable[[AutoModelForCausalLM, AutoModelForCausalLM, dict[str, Any]], dict[str, Any]]
 
 
 @dataclass
@@ -112,6 +112,27 @@ class CompressionTrainConfig:
             hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
             hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
         )
+
+
+def _coerce_history_value(value: Any) -> Any:
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return str(value.detach().cpu().tolist())
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return value
+
+
+def _numeric_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    return {
+        key: float(value)
+        for key, value in metrics.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+
 
 def compress_latent_trajectory(full_latents: torch.Tensor, compressed_steps: int) -> torch.Tensor:
     # Differentiable temporal compression: [B, T, D] -> [B, K, D]
@@ -384,7 +405,7 @@ def train_reasoner_stage2(
     actor_tokenizer: Any,
     alignment_cfg: Optional[DictConfig] = None,
     evaluation_fn: Optional[EvaluationFn] = None,
-) -> list[dict[str, float]]:
+) -> list[dict[str, Any]]:
     """
     Stage II Interlat-style training loop:
     - Freeze Actor (Agent B) completely.
@@ -496,7 +517,7 @@ def train_reasoner_stage2(
         ),
     )
 
-    history: list[dict[str, float]] = []
+    history: list[dict[str, Any]] = []
     global_step = 0
     total_training_steps = max(1, int(config.num_epochs) * max(1, len(train_dataloader)))
 
@@ -730,8 +751,12 @@ def train_reasoner_stage2(
 
         if evaluation_fn is not None:
             evaluation_metrics = {
-                key: float(value)
-                for key, value in evaluation_fn(reasoner_model, actor_model, latest_alignment_context).items()
+                key: _coerce_history_value(value)
+                for key, value in evaluation_fn(
+                    reasoner_model,
+                    actor_model,
+                    latest_alignment_context,
+                ).items()
             }
             eval_history_entry = {
                 "epoch": float(epoch),
@@ -740,7 +765,7 @@ def train_reasoner_stage2(
             }
             history.append(eval_history_entry)
             if config.wandb_enabled:
-                wandb.log(evaluation_metrics, step=global_step)
+                wandb.log(_numeric_metrics(evaluation_metrics), step=global_step)
 
         if config.checkpoint_enabled:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"

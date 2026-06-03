@@ -1443,6 +1443,7 @@ def build_training_smoke_report(
     min_eval_samples: int = 1,
     max_loss: float = 1000.0,
     max_answer_perplexity: float = 10000.0,
+    min_answer_extraction_rate_percentage: float = 100.0,
 ) -> dict[str, Any]:
     loss_entries = [entry for entry in history if "loss" in entry]
     heldout_entries = [entry for entry in history if "heldout_eval_samples" in entry]
@@ -1452,6 +1453,10 @@ def build_training_smoke_report(
     final_perplexity_raw = final_eval.get("heldout_answer_perplexity")
     final_perplexity = (
         None if final_perplexity_raw is None else float(final_perplexity_raw)
+    )
+    final_extraction_rate_raw = final_eval.get("heldout_answer_extraction_rate_percentage")
+    final_extraction_rate = (
+        None if final_extraction_rate_raw is None else float(final_extraction_rate_raw)
     )
     eval_samples = int(float(final_eval.get("heldout_eval_samples", 0) or 0))
 
@@ -1477,6 +1482,13 @@ def build_training_smoke_report(
             f"Final heldout answer perplexity {final_perplexity:.4f} exceeds smoke limit "
             f"{max_answer_perplexity:.4f}."
         )
+    if final_extraction_rate is None or not math.isfinite(final_extraction_rate):
+        missing_requirements.append("Final heldout answer extraction rate is missing or non-finite.")
+    elif final_extraction_rate < min_answer_extraction_rate_percentage:
+        missing_requirements.append(
+            f"Answer extraction rate {final_extraction_rate:.2f}% is below required "
+            f"{min_answer_extraction_rate_percentage:.2f}%."
+        )
 
     return {
         "phase": "training_smoke",
@@ -1486,10 +1498,18 @@ def build_training_smoke_report(
         "final_heldout_exact_match_accuracy": final_eval.get(
             "heldout_exact_match_accuracy"
         ),
-        "final_heldout_answer_extraction_rate_percentage": final_eval.get(
-            "heldout_answer_extraction_rate_percentage"
+        "final_heldout_answer_extraction_rate_percentage": final_extraction_rate,
+        "final_heldout_decode_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_candidate_fallback_rate_percentage": final_eval.get(
+            "heldout_candidate_fallback_rate_percentage"
+        ),
+        "final_heldout_extraction_failure_count": final_eval.get(
+            "heldout_extraction_failure_count"
         ),
         "final_heldout_answer_perplexity": final_perplexity,
+        "heldout_eval_diagnostics": final_eval.get("heldout_eval_diagnostics"),
         "heldout_eval_samples": eval_samples,
         "missing_requirements": missing_requirements,
     }

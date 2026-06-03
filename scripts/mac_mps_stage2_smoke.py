@@ -56,6 +56,16 @@ def _print_report_summary(report_path: Path) -> None:
             "final_heldout_answer_perplexity": report.get(
                 "final_heldout_answer_perplexity"
             ),
+            "final_answer_extraction_rate": smoke_report.get(
+                "final_heldout_answer_extraction_rate_percentage"
+            ),
+            "decode_answer_extraction_rate": smoke_report.get(
+                "final_heldout_decode_answer_extraction_rate_percentage"
+            ),
+            "candidate_fallback_rate": smoke_report.get(
+                "final_heldout_candidate_fallback_rate_percentage"
+            ),
+            "eval_diagnostics": smoke_report.get("heldout_eval_diagnostics"),
             "missing_phase2_requirements": report.get("missing_requirements"),
             "missing_smoke_requirements": smoke_report.get("missing_requirements"),
         },

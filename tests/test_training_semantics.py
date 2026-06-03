@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from latent_pipeline import _build_alignment_cache_key
 from train_compressor import (
     CompressionTrainConfig,
+    _coerce_history_value,
+    _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
     train_reasoner_stage2,
@@ -118,6 +120,13 @@ def _make_tiny_models(hidden_dim: int = 16, vocab_size: int = 128, with_layers: 
             return self._embed
 
     return TinyModel(), TinyModel()
+
+
+def test_training_history_preserves_diagnostic_metrics() -> None:
+    assert _coerce_history_value("target=13 | predicted=13") == "target=13 | predicted=13"
+    assert _coerce_history_value(torch.tensor(2.5)) == 2.5
+    assert _coerce_history_value(torch.tensor([1.0, 2.0])) == "[1.0, 2.0]"
+    assert _numeric_metrics({"loss": 1.0, "diagnostics": "x", "flag": True}) == {"loss": 1.0}
 
 
 def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:

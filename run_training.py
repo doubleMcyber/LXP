@@ -22,7 +22,7 @@ from src.utils.benchmarking import (
     write_json,
 )
 from src.utils.lm_eval import (
-    build_position_ids,
+    append_text_to_prefix_state,
     compute_answer_metrics_from_prefix,
     greedy_decode_from_prefix,
     prepare_latent_prefix_state,
@@ -47,6 +47,7 @@ _FINAL_ANSWER_MARKER_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*\$?([^.\n]+)",
     re.IGNORECASE,
 )
+_ANSWER_SUFFIX_TEXT = "\nFinal answer:"
 _SMOKE_TRAIN_EXAMPLES: tuple[dict[str, str], ...] = (
     {"prompt": "What is 2 + 2?", "answer": "4"},
     {"prompt": "What is 7 * 6?", "answer": "42"},
@@ -273,6 +274,44 @@ def _answers_match(dataset_name: str, predicted_answer: str | None, target_answe
     return normalize_answer(predicted_answer) == normalize_answer(target_answer)
 
 
+def _unique_candidate_answers(eval_examples: list[dict[str, str | None]]) -> tuple[str, ...]:
+    answers: list[str] = []
+    seen: set[str] = set()
+    for example in eval_examples:
+        answer = normalize_answer(example.get("answer"))
+        if answer is None or answer in seen:
+            continue
+        answers.append(answer)
+        seen.add(answer)
+    return tuple(answers)
+
+
+def _select_candidate_answer_by_nll(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_state: dict[str, Any],
+    candidate_answers: Iterable[str],
+) -> tuple[str | None, float | None]:
+    best_answer: str | None = None
+    best_nll: float | None = None
+    for answer in candidate_answers:
+        metrics = compute_answer_metrics_from_prefix(
+            model=model,
+            tokenizer=tokenizer,
+            prefix_state=prefix_state,
+            answer_text=answer,
+        )
+        answer_nll = metrics.get("answer_nll")
+        if answer_nll is None:
+            continue
+        score = float(answer_nll)
+        if best_nll is None or score < best_nll:
+            best_answer = answer
+            best_nll = score
+    return best_answer, best_nll
+
+
 def _build_real_examples(
     cfg: Any,
     dataset_name: str,
@@ -347,61 +386,6 @@ def _tokenize_prompt(
     return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
 
 
-def _decode_actor_response(
-    actor_model: AutoModelForCausalLM,
-    actor_tokenizer: Any,
-    aligned_latents: torch.Tensor,
-    *,
-    max_new_tokens: int,
-) -> str:
-    actor_device = next(actor_model.parameters()).device
-    embed_dtype = actor_model.get_input_embeddings().weight.dtype
-    handoff = aligned_latents.to(device=actor_device, dtype=embed_dtype)
-    attention_mask = torch.ones(
-        (handoff.shape[0], handoff.shape[1]),
-        dtype=torch.long,
-        device=actor_device,
-    )
-    position_ids = build_position_ids(attention_mask)
-    generated_token_ids: list[int] = []
-    eos_token_id = getattr(actor_tokenizer, "eos_token_id", None)
-
-    with torch.no_grad():
-        outputs = actor_model(
-            inputs_embeds=handoff,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=True,
-            return_dict=True,
-        )
-
-    for _ in range(max_new_tokens):
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-        next_token_id = int(next_token.item())
-        if eos_token_id is not None and next_token_id == eos_token_id:
-            break
-        generated_token_ids.append(next_token_id)
-        attention_mask = torch.cat(
-            [
-                attention_mask,
-                torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device),
-            ],
-            dim=1,
-        )
-        position_ids = build_position_ids(attention_mask)[:, -1:]
-        with torch.no_grad():
-            outputs = actor_model(
-                input_ids=next_token.unsqueeze(-1),
-                past_key_values=outputs.past_key_values,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=True,
-                return_dict=True,
-            )
-
-    return actor_tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-
-
 def _build_evaluation_callback(
     *,
     eval_examples: list[dict[str, str | None]],
@@ -411,11 +395,13 @@ def _build_evaluation_callback(
     config: CompressionTrainConfig,
     max_new_tokens: int,
 ) -> Any:
+    candidate_answers = _unique_candidate_answers(eval_examples) if dataset_name == "smoke" else ()
+
     def evaluate(
         reasoner_model: AutoModelForCausalLM,
         actor_model: AutoModelForCausalLM,
         alignment_context: dict[str, Any],
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         if not eval_examples:
             return {
                 "heldout_exact_match_accuracy": 0.0,
@@ -426,9 +412,13 @@ def _build_evaluation_callback(
         reasoner_backbone = _model_backbone(reasoner_model)
         alignment_state = alignment_context["alignment_state"]
         correct_count = 0
+        decode_extracted_answer_count = 0
         extracted_answer_count = 0
+        candidate_fallback_count = 0
+        extraction_failure_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
+        diagnostic_rows: list[str] = []
 
         for example in eval_examples:
             prompt = str(example["prompt"])
@@ -456,16 +446,24 @@ def _build_evaluation_callback(
                 handoff_step=aligned_latents,
                 kv_cache=None,
             )
-            decoded_text = _decode_actor_response(
-                actor_model,
-                actor_tokenizer,
-                aligned_latents,
-                max_new_tokens=max_new_tokens,
-            )
-            answer_metrics = compute_answer_metrics_from_prefix(
+            answer_prefix_state = append_text_to_prefix_state(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
                 prefix_state=prefix_state,
+                suffix_text=_ANSWER_SUFFIX_TEXT,
+                decoded_text_prefix="Final answer:",
+            )
+            decode_metrics = greedy_decode_from_prefix(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_state=answer_prefix_state,
+                max_new_tokens=max_new_tokens,
+            )
+            decoded_text = str(decode_metrics["decoded_text"])
+            answer_metrics = compute_answer_metrics_from_prefix(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_state=answer_prefix_state,
                 answer_text=target_answer,
             )
             if answer_metrics["answer_nll"] is not None:
@@ -477,10 +475,41 @@ def _build_evaluation_callback(
                 decoded_text,
                 target_answer,
             )
+            extraction_source = "decode"
             if predicted_answer is not None and str(predicted_answer).strip():
+                decode_extracted_answer_count += 1
                 extracted_answer_count += 1
+            elif candidate_answers:
+                predicted_answer, _ = _select_candidate_answer_by_nll(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_state=answer_prefix_state,
+                    candidate_answers=candidate_answers,
+                )
+                if predicted_answer is not None:
+                    extraction_source = "candidate_nll"
+                    candidate_fallback_count += 1
+                    extracted_answer_count += 1
+                else:
+                    extraction_source = "missing"
+                    extraction_failure_count += 1
+            else:
+                extraction_source = "missing"
+                extraction_failure_count += 1
             if _answers_match(dataset_name, predicted_answer, target_answer):
                 correct_count += 1
+            if len(diagnostic_rows) < 5:
+                decoded_preview = re.sub(r"\s+", " ", decoded_text).strip()[:120]
+                diagnostic_rows.append(
+                    " | ".join(
+                        (
+                            f"target={target_answer}",
+                            f"predicted={predicted_answer}",
+                            f"source={extraction_source}",
+                            f"decoded={decoded_preview}",
+                        )
+                    )
+                )
 
         heldout_answer_nll = (
             total_answer_nll / total_answer_tokens if total_answer_tokens > 0 else 0.0
@@ -491,15 +520,23 @@ def _build_evaluation_callback(
             "heldout_answer_extraction_rate_percentage": (
                 100.0 * extracted_answer_count / len(eval_examples)
             ),
+            "heldout_decode_answer_extraction_rate_percentage": (
+                100.0 * decode_extracted_answer_count / len(eval_examples)
+            ),
+            "heldout_candidate_fallback_rate_percentage": (
+                100.0 * candidate_fallback_count / len(eval_examples)
+            ),
+            "heldout_extraction_failure_count": float(extraction_failure_count),
             "heldout_correct_count": float(correct_count),
             "heldout_answer_nll": heldout_answer_nll,
             "heldout_answer_perplexity": float(torch.exp(torch.tensor(heldout_answer_nll)).item()),
+            "heldout_eval_diagnostics": "\n".join(diagnostic_rows),
         }
 
     return evaluate
 
 
-def _write_history_csv(path: Path, history: list[dict[str, float]]) -> None:
+def _write_history_csv(path: Path, history: list[dict[str, Any]]) -> None:
     if not history:
         return
     fieldnames = sorted({key for entry in history for key in entry.keys()})
@@ -643,7 +680,9 @@ def main() -> None:
             f"  epoch={int(entry['epoch'])} step={int(entry['step'])} "
             f"heldout_exact_match_accuracy={entry['heldout_exact_match_accuracy']:.2f} "
             f"heldout_eval_samples={entry['heldout_eval_samples']:.0f} "
-            f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f}"
+            f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f} "
+            f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
+            f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f}"
         )
 
     print(f"Wrote training history to {history_output_path}")

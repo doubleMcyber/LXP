@@ -1407,6 +1407,10 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
                 "step": 1.0,
                 "heldout_exact_match_accuracy": 0.0,
                 "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_decode_answer_extraction_rate_percentage": 33.333,
+                "heldout_candidate_fallback_rate_percentage": 66.667,
+                "heldout_extraction_failure_count": 0.0,
+                "heldout_eval_diagnostics": "target=13 | predicted=13 | source=candidate_nll",
                 "heldout_answer_perplexity": 250.0,
                 "heldout_eval_samples": 3.0,
             },
@@ -1416,6 +1420,10 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
     assert report["passed"] is True
     assert report["final_heldout_exact_match_accuracy"] == 0.0
     assert report["final_heldout_answer_extraction_rate_percentage"] == 100.0
+    assert report["final_heldout_decode_answer_extraction_rate_percentage"] == 33.333
+    assert report["final_heldout_candidate_fallback_rate_percentage"] == 66.667
+    assert report["final_heldout_extraction_failure_count"] == 0.0
+    assert "source=candidate_nll" in report["heldout_eval_diagnostics"]
 
 
 def test_build_training_smoke_report_flags_nonfinite_loss() -> None:
@@ -1425,6 +1433,7 @@ def test_build_training_smoke_report_flags_nonfinite_loss() -> None:
             {
                 "epoch": 0.0,
                 "step": 1.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
                 "heldout_answer_perplexity": 1.0,
                 "heldout_eval_samples": 1.0,
             },
@@ -1433,6 +1442,24 @@ def test_build_training_smoke_report_flags_nonfinite_loss() -> None:
 
     assert report["passed"] is False
     assert any("non-finite" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_flags_low_extraction_rate() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_answer_extraction_rate_percentage": 33.333,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert any("Answer extraction rate" in item for item in report["missing_requirements"])
 
 
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
