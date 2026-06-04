@@ -1379,6 +1379,7 @@ def build_training_phase2_report(
     runtime_metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     heldout_entries = [entry for entry in history if "heldout_exact_match_accuracy" in entry]
+    final_heldout_entry = heldout_entries[-1] if heldout_entries else {}
     final_heldout_accuracy = None if not heldout_entries else float(heldout_entries[-1]["heldout_exact_match_accuracy"])
     final_heldout_answer_perplexity = (
         None if not heldout_entries else heldout_entries[-1].get("heldout_answer_perplexity")
@@ -1420,6 +1421,12 @@ def build_training_phase2_report(
         "baseline_accuracy_percentage": baseline_accuracy_percentage,
         "final_heldout_exact_match_accuracy": final_heldout_accuracy,
         "final_heldout_answer_perplexity": final_heldout_answer_perplexity,
+        "final_heldout_latent_candidate_accuracy": final_heldout_entry.get(
+            "heldout_latent_candidate_accuracy"
+        ),
+        "final_heldout_latent_probe_accuracy": final_heldout_entry.get(
+            "heldout_latent_probe_accuracy"
+        ),
         "accuracy_retention_ratio": accuracy_retention_ratio,
         "alignment_mode": alignment_context.get("alignment_mode"),
         "semantic_anchor_count": alignment_context.get("semantic_anchor_count"),
@@ -1503,6 +1510,14 @@ def build_training_smoke_report(
     actor_baseline_unique_count = (
         None if actor_baseline_unique_raw is None else int(float(actor_baseline_unique_raw))
     )
+    latent_probe_accuracy_raw = final_eval.get("heldout_latent_probe_accuracy")
+    latent_probe_accuracy = (
+        None if latent_probe_accuracy_raw is None else float(latent_probe_accuracy_raw)
+    )
+    latent_probe_unique_raw = final_eval.get("heldout_latent_probe_unique_predicted_answer_count")
+    latent_probe_unique_count = (
+        None if latent_probe_unique_raw is None else int(float(latent_probe_unique_raw))
+    )
 
     missing_requirements: list[str] = []
     if not loss_entries:
@@ -1584,6 +1599,14 @@ def build_training_smoke_report(
         ),
         "final_heldout_latent_candidate_unique_predicted_answer_count": final_eval.get(
             "heldout_latent_candidate_unique_predicted_answer_count"
+        ),
+        "final_heldout_latent_probe_accuracy": latent_probe_accuracy,
+        "final_heldout_latent_probe_unique_predicted_answer_count": latent_probe_unique_count,
+        "latent_probe_ready": (
+            latent_probe_accuracy is not None
+            and latent_probe_accuracy >= 100.0
+            and latent_probe_unique_count is not None
+            and latent_probe_unique_count > 1
         ),
         "final_heldout_extraction_failure_count": final_eval.get(
             "heldout_extraction_failure_count"

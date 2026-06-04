@@ -8,6 +8,8 @@ from typing import Sequence
 
 import torch
 
+from scripts.render_stage2_report import render_stage2_report
+
 
 def build_command(args: argparse.Namespace) -> list[str]:
     output_dir = Path(args.output_dir)
@@ -41,6 +43,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 "training.learning_rate=1.0e-4",
                 "training.lambda_answer=20.0",
                 "training.lambda_answer_contrast=20.0",
+                "training.lambda_answer_probe=20.0",
                 "training.answer_contrast_temperature=0.5",
                 "training.lambda_task=0.1",
                 "training.lambda_pref=0.1",
@@ -49,6 +52,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 "training.lambda_contrast=0.0",
                 "training.train_reasoner=false",
                 "training.latent_handoff_adapter.enabled=true",
+                "training.latent_answer_probe.enabled=true",
             ]
         )
     return command
@@ -89,6 +93,10 @@ def _print_report_summary(report_path: Path) -> None:
             "latent_candidate_accuracy": smoke_report.get(
                 "final_heldout_latent_candidate_accuracy"
             ),
+            "latent_probe_accuracy": smoke_report.get(
+                "final_heldout_latent_probe_accuracy"
+            ),
+            "latent_probe_ready": smoke_report.get("latent_probe_ready"),
             "unique_predicted_answer_count": smoke_report.get(
                 "final_heldout_unique_predicted_answer_count"
             ),
@@ -150,7 +158,13 @@ def main() -> int:
     if not torch.backends.mps.is_available() and not args.allow_cpu_fallback:
         raise SystemExit("MPS is unavailable. Re-run with --allow-cpu-fallback to test CPU only.")
     subprocess.run(command, check=True)
-    _print_report_summary(Path(args.output_dir) / "mac_mps_training_report.json")
+    output_dir = Path(args.output_dir)
+    report_path = output_dir / "mac_mps_training_report.json"
+    history_path = output_dir / "mac_mps_training_history.csv"
+    html_path = output_dir / "mac_mps_training_report.html"
+    render_stage2_report(report_path, history_path, html_path)
+    print(f"Wrote visual training report to {html_path}", flush=True)
+    _print_report_summary(report_path)
     return 0
 
 

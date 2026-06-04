@@ -14,7 +14,13 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from transformers import AutoModelForCausalLM
 
-from src.models.hidden_state import AdaptiveProjection, CurriculumStage, HiddenStateProcessor, LatentHandoffAdapter
+from src.models.hidden_state import (
+    AdaptiveProjection,
+    CurriculumStage,
+    HiddenStateProcessor,
+    LatentAnswerProbe,
+    LatentHandoffAdapter,
+)
 from src.models.losses import (
     AdaptiveLossBalancer,
     AdaptiveLossBalancerConfig,
@@ -55,6 +61,7 @@ class CompressionTrainConfig:
     lambda_plan: float = 0.25
     lambda_contrast: float = 0.1
     lambda_answer_contrast: float = 0.0
+    lambda_answer_probe: float = 0.0
     answer_contrast_temperature: float = 1.0
     contrast_temperature: float = 0.1
     curriculum_enabled: bool = True
@@ -71,6 +78,10 @@ class CompressionTrainConfig:
     latent_handoff_adapter_rank: int = 64
     latent_handoff_adapter_scale: float = 1.0
     latent_handoff_adapter_dropout: float = 0.0
+    latent_answer_probe_enabled: bool = False
+    latent_answer_probe_max_candidates: int = 64
+    latent_answer_probe_hidden_multiplier: int = 2
+    latent_answer_probe_dropout: float = 0.0
     hidden_state_processor_enabled: bool = False
     hidden_state_processor_num_heads: int = 4
     hidden_state_processor_dropout: float = 0.0
@@ -83,6 +94,7 @@ class CompressionTrainConfig:
         adaptive_loss_cfg = getattr(t, "adaptive_loss", None)
         projection_cfg = getattr(t, "adaptive_projection", None)
         handoff_adapter_cfg = getattr(t, "latent_handoff_adapter", None)
+        answer_probe_cfg = getattr(t, "latent_answer_probe", None)
         processor_cfg = getattr(t, "hidden_state_processor", None)
         return cls(
             compressed_steps=t.compressed_steps,
@@ -113,6 +125,7 @@ class CompressionTrainConfig:
             lambda_plan=float(getattr(t, "lambda_plan", 0.25)),
             lambda_contrast=float(getattr(t, "lambda_contrast", 0.1)),
             lambda_answer_contrast=float(getattr(t, "lambda_answer_contrast", 0.0)),
+            lambda_answer_probe=float(getattr(t, "lambda_answer_probe", 0.0)),
             answer_contrast_temperature=float(getattr(t, "answer_contrast_temperature", 1.0)),
             contrast_temperature=float(getattr(t, "contrast_temperature", 0.1)),
             curriculum_enabled=bool(getattr(curriculum_cfg, "enabled", True)) if curriculum_cfg else True,
@@ -143,6 +156,18 @@ class CompressionTrainConfig:
             latent_handoff_adapter_dropout=float(
                 getattr(handoff_adapter_cfg, "dropout", 0.0)
             ) if handoff_adapter_cfg else 0.0,
+            latent_answer_probe_enabled=bool(
+                getattr(answer_probe_cfg, "enabled", False)
+            ) if answer_probe_cfg else False,
+            latent_answer_probe_max_candidates=int(
+                getattr(answer_probe_cfg, "max_candidates", 64)
+            ) if answer_probe_cfg else 64,
+            latent_answer_probe_hidden_multiplier=int(
+                getattr(answer_probe_cfg, "hidden_multiplier", 2)
+            ) if answer_probe_cfg else 2,
+            latent_answer_probe_dropout=float(
+                getattr(answer_probe_cfg, "dropout", 0.0)
+            ) if answer_probe_cfg else 0.0,
             hidden_state_processor_enabled=bool(getattr(processor_cfg, "enabled", False)) if processor_cfg else False,
             hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
             hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
@@ -471,19 +496,12 @@ def _compute_latent_answer_loss(
     return answer_loss, len(encoded_answers), float(average_answer_tokens)
 
 
-def _compute_latent_candidate_contrast_loss(
-    *,
-    actor_model: AutoModelForCausalLM,
-    actor_tokenizer: Any,
-    latent_prefix: torch.Tensor,
+def _candidate_target_indices(
     answers: Sequence[str | None],
     candidate_answers: Sequence[str],
-    suffix_text: str,
-    max_answer_length: int,
-    temperature: float,
-) -> tuple[torch.Tensor | None, int, float]:
+) -> tuple[list[int], list[int]]:
     if len(candidate_answers) < 2:
-        return None, 0, 0.0
+        return [], []
 
     candidate_norms = [_normalized_text(candidate) for candidate in candidate_answers]
     valid_rows: list[int] = []
@@ -498,6 +516,21 @@ def _compute_latent_candidate_contrast_loss(
             continue
         valid_rows.append(row_index)
         target_indices.append(target_index)
+    return valid_rows, target_indices
+
+
+def _compute_latent_candidate_contrast_loss(
+    *,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    candidate_answers: Sequence[str],
+    suffix_text: str,
+    max_answer_length: int,
+    temperature: float,
+) -> tuple[torch.Tensor | None, int, float]:
+    valid_rows, target_indices = _candidate_target_indices(answers, candidate_answers)
     if not valid_rows:
         return None, 0, 0.0
 
@@ -603,6 +636,35 @@ def _compute_latent_candidate_contrast_loss(
     predictions = score_matrix.argmax(dim=-1)
     accuracy = float((predictions == target_tensor).float().mean().detach().cpu().item() * 100.0)
     return contrast_loss, len(valid_rows), accuracy
+
+
+def _compute_latent_answer_probe_loss(
+    *,
+    latent_answer_probe: LatentAnswerProbe | None,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    candidate_answers: Sequence[str],
+) -> tuple[torch.Tensor | None, int, float]:
+    if latent_answer_probe is None:
+        return None, 0, 0.0
+    if len(candidate_answers) > latent_answer_probe.max_candidates:
+        raise ValueError(
+            "latent_answer_probe.max_candidates is smaller than the candidate answer set: "
+            f"{latent_answer_probe.max_candidates} < {len(candidate_answers)}"
+        )
+
+    valid_rows, target_indices = _candidate_target_indices(answers, candidate_answers)
+    if not valid_rows:
+        return None, 0, 0.0
+
+    row_index_tensor = torch.tensor(valid_rows, dtype=torch.long, device=latent_prefix.device)
+    selected_prefix = latent_prefix.index_select(0, row_index_tensor)
+    logits = latent_answer_probe(selected_prefix)[:, : len(candidate_answers)]
+    targets = torch.tensor(target_indices, dtype=torch.long, device=logits.device)
+    probe_loss = F.cross_entropy(logits, targets)
+    predictions = logits.argmax(dim=-1)
+    accuracy = float((predictions == targets).float().mean().detach().cpu().item() * 100.0)
+    return probe_loss, len(valid_rows), accuracy
 
 
 def _ensure_padding_token(tokenizer: Any) -> None:
@@ -901,15 +963,29 @@ def train_reasoner_stage2(
         if config.latent_handoff_adapter_enabled
         else None
     )
+    latent_answer_probe = (
+        LatentAnswerProbe(
+            actor_hidden_size,
+            max_candidates=config.latent_answer_probe_max_candidates,
+            hidden_multiplier=config.latent_answer_probe_hidden_multiplier,
+            dropout=config.latent_answer_probe_dropout,
+        )
+        if config.latent_answer_probe_enabled
+        else None
+    )
     if hidden_state_processor is not None:
         hidden_state_processor.train()
     if latent_handoff_adapter is not None:
         latent_handoff_adapter.to(_model_device(reasoner_model))
         latent_handoff_adapter.train()
+    if latent_answer_probe is not None:
+        latent_answer_probe.to(_model_device(reasoner_model))
+        latent_answer_probe.train()
     optimizer = torch.optim.AdamW(
         (
             list(p for p in reasoner_model.parameters() if p.requires_grad)
             + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
+            + ([] if latent_answer_probe is None else list(latent_answer_probe.parameters()))
             + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
         ),
         lr=config.learning_rate,
@@ -923,6 +999,8 @@ def train_reasoner_stage2(
         hidden_state_processor.to(reasoner_device)
     if latent_handoff_adapter is not None:
         latent_handoff_adapter.to(reasoner_device)
+    if latent_answer_probe is not None:
+        latent_answer_probe.to(reasoner_device)
     curriculum_stages = _curriculum_schedule(config) if config.curriculum_enabled else (
         CurriculumStage(
             name="default",
@@ -972,6 +1050,7 @@ def train_reasoner_stage2(
             "l_contrast": config.lambda_contrast,
             "l_answer": config.lambda_answer,
             "l_answer_contrast": config.lambda_answer_contrast,
+            "l_answer_probe": config.lambda_answer_probe,
         },
         config=AdaptiveLossBalancerConfig(
             enabled=config.adaptive_loss_enabled,
@@ -983,6 +1062,7 @@ def train_reasoner_stage2(
 
     history: list[dict[str, Any]] = []
     global_step = 0
+    latest_candidate_answers: tuple[str, ...] = ()
     total_training_steps = max(1, int(config.num_epochs) * max(1, len(train_dataloader)))
 
     def record_evaluation(event: str, epoch: float) -> None:
@@ -994,14 +1074,28 @@ def train_reasoner_stage2(
             eval_context["stage2_latent_handoff_adapter"] = latent_handoff_adapter
         if hidden_state_processor is not None:
             eval_context["stage2_hidden_state_processor"] = hidden_state_processor
-        evaluation_metrics = {
-            key: _coerce_history_value(value)
-            for key, value in evaluation_fn(
-                reasoner_model,
-                actor_model,
-                eval_context,
-            ).items()
-        }
+        if latent_answer_probe is not None:
+            eval_context["stage2_latent_answer_probe"] = latent_answer_probe
+            eval_context["stage2_latent_answer_candidates"] = latest_candidate_answers
+        module_training_states = [
+            (module, module.training)
+            for module in (latent_handoff_adapter, hidden_state_processor, latent_answer_probe)
+            if module is not None
+        ]
+        for module, _was_training in module_training_states:
+            module.eval()
+        try:
+            evaluation_metrics = {
+                key: _coerce_history_value(value)
+                for key, value in evaluation_fn(
+                    reasoner_model,
+                    actor_model,
+                    eval_context,
+                ).items()
+            }
+        finally:
+            for module, was_training in module_training_states:
+                module.train(was_training)
         eval_history_entry = {
             "event": event,
             "epoch": float(epoch),
@@ -1033,6 +1127,8 @@ def train_reasoner_stage2(
             reasoner_texts = _extract_prompt_batch(batch, fallback_texts=texts)
             answers = _extract_answer_batch(batch, expected_count=len(texts))
             candidate_answers = _extract_candidate_answers(batch, answers=answers)
+            if candidate_answers:
+                latest_candidate_answers = candidate_answers
             reasoner_batch = _tokenize_text_batch(
                 reasoner_tokenizer,
                 reasoner_texts,
@@ -1149,6 +1245,14 @@ def train_reasoner_stage2(
                     temperature=config.answer_contrast_temperature,
                 )
             )
+            answer_probe_loss, answer_probe_sample_count, answer_probe_accuracy = (
+                _compute_latent_answer_probe_loss(
+                    latent_answer_probe=latent_answer_probe,
+                    latent_prefix=compressed_latents_aligned,
+                    answers=answers,
+                    candidate_answers=candidate_answers,
+                )
+            )
             loss_terms = {
                 "l_task": loss_outputs["l_task"],
                 "l_pref": loss_outputs["l_pref"],
@@ -1160,21 +1264,28 @@ def train_reasoner_stage2(
                 loss_terms["l_answer"] = answer_loss.to(reasoner_device)
             if answer_contrast_loss is not None:
                 loss_terms["l_answer_contrast"] = answer_contrast_loss.to(reasoner_device)
+            if answer_probe_loss is not None:
+                loss_terms["l_answer_probe"] = answer_probe_loss.to(reasoner_device)
             total_loss, effective_weights = loss_balancer.combine(loss_terms)
 
             optimizer.zero_grad(set_to_none=True)
             adapter_before = _snapshot_module_parameters(latent_handoff_adapter)
+            answer_probe_before = _snapshot_module_parameters(latent_answer_probe)
             total_loss.backward()
             reasoner_grad_norm = _gradient_norm(reasoner_model)
             handoff_adapter_grad_norm = _gradient_norm(latent_handoff_adapter)
+            latent_answer_probe_grad_norm = _gradient_norm(latent_answer_probe)
             hidden_processor_grad_norm = _gradient_norm(hidden_state_processor)
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
             if latent_handoff_adapter is not None:
                 nn.utils.clip_grad_norm_(latent_handoff_adapter.parameters(), config.max_grad_norm)
+            if latent_answer_probe is not None:
+                nn.utils.clip_grad_norm_(latent_answer_probe.parameters(), config.max_grad_norm)
             if hidden_state_processor is not None:
                 nn.utils.clip_grad_norm_(hidden_state_processor.parameters(), config.max_grad_norm)
             optimizer.step()
             handoff_adapter_update_norm = _module_update_norm(adapter_before, latent_handoff_adapter)
+            latent_answer_probe_update_norm = _module_update_norm(answer_probe_before, latent_answer_probe)
 
             metrics = {
                 "epoch": float(epoch),
@@ -1189,10 +1300,15 @@ def train_reasoner_stage2(
                 "l_answer_contrast": 0.0
                 if answer_contrast_loss is None
                 else float(answer_contrast_loss.detach().cpu().item()),
+                "l_answer_probe": 0.0
+                if answer_probe_loss is None
+                else float(answer_probe_loss.detach().cpu().item()),
                 "answer_loss_sample_count": float(answer_loss_sample_count),
                 "answer_loss_token_count_mean": float(answer_token_count_mean),
                 "answer_contrast_sample_count": float(answer_contrast_sample_count),
                 "answer_contrast_accuracy": float(answer_contrast_accuracy),
+                "answer_probe_sample_count": float(answer_probe_sample_count),
+                "answer_probe_accuracy": float(answer_probe_accuracy),
                 "answer_candidate_count": float(len(candidate_answers)),
                 "effective_weight_task": effective_weights["l_task"],
                 "effective_weight_pref": effective_weights["l_pref"],
@@ -1201,12 +1317,16 @@ def train_reasoner_stage2(
                 "effective_weight_contrast": effective_weights["l_contrast"],
                 "effective_weight_answer": effective_weights.get("l_answer", 0.0),
                 "effective_weight_answer_contrast": effective_weights.get("l_answer_contrast", 0.0),
+                "effective_weight_answer_probe": effective_weights.get("l_answer_probe", 0.0),
                 "reasoner_grad_norm": reasoner_grad_norm,
                 "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
+                "latent_answer_probe_grad_norm": latent_answer_probe_grad_norm,
                 "hidden_processor_grad_norm": hidden_processor_grad_norm,
                 "handoff_adapter_update_norm": handoff_adapter_update_norm,
+                "latent_answer_probe_update_norm": latent_answer_probe_update_norm,
                 "trainable_reasoner_parameter_count": float(_parameter_count(reasoner_model)),
                 "trainable_handoff_adapter_parameter_count": float(_parameter_count(latent_handoff_adapter)),
+                "trainable_latent_answer_probe_parameter_count": float(_parameter_count(latent_answer_probe)),
                 "trainable_hidden_processor_parameter_count": float(_parameter_count(hidden_state_processor)),
                 "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
                 "projection_scale_mean": projection_metrics["projection_scale_mean"],
@@ -1254,10 +1374,13 @@ def train_reasoner_stage2(
                         "l_contrast": metrics["l_contrast"],
                         "l_answer": metrics["l_answer"],
                         "l_answer_contrast": metrics["l_answer_contrast"],
+                        "l_answer_probe": metrics["l_answer_probe"],
                         "answer_loss_sample_count": metrics["answer_loss_sample_count"],
                         "answer_loss_token_count_mean": metrics["answer_loss_token_count_mean"],
                         "answer_contrast_sample_count": metrics["answer_contrast_sample_count"],
                         "answer_contrast_accuracy": metrics["answer_contrast_accuracy"],
+                        "answer_probe_sample_count": metrics["answer_probe_sample_count"],
+                        "answer_probe_accuracy": metrics["answer_probe_accuracy"],
                         "answer_candidate_count": metrics["answer_candidate_count"],
                         "effective_weight_task": metrics["effective_weight_task"],
                         "effective_weight_pref": metrics["effective_weight_pref"],
@@ -1266,13 +1389,19 @@ def train_reasoner_stage2(
                         "effective_weight_contrast": metrics["effective_weight_contrast"],
                         "effective_weight_answer": metrics["effective_weight_answer"],
                         "effective_weight_answer_contrast": metrics["effective_weight_answer_contrast"],
+                        "effective_weight_answer_probe": metrics["effective_weight_answer_probe"],
                         "reasoner_grad_norm": metrics["reasoner_grad_norm"],
                         "handoff_adapter_grad_norm": metrics["handoff_adapter_grad_norm"],
+                        "latent_answer_probe_grad_norm": metrics["latent_answer_probe_grad_norm"],
                         "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],
                         "handoff_adapter_update_norm": metrics["handoff_adapter_update_norm"],
+                        "latent_answer_probe_update_norm": metrics["latent_answer_probe_update_norm"],
                         "trainable_reasoner_parameter_count": metrics["trainable_reasoner_parameter_count"],
                         "trainable_handoff_adapter_parameter_count": metrics[
                             "trainable_handoff_adapter_parameter_count"
+                        ],
+                        "trainable_latent_answer_probe_parameter_count": metrics[
+                            "trainable_latent_answer_probe_parameter_count"
                         ],
                         "trainable_hidden_processor_parameter_count": metrics[
                             "trainable_hidden_processor_parameter_count"
@@ -1307,6 +1436,9 @@ def train_reasoner_stage2(
                             "latent_handoff_adapter_state_dict": None
                             if latent_handoff_adapter is None
                             else latent_handoff_adapter.state_dict(),
+                            "latent_answer_probe_state_dict": None
+                            if latent_answer_probe is None
+                            else latent_answer_probe.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "training_config": dataclasses.asdict(config),
                             "alignment_context": alignment_context,
@@ -1333,6 +1465,9 @@ def train_reasoner_stage2(
                     "latent_handoff_adapter_state_dict": None
                     if latent_handoff_adapter is None
                     else latent_handoff_adapter.state_dict(),
+                    "latent_answer_probe_state_dict": None
+                    if latent_answer_probe is None
+                    else latent_answer_probe.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "training_config": dataclasses.asdict(config),
                     "alignment_context": latest_alignment_context,

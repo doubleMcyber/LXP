@@ -556,6 +556,7 @@ def _build_evaluation_callback(
         candidate_fallback_count = 0
         extraction_failure_count = 0
         latent_candidate_correct_count = 0
+        latent_probe_correct_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
         baseline_candidate_correct_count = 0
@@ -563,6 +564,7 @@ def _build_evaluation_callback(
         total_answer_nll = 0.0
         predicted_answers: list[str | None] = []
         latent_candidate_predicted_answers: list[str | None] = []
+        latent_probe_predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
         baseline_candidate_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
@@ -632,6 +634,25 @@ def _build_evaluation_callback(
             if hidden_processor is not None:
                 with torch.no_grad():
                     aligned_latents = hidden_processor(aligned_latents)
+            latent_probe_predicted_answer = None
+            latent_probe = alignment_context.get("stage2_latent_answer_probe")
+            latent_probe_candidates = tuple(
+                alignment_context.get("stage2_latent_answer_candidates") or candidate_answers
+            )
+            if latent_probe is not None and latent_probe_candidates:
+                if len(latent_probe_candidates) <= int(
+                    getattr(latent_probe, "max_candidates", len(latent_probe_candidates))
+                ):
+                    with torch.no_grad():
+                        probe_device = next(latent_probe.parameters()).device
+                        probe_logits = latent_probe(aligned_latents.to(probe_device))[
+                            :, : len(latent_probe_candidates)
+                        ]
+                        probe_index = int(probe_logits.argmax(dim=-1)[0].detach().cpu().item())
+                    latent_probe_predicted_answer = latent_probe_candidates[probe_index]
+                    latent_probe_predicted_answers.append(latent_probe_predicted_answer)
+                    if _answers_match(dataset_name, latent_probe_predicted_answer, target_answer):
+                        latent_probe_correct_count += 1
             prefix_state = prepare_latent_prefix_state(
                 model=actor_model,
                 handoff_step=aligned_latents,
@@ -707,6 +728,7 @@ def _build_evaluation_callback(
                             f"target={target_answer}",
                             f"predicted={predicted_answer}",
                             f"candidate_predicted={latent_candidate_predicted_answer}",
+                            f"probe_predicted={latent_probe_predicted_answer}",
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
@@ -739,6 +761,16 @@ def _build_evaluation_callback(
             "heldout_latent_candidate_unique_predicted_answer_count": (
                 float(_unique_normalized_answer_count(latent_candidate_predicted_answers))
                 if candidate_answers
+                else None
+            ),
+            "heldout_latent_probe_accuracy": (
+                100.0 * latent_probe_correct_count / len(eval_examples)
+                if latent_probe is not None and latent_probe_candidates
+                else None
+            ),
+            "heldout_latent_probe_unique_predicted_answer_count": (
+                float(_unique_normalized_answer_count(latent_probe_predicted_answers))
+                if latent_probe is not None and latent_probe_candidates
                 else None
             ),
             "heldout_extraction_failure_count": float(extraction_failure_count),
@@ -915,8 +947,12 @@ def main() -> None:
                 f"l_answer={entry.get('l_answer', 0.0):.4f} "
                 f"l_answer_contrast={entry.get('l_answer_contrast', 0.0):.4f} "
                 f"answer_contrast_accuracy={entry.get('answer_contrast_accuracy', 0.0):.2f} "
+                f"l_answer_probe={entry.get('l_answer_probe', 0.0):.4f} "
+                f"answer_probe_accuracy={entry.get('answer_probe_accuracy', 0.0):.2f} "
                 f"adapter_grad={entry.get('handoff_adapter_grad_norm', 0.0):.4f} "
                 f"adapter_update={entry.get('handoff_adapter_update_norm', 0.0):.6f} "
+                f"probe_grad={entry.get('latent_answer_probe_grad_norm', 0.0):.4f} "
+                f"probe_update={entry.get('latent_answer_probe_update_norm', 0.0):.6f} "
             )
             continue
         print(
@@ -926,6 +962,7 @@ def main() -> None:
             f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f} "
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
             f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
+            f"latent_probe_accuracy={entry.get('heldout_latent_probe_accuracy', 0.0) or 0.0:.2f} "
             f"unique_predictions={entry.get('heldout_unique_predicted_answer_count', 0.0):.0f} "
             f"actor_text_baseline_accuracy={entry.get('heldout_actor_text_baseline_accuracy', 0.0):.2f}"
         )

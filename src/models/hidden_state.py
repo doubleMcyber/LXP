@@ -107,6 +107,33 @@ class LatentHandoffAdapter(nn.Module):
         return hidden_states + (self.scale * residual.to(dtype=hidden_states.dtype))
 
 
+class LatentAnswerProbe(nn.Module):
+    """Lightweight candidate readout for inspecting whether latent prefixes encode answers."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        max_candidates: int = 64,
+        hidden_multiplier: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        probe_hidden = max(int(hidden_size), int(hidden_size) * max(1, int(hidden_multiplier)))
+        self.max_candidates = int(max_candidates)
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, probe_hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(probe_hidden, self.max_candidates),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        pooled = hidden_states.mean(dim=1)
+        return self.net(pooled.float())
+
+
 def build_plan_summary(hidden_states: torch.Tensor) -> torch.Tensor:
     start = hidden_states[:, :1, :]
     middle = hidden_states.mean(dim=1, keepdim=True)

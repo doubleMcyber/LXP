@@ -7,10 +7,12 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from latent_pipeline import _build_alignment_cache_key
+from src.models.hidden_state import LatentAnswerProbe
 from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
     _compute_latent_answer_loss,
+    _compute_latent_answer_probe_loss,
     _compute_latent_candidate_contrast_loss,
     _numeric_metrics,
     _tokenize_text_batch,
@@ -184,6 +186,31 @@ def test_latent_candidate_contrast_loss_backprops_to_prefix() -> None:
     assert torch.isfinite(latent_prefix.grad).all()
 
 
+def test_latent_answer_probe_loss_backprops_to_probe_and_prefix() -> None:
+    probe = LatentAnswerProbe(16, max_candidates=4, hidden_multiplier=1)
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    probe_loss, sample_count, accuracy = _compute_latent_answer_probe_loss(
+        latent_answer_probe=probe,
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        candidate_answers=("13", "42", "5"),
+    )
+
+    assert probe_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    probe_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    probe_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in probe.parameters()
+        if parameter.grad is not None
+    )
+    assert probe_grad_norm > 0.0
+
+
 def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:
     texts = ["alpha beta", "gamma delta"]
     dataloader = DataLoader(
@@ -317,6 +344,7 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
                 "text": "Question: What is 2 + 2?\nAnswer: 4",
                 "prompt": "What is 2 + 2?",
                 "answer": "4",
+                "answer_candidates": ["4", "5"],
             }
         ],
         batch_size=1,
@@ -324,6 +352,7 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
             "texts": [item["text"] for item in batch],
             "prompts": [item["prompt"] for item in batch],
             "answers": [item["answer"] for item in batch],
+            "answer_candidates": [item["answer_candidates"] for item in batch],
         },
     )
     reasoner, actor = _make_tiny_models()
@@ -333,6 +362,7 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         weight_decay=0.0,
         num_epochs=1,
         lambda_answer=20.0,
+        lambda_answer_probe=20.0,
         lambda_task=0.1,
         lambda_pref=0.1,
         lambda_geom=0.1,
@@ -340,6 +370,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         lambda_contrast=0.0,
         adaptive_loss_enabled=False,
         train_reasoner=False,
+        latent_answer_probe_enabled=True,
+        latent_answer_probe_max_candidates=8,
         wandb_enabled=False,
         checkpoint_enabled=False,
         reasoner_max_length=16,
@@ -359,6 +391,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
     assert train_row["trainable_reasoner_parameter_count"] == 0.0
     assert train_row["trainable_handoff_adapter_parameter_count"] > 0.0
     assert train_row["handoff_adapter_grad_norm"] > 0.0
+    assert train_row["trainable_latent_answer_probe_parameter_count"] > 0.0
+    assert train_row["latent_answer_probe_grad_norm"] > 0.0
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:

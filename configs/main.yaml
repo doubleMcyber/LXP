@@ -149,6 +149,7 @@ training:
   lambda_contrast: 0.1
   lambda_answer: 4.0
   lambda_answer_contrast: 0.0
+  lambda_answer_probe: 0.0
   answer_contrast_temperature: 1.0
   answer_suffix_text: "\nFinal answer:"
   answer_max_length: 32
@@ -173,6 +174,11 @@ training:
     enabled: true
     rank: 64
     scale: 1.0
+    dropout: 0.0
+  latent_answer_probe:
+    enabled: false
+    max_candidates: 64
+    hidden_multiplier: 2
     dropout: 0.0
   hidden_state_processor:
     enabled: false
