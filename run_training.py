@@ -22,11 +22,10 @@ from src.utils.benchmarking import (
     write_json,
 )
 from src.utils.lm_eval import (
-    append_text_to_prefix_state,
-    compute_answer_metrics_from_prefix,
-    greedy_decode_from_prefix,
-    prepare_latent_prefix_state,
-    prepare_text_prefix_state,
+    compute_answer_metrics_from_prefix_embeddings,
+    compute_first_token_metrics_from_prefix_embeddings,
+    generate_from_prefix_embeddings,
+    generate_from_text_prefix,
 )
 from src.utils.metrics import extract_boxed_text, normalize_answer
 from train_compressor import (
@@ -52,7 +51,8 @@ _FINAL_ANSWER_STOP_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*\$?(?:-?\d[\d,]*(?:\.\d+)?|[a-z0-9^*/+\-]+)(?:[\s.]|$)",
     re.IGNORECASE,
 )
-_ANSWER_SUFFIX_TEXT = "\nFinal answer:"
+_ANSWER_SUFFIX_TEXT = "\nFinal answer: "
+_ANSWER_DECODED_PREFIX = "Final answer: "
 _SMOKE_TRAIN_EXAMPLES: tuple[dict[str, str], ...] = (
     {"prompt": "What is 2 + 2?", "answer": "4"},
     {"prompt": "What is 7 * 6?", "answer": "42"},
@@ -327,16 +327,16 @@ def _select_candidate_answer_by_nll(
     *,
     model: AutoModelForCausalLM,
     tokenizer: Any,
-    prefix_state: dict[str, Any],
+    prefix_embeds: torch.Tensor,
     candidate_answers: Iterable[str],
 ) -> tuple[str | None, float | None]:
     best_answer: str | None = None
     best_nll: float | None = None
     for answer in candidate_answers:
-        metrics = compute_answer_metrics_from_prefix(
+        metrics = compute_answer_metrics_from_prefix_embeddings(
             model=model,
             tokenizer=tokenizer,
-            prefix_state=prefix_state,
+            prefix_embeds=prefix_embeds,
             answer_text=answer,
             answer_variants=_answer_metric_variants(answer),
         )
@@ -348,6 +348,37 @@ def _select_candidate_answer_by_nll(
             best_answer = answer
             best_nll = score
     return best_answer, best_nll
+
+
+def _text_prefix_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_text: str,
+) -> torch.Tensor:
+    model_device = next(model.parameters()).device
+    encoded = tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded["input_ids"].to(model_device)
+    with torch.no_grad():
+        return model.get_input_embeddings()(input_ids)
+
+
+def _append_text_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_embeds: torch.Tensor,
+    suffix_text: str,
+) -> torch.Tensor:
+    model_device = next(model.parameters()).device
+    encoded = tokenizer(suffix_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded["input_ids"].to(model_device)
+    if input_ids.numel() == 0:
+        return prefix_embeds
+    with torch.no_grad():
+        suffix_embeds = model.get_input_embeddings()(input_ids)
+    suffix_embeds = suffix_embeds.expand(prefix_embeds.shape[0], -1, -1)
+    return torch.cat([prefix_embeds, suffix_embeds.to(prefix_embeds.dtype)], dim=1)
 
 
 def _answer_metric_variants(answer: str | None) -> tuple[str, ...]:
@@ -393,31 +424,6 @@ def _format_actor_answer_prompt(
         )
     lines.extend(["", f"Question: {prompt.strip()}"])
     return "\n".join(lines)
-
-
-def _prepare_actor_answer_prefix_state(
-    *,
-    actor_model: AutoModelForCausalLM,
-    actor_tokenizer: Any,
-    prompt: str,
-    baseline_examples: list[dict[str, str | None]],
-) -> dict[str, Any]:
-    prefix_text = _format_actor_answer_prompt(
-        prompt,
-        baseline_examples=baseline_examples,
-    )
-    text_prefix_state = prepare_text_prefix_state(
-        model=actor_model,
-        tokenizer=actor_tokenizer,
-        prefix_text=prefix_text,
-    )
-    return append_text_to_prefix_state(
-        model=actor_model,
-        tokenizer=actor_tokenizer,
-        prefix_state=text_prefix_state,
-        suffix_text=_ANSWER_SUFFIX_TEXT,
-        decoded_text_prefix="Final answer:",
-    )
 
 
 def _build_real_examples(
@@ -557,9 +563,15 @@ def _build_evaluation_callback(
         extraction_failure_count = 0
         latent_candidate_correct_count = 0
         latent_probe_correct_count = 0
+        latent_first_token_correct_count = 0
+        latent_first_token_rank_total = 0.0
+        latent_first_token_rank_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
         baseline_candidate_correct_count = 0
+        baseline_first_token_correct_count = 0
+        baseline_first_token_rank_total = 0.0
+        baseline_first_token_rank_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
         predicted_answers: list[str | None] = []
@@ -572,17 +584,19 @@ def _build_evaluation_callback(
         for example in eval_examples:
             prompt = str(example["prompt"])
             target_answer = example["answer"]
-            actor_text_prefix_state = _prepare_actor_answer_prefix_state(
-                actor_model=actor_model,
-                actor_tokenizer=actor_tokenizer,
-                prompt=prompt,
-                baseline_examples=baseline_examples,
+            actor_answer_prefix_text = (
+                _format_actor_answer_prompt(
+                    prompt,
+                    baseline_examples=baseline_examples,
+                )
+                + _ANSWER_SUFFIX_TEXT
             )
-            baseline_decode_metrics = greedy_decode_from_prefix(
+            baseline_decode_metrics = generate_from_text_prefix(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
-                prefix_state=actor_text_prefix_state,
+                prefix_text=actor_answer_prefix_text,
                 max_new_tokens=max_new_tokens,
+                decoded_text_prefix=_ANSWER_DECODED_PREFIX,
                 stop_regex=_FINAL_ANSWER_STOP_REGEX,
             )
             baseline_decoded_text = str(baseline_decode_metrics["decoded_text"])
@@ -598,10 +612,29 @@ def _build_evaluation_callback(
                 baseline_correct_count += 1
             baseline_candidate_predicted_answer = None
             if candidate_answers:
+                actor_text_prefix_embeds = _text_prefix_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_text=actor_answer_prefix_text,
+                )
+                baseline_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_embeds=actor_text_prefix_embeds,
+                    answer_text=target_answer,
+                    answer_variants=_answer_metric_variants(target_answer),
+                )
+                if baseline_first_token_metrics.get("first_token_rank") is not None:
+                    baseline_first_token_rank_count += 1
+                    baseline_first_token_rank_total += float(
+                        baseline_first_token_metrics["first_token_rank"] or 0.0
+                    )
+                if bool(baseline_first_token_metrics.get("first_token_top1")):
+                    baseline_first_token_correct_count += 1
                 baseline_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
-                    prefix_state=actor_text_prefix_state,
+                    prefix_embeds=actor_text_prefix_embeds,
                     candidate_answers=candidate_answers,
                 )
                 baseline_candidate_predicted_answers.append(baseline_candidate_predicted_answer)
@@ -653,33 +686,49 @@ def _build_evaluation_callback(
                     latent_probe_predicted_answers.append(latent_probe_predicted_answer)
                     if _answers_match(dataset_name, latent_probe_predicted_answer, target_answer):
                         latent_probe_correct_count += 1
-            prefix_state = prepare_latent_prefix_state(
-                model=actor_model,
-                handoff_step=aligned_latents,
-                kv_cache=None,
-            )
-            answer_prefix_state = append_text_to_prefix_state(
+            latent_soft_prompt_decoder = alignment_context.get("stage2_latent_soft_prompt_decoder")
+            if latent_soft_prompt_decoder is not None:
+                with torch.no_grad():
+                    decoder_device = next(latent_soft_prompt_decoder.parameters()).device
+                    aligned_latents = latent_soft_prompt_decoder(aligned_latents.to(decoder_device)).to(
+                        reasoner_device
+                    )
+            answer_prefix_embeds = _append_text_embeddings(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
-                prefix_state=prefix_state,
+                prefix_embeds=aligned_latents,
                 suffix_text=_ANSWER_SUFFIX_TEXT,
-                decoded_text_prefix="Final answer:",
             )
-            decode_metrics = greedy_decode_from_prefix(
+            decode_metrics = generate_from_prefix_embeddings(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
-                prefix_state=answer_prefix_state,
+                prefix_embeds=answer_prefix_embeds,
                 max_new_tokens=max_new_tokens,
+                decoded_text_prefix=_ANSWER_DECODED_PREFIX,
                 stop_regex=_FINAL_ANSWER_STOP_REGEX,
             )
             decoded_text = str(decode_metrics["decoded_text"])
-            answer_metrics = compute_answer_metrics_from_prefix(
+            answer_metrics = compute_answer_metrics_from_prefix_embeddings(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
-                prefix_state=answer_prefix_state,
+                prefix_embeds=answer_prefix_embeds,
                 answer_text=target_answer,
                 answer_variants=_answer_metric_variants(target_answer),
             )
+            latent_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_embeds=answer_prefix_embeds,
+                answer_text=target_answer,
+                answer_variants=_answer_metric_variants(target_answer),
+            )
+            if latent_first_token_metrics.get("first_token_rank") is not None:
+                latent_first_token_rank_count += 1
+                latent_first_token_rank_total += float(
+                    latent_first_token_metrics["first_token_rank"] or 0.0
+                )
+            if bool(latent_first_token_metrics.get("first_token_top1")):
+                latent_first_token_correct_count += 1
             if answer_metrics["answer_nll"] is not None:
                 token_count = int(answer_metrics["answer_token_count"] or 0)
                 total_answer_tokens += token_count
@@ -694,7 +743,7 @@ def _build_evaluation_callback(
                 latent_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
-                    prefix_state=answer_prefix_state,
+                    prefix_embeds=answer_prefix_embeds,
                     candidate_answers=candidate_answers,
                 )
                 latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
@@ -729,6 +778,8 @@ def _build_evaluation_callback(
                             f"predicted={predicted_answer}",
                             f"candidate_predicted={latent_candidate_predicted_answer}",
                             f"probe_predicted={latent_probe_predicted_answer}",
+                            f"latent_first_token_rank={latent_first_token_metrics.get('first_token_rank')}",
+                            f"latent_first_token_predicted={latent_first_token_metrics.get('first_token_predicted_text')}",
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
@@ -773,6 +824,16 @@ def _build_evaluation_callback(
                 if latent_probe is not None and latent_probe_candidates
                 else None
             ),
+            "heldout_latent_first_token_accuracy": (
+                100.0 * latent_first_token_correct_count / latent_first_token_rank_count
+                if latent_first_token_rank_count
+                else None
+            ),
+            "heldout_latent_first_token_rank_mean": (
+                latent_first_token_rank_total / latent_first_token_rank_count
+                if latent_first_token_rank_count
+                else None
+            ),
             "heldout_extraction_failure_count": float(extraction_failure_count),
             "heldout_unique_predicted_answer_count": float(
                 _unique_normalized_answer_count(predicted_answers)
@@ -794,6 +855,16 @@ def _build_evaluation_callback(
             "heldout_actor_text_baseline_candidate_unique_predicted_answer_count": (
                 float(_unique_normalized_answer_count(baseline_candidate_predicted_answers))
                 if candidate_answers
+                else None
+            ),
+            "heldout_actor_text_baseline_first_token_accuracy": (
+                100.0 * baseline_first_token_correct_count / baseline_first_token_rank_count
+                if baseline_first_token_rank_count
+                else None
+            ),
+            "heldout_actor_text_baseline_first_token_rank_mean": (
+                baseline_first_token_rank_total / baseline_first_token_rank_count
+                if baseline_first_token_rank_count
                 else None
             ),
             "heldout_correct_count": float(correct_count),
@@ -945,6 +1016,8 @@ def main() -> None:
                 f"loss={entry['loss']:.4f} l_task={entry['l_task']:.4f} "
                 f"l_pref={entry['l_pref']:.4f} l_geom={entry['l_geom']:.4f} "
                 f"l_answer={entry.get('l_answer', 0.0):.4f} "
+                f"first_token_acc={entry.get('answer_first_token_accuracy', 0.0):.2f} "
+                f"first_token_rank={entry.get('answer_first_token_rank_mean', 0.0):.2f} "
                 f"l_answer_contrast={entry.get('l_answer_contrast', 0.0):.4f} "
                 f"answer_contrast_accuracy={entry.get('answer_contrast_accuracy', 0.0):.2f} "
                 f"l_answer_probe={entry.get('l_answer_probe', 0.0):.4f} "
@@ -953,6 +1026,8 @@ def main() -> None:
                 f"adapter_update={entry.get('handoff_adapter_update_norm', 0.0):.6f} "
                 f"probe_grad={entry.get('latent_answer_probe_grad_norm', 0.0):.4f} "
                 f"probe_update={entry.get('latent_answer_probe_update_norm', 0.0):.6f} "
+                f"soft_prompt_grad={entry.get('latent_soft_prompt_decoder_grad_norm', 0.0):.4f} "
+                f"soft_prompt_update={entry.get('latent_soft_prompt_decoder_update_norm', 0.0):.6f} "
             )
             continue
         print(
@@ -963,6 +1038,7 @@ def main() -> None:
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
             f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
             f"latent_probe_accuracy={entry.get('heldout_latent_probe_accuracy', 0.0) or 0.0:.2f} "
+            f"latent_first_token_accuracy={entry.get('heldout_latent_first_token_accuracy', 0.0) or 0.0:.2f} "
             f"unique_predictions={entry.get('heldout_unique_predicted_answer_count', 0.0):.0f} "
             f"actor_text_baseline_accuracy={entry.get('heldout_actor_text_baseline_accuracy', 0.0):.2f}"
         )

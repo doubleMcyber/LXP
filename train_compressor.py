@@ -20,6 +20,7 @@ from src.models.hidden_state import (
     HiddenStateProcessor,
     LatentAnswerProbe,
     LatentHandoffAdapter,
+    LatentSoftPromptDecoder,
 )
 from src.models.losses import (
     AdaptiveLossBalancer,
@@ -45,9 +46,11 @@ class CompressionTrainConfig:
     lambda_geom: float = 1.0
     eps: float = 1e-8
     lambda_answer: float = 4.0
-    answer_suffix_text: str = "\nFinal answer:"
+    lambda_answer_first_token: float = 0.0
+    answer_suffix_text: str = "\nFinal answer: "
     answer_max_length: int = 32
     answer_first_token_weight: float = 2.0
+    answer_first_token_margin: float = 2.0
     evaluate_before_training: bool = False
     train_reasoner: bool = True
     wandb_enabled: bool = True
@@ -82,6 +85,13 @@ class CompressionTrainConfig:
     latent_answer_probe_max_candidates: int = 64
     latent_answer_probe_hidden_multiplier: int = 2
     latent_answer_probe_dropout: float = 0.0
+    latent_soft_prompt_decoder_enabled: bool = False
+    latent_soft_prompt_decoder_output_steps: int = 0
+    latent_soft_prompt_decoder_num_heads: int = 4
+    latent_soft_prompt_decoder_hidden_multiplier: int = 2
+    latent_soft_prompt_decoder_dropout: float = 0.0
+    latent_soft_prompt_decoder_residual_scale: float = 1.0
+    latent_soft_prompt_decoder_max_delta_norm: float = 0.0
     hidden_state_processor_enabled: bool = False
     hidden_state_processor_num_heads: int = 4
     hidden_state_processor_dropout: float = 0.0
@@ -95,6 +105,7 @@ class CompressionTrainConfig:
         projection_cfg = getattr(t, "adaptive_projection", None)
         handoff_adapter_cfg = getattr(t, "latent_handoff_adapter", None)
         answer_probe_cfg = getattr(t, "latent_answer_probe", None)
+        soft_prompt_cfg = getattr(t, "latent_soft_prompt_decoder", None)
         processor_cfg = getattr(t, "hidden_state_processor", None)
         return cls(
             compressed_steps=t.compressed_steps,
@@ -107,9 +118,11 @@ class CompressionTrainConfig:
             lambda_geom=t.lambda_geom,
             eps=t.eps,
             lambda_answer=float(getattr(t, "lambda_answer", 4.0)),
-            answer_suffix_text=str(getattr(t, "answer_suffix_text", "\nFinal answer:")),
+            lambda_answer_first_token=float(getattr(t, "lambda_answer_first_token", 0.0)),
+            answer_suffix_text=str(getattr(t, "answer_suffix_text", "\nFinal answer: ")),
             answer_max_length=int(getattr(t, "answer_max_length", 32)),
             answer_first_token_weight=float(getattr(t, "answer_first_token_weight", 2.0)),
+            answer_first_token_margin=float(getattr(t, "answer_first_token_margin", 2.0)),
             evaluate_before_training=bool(
                 getattr(getattr(t, "evaluation", None), "evaluate_before_training", False)
             ),
@@ -168,6 +181,27 @@ class CompressionTrainConfig:
             latent_answer_probe_dropout=float(
                 getattr(answer_probe_cfg, "dropout", 0.0)
             ) if answer_probe_cfg else 0.0,
+            latent_soft_prompt_decoder_enabled=bool(
+                getattr(soft_prompt_cfg, "enabled", False)
+            ) if soft_prompt_cfg else False,
+            latent_soft_prompt_decoder_output_steps=int(
+                getattr(soft_prompt_cfg, "output_steps", 0)
+            ) if soft_prompt_cfg else 0,
+            latent_soft_prompt_decoder_num_heads=int(
+                getattr(soft_prompt_cfg, "num_heads", 4)
+            ) if soft_prompt_cfg else 4,
+            latent_soft_prompt_decoder_hidden_multiplier=int(
+                getattr(soft_prompt_cfg, "hidden_multiplier", 2)
+            ) if soft_prompt_cfg else 2,
+            latent_soft_prompt_decoder_dropout=float(
+                getattr(soft_prompt_cfg, "dropout", 0.0)
+            ) if soft_prompt_cfg else 0.0,
+            latent_soft_prompt_decoder_residual_scale=float(
+                getattr(soft_prompt_cfg, "residual_scale", 1.0)
+            ) if soft_prompt_cfg else 1.0,
+            latent_soft_prompt_decoder_max_delta_norm=float(
+                getattr(soft_prompt_cfg, "max_delta_norm", 0.0)
+            ) if soft_prompt_cfg else 0.0,
             hidden_state_processor_enabled=bool(getattr(processor_cfg, "enabled", False)) if processor_cfg else False,
             hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
             hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
@@ -494,6 +528,78 @@ def _compute_latent_answer_loss(
     answer_loss = (token_losses * weights).sum() / weights.sum().clamp_min(1.0)
     average_answer_tokens = sum(len(token_ids) for token_ids in encoded_answers) / len(encoded_answers)
     return answer_loss, len(encoded_answers), float(average_answer_tokens)
+
+
+def _compute_latent_first_token_loss(
+    *,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+    margin: float,
+) -> tuple[torch.Tensor | None, int, float, float, float]:
+    valid_indices: list[int] = []
+    first_token_ids: list[int] = []
+    for index, answer in enumerate(answers):
+        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
+        if continuation is None:
+            continue
+        token_ids = _encode_token_ids(
+            actor_tokenizer,
+            continuation,
+            max_length=max(1, int(max_answer_length)),
+        )
+        if not token_ids:
+            continue
+        valid_indices.append(index)
+        first_token_ids.append(int(token_ids[0]))
+    if not first_token_ids:
+        return None, 0, 0.0, 0.0, 0.0
+
+    actor_device = _model_device(actor_model)
+    embedding = actor_model.get_input_embeddings()
+    prefix = latent_prefix.index_select(
+        0,
+        torch.tensor(valid_indices, dtype=torch.long, device=latent_prefix.device),
+    ).to(device=actor_device, dtype=embedding.weight.dtype)
+    suffix_ids = _encode_token_ids(actor_tokenizer, suffix_text)
+    suffix_width = len(suffix_ids)
+    if suffix_width:
+        suffix_tensor = torch.tensor(
+            suffix_ids,
+            dtype=torch.long,
+            device=actor_device,
+        ).unsqueeze(0).expand(prefix.shape[0], suffix_width)
+        suffix_embeds = embedding(suffix_tensor)
+    else:
+        suffix_embeds = prefix[:, :0, :]
+    inputs_embeds = torch.cat([prefix, suffix_embeds], dim=1)
+    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=actor_device)
+    outputs = actor_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    logits = outputs.logits[:, -1, :].float()
+    targets = torch.tensor(first_token_ids, dtype=torch.long, device=actor_device)
+    ce_loss = F.cross_entropy(logits, targets)
+    target_logits = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    other_logits = logits.masked_fill(
+        F.one_hot(targets, num_classes=logits.shape[-1]).bool(),
+        float("-inf"),
+    ).max(dim=-1).values
+    margin_loss = F.relu(float(margin) - (target_logits - other_logits)).mean()
+    first_token_loss = ce_loss + margin_loss
+    predictions = logits.argmax(dim=-1)
+    accuracy = float((predictions == targets).float().mean().detach().cpu().item() * 100.0)
+    ranks = 1 + (logits > target_logits.unsqueeze(1)).sum(dim=-1).float()
+    average_rank = float(ranks.mean().detach().cpu().item())
+    average_margin = float((target_logits - other_logits).mean().detach().cpu().item())
+    return first_token_loss, len(first_token_ids), accuracy, average_rank, average_margin
 
 
 def _candidate_target_indices(
@@ -973,6 +1079,19 @@ def train_reasoner_stage2(
         if config.latent_answer_probe_enabled
         else None
     )
+    latent_soft_prompt_decoder = (
+        LatentSoftPromptDecoder(
+            actor_hidden_size,
+            output_steps=config.latent_soft_prompt_decoder_output_steps,
+            num_heads=config.latent_soft_prompt_decoder_num_heads,
+            hidden_multiplier=config.latent_soft_prompt_decoder_hidden_multiplier,
+            dropout=config.latent_soft_prompt_decoder_dropout,
+            residual_scale=config.latent_soft_prompt_decoder_residual_scale,
+            max_delta_norm=config.latent_soft_prompt_decoder_max_delta_norm,
+        )
+        if config.latent_soft_prompt_decoder_enabled
+        else None
+    )
     if hidden_state_processor is not None:
         hidden_state_processor.train()
     if latent_handoff_adapter is not None:
@@ -981,11 +1100,15 @@ def train_reasoner_stage2(
     if latent_answer_probe is not None:
         latent_answer_probe.to(_model_device(reasoner_model))
         latent_answer_probe.train()
+    if latent_soft_prompt_decoder is not None:
+        latent_soft_prompt_decoder.to(_model_device(reasoner_model))
+        latent_soft_prompt_decoder.train()
     optimizer = torch.optim.AdamW(
         (
             list(p for p in reasoner_model.parameters() if p.requires_grad)
             + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
             + ([] if latent_answer_probe is None else list(latent_answer_probe.parameters()))
+            + ([] if latent_soft_prompt_decoder is None else list(latent_soft_prompt_decoder.parameters()))
             + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
         ),
         lr=config.learning_rate,
@@ -1001,6 +1124,8 @@ def train_reasoner_stage2(
         latent_handoff_adapter.to(reasoner_device)
     if latent_answer_probe is not None:
         latent_answer_probe.to(reasoner_device)
+    if latent_soft_prompt_decoder is not None:
+        latent_soft_prompt_decoder.to(reasoner_device)
     curriculum_stages = _curriculum_schedule(config) if config.curriculum_enabled else (
         CurriculumStage(
             name="default",
@@ -1049,6 +1174,7 @@ def train_reasoner_stage2(
             "l_plan": config.lambda_plan,
             "l_contrast": config.lambda_contrast,
             "l_answer": config.lambda_answer,
+            "l_answer_first_token": config.lambda_answer_first_token,
             "l_answer_contrast": config.lambda_answer_contrast,
             "l_answer_probe": config.lambda_answer_probe,
         },
@@ -1077,9 +1203,16 @@ def train_reasoner_stage2(
         if latent_answer_probe is not None:
             eval_context["stage2_latent_answer_probe"] = latent_answer_probe
             eval_context["stage2_latent_answer_candidates"] = latest_candidate_answers
+        if latent_soft_prompt_decoder is not None:
+            eval_context["stage2_latent_soft_prompt_decoder"] = latent_soft_prompt_decoder
         module_training_states = [
             (module, module.training)
-            for module in (latent_handoff_adapter, hidden_state_processor, latent_answer_probe)
+            for module in (
+                latent_handoff_adapter,
+                hidden_state_processor,
+                latent_answer_probe,
+                latent_soft_prompt_decoder,
+            )
             if module is not None
         ]
         for module, _was_training in module_training_states:
@@ -1175,6 +1308,22 @@ def train_reasoner_stage2(
                 compressed_latents_aligned = latent_handoff_adapter(compressed_latents_aligned)
             if hidden_state_processor is not None:
                 compressed_latents_aligned = hidden_state_processor(compressed_latents_aligned)
+            actor_prefix_latents = compressed_latents_aligned
+            soft_prompt_delta_norm = 0.0
+            if latent_soft_prompt_decoder is not None:
+                actor_prefix_latents = latent_soft_prompt_decoder(compressed_latents_aligned)
+                if actor_prefix_latents.shape == compressed_latents_aligned.shape:
+                    soft_prompt_delta_norm = float(
+                        (actor_prefix_latents.detach().float() - compressed_latents_aligned.detach().float())
+                        .norm(dim=-1)
+                        .mean()
+                        .cpu()
+                        .item()
+                    )
+                else:
+                    soft_prompt_delta_norm = float(
+                        actor_prefix_latents.detach().float().norm(dim=-1).mean().cpu().item()
+                    )
 
             full_attention = torch.ones(
                 (full_latents.size(0), full_latents.size(1)),
@@ -1182,7 +1331,7 @@ def train_reasoner_stage2(
                 device=actor_device,
             )
             compressed_attention = torch.ones(
-                (compressed_latents.size(0), compressed_latents.size(1)),
+                (actor_prefix_latents.size(0), actor_prefix_latents.size(1)),
                 dtype=torch.long,
                 device=actor_device,
             )
@@ -1199,7 +1348,7 @@ def train_reasoner_stage2(
                 ).logits
 
             actor_logits_compressed = actor_model(
-                inputs_embeds=compressed_latents_aligned.to(
+                inputs_embeds=actor_prefix_latents.to(
                     device=actor_device,
                     dtype=actor_model.get_input_embeddings().weight.dtype,
                 ),
@@ -1217,27 +1366,42 @@ def train_reasoner_stage2(
             )
             l_plan = compute_plan_similarity_loss(
                 full_latents_aligned.detach(),
-                compressed_latents_aligned,
+                actor_prefix_latents,
             )
             l_contrast = compute_random_contrast_loss(
                 full_latents_aligned.detach(),
-                compressed_latents_aligned,
+                actor_prefix_latents,
                 temperature=config.contrast_temperature,
             )
             answer_loss, answer_loss_sample_count, answer_token_count_mean = _compute_latent_answer_loss(
                 actor_model=actor_model,
                 actor_tokenizer=actor_tokenizer,
-                latent_prefix=compressed_latents_aligned,
+                latent_prefix=actor_prefix_latents,
                 answers=answers,
                 suffix_text=config.answer_suffix_text,
                 max_answer_length=config.answer_max_length,
                 first_token_weight=config.answer_first_token_weight,
             )
+            (
+                answer_first_token_loss,
+                answer_first_token_sample_count,
+                answer_first_token_accuracy,
+                answer_first_token_rank_mean,
+                answer_first_token_margin_mean,
+            ) = _compute_latent_first_token_loss(
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                latent_prefix=actor_prefix_latents,
+                answers=answers,
+                suffix_text=config.answer_suffix_text,
+                max_answer_length=config.answer_max_length,
+                margin=config.answer_first_token_margin,
+            )
             answer_contrast_loss, answer_contrast_sample_count, answer_contrast_accuracy = (
                 _compute_latent_candidate_contrast_loss(
                     actor_model=actor_model,
                     actor_tokenizer=actor_tokenizer,
-                    latent_prefix=compressed_latents_aligned,
+                    latent_prefix=actor_prefix_latents,
                     answers=answers,
                     candidate_answers=candidate_answers,
                     suffix_text=config.answer_suffix_text,
@@ -1262,6 +1426,8 @@ def train_reasoner_stage2(
             }
             if answer_loss is not None:
                 loss_terms["l_answer"] = answer_loss.to(reasoner_device)
+            if answer_first_token_loss is not None:
+                loss_terms["l_answer_first_token"] = answer_first_token_loss.to(reasoner_device)
             if answer_contrast_loss is not None:
                 loss_terms["l_answer_contrast"] = answer_contrast_loss.to(reasoner_device)
             if answer_probe_loss is not None:
@@ -1271,21 +1437,29 @@ def train_reasoner_stage2(
             optimizer.zero_grad(set_to_none=True)
             adapter_before = _snapshot_module_parameters(latent_handoff_adapter)
             answer_probe_before = _snapshot_module_parameters(latent_answer_probe)
+            soft_prompt_decoder_before = _snapshot_module_parameters(latent_soft_prompt_decoder)
             total_loss.backward()
             reasoner_grad_norm = _gradient_norm(reasoner_model)
             handoff_adapter_grad_norm = _gradient_norm(latent_handoff_adapter)
             latent_answer_probe_grad_norm = _gradient_norm(latent_answer_probe)
+            latent_soft_prompt_decoder_grad_norm = _gradient_norm(latent_soft_prompt_decoder)
             hidden_processor_grad_norm = _gradient_norm(hidden_state_processor)
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
             if latent_handoff_adapter is not None:
                 nn.utils.clip_grad_norm_(latent_handoff_adapter.parameters(), config.max_grad_norm)
             if latent_answer_probe is not None:
                 nn.utils.clip_grad_norm_(latent_answer_probe.parameters(), config.max_grad_norm)
+            if latent_soft_prompt_decoder is not None:
+                nn.utils.clip_grad_norm_(latent_soft_prompt_decoder.parameters(), config.max_grad_norm)
             if hidden_state_processor is not None:
                 nn.utils.clip_grad_norm_(hidden_state_processor.parameters(), config.max_grad_norm)
             optimizer.step()
             handoff_adapter_update_norm = _module_update_norm(adapter_before, latent_handoff_adapter)
             latent_answer_probe_update_norm = _module_update_norm(answer_probe_before, latent_answer_probe)
+            latent_soft_prompt_decoder_update_norm = _module_update_norm(
+                soft_prompt_decoder_before,
+                latent_soft_prompt_decoder,
+            )
 
             metrics = {
                 "epoch": float(epoch),
@@ -1297,6 +1471,9 @@ def train_reasoner_stage2(
                 "l_plan": float(l_plan.detach().cpu().item()),
                 "l_contrast": float(l_contrast.detach().cpu().item()),
                 "l_answer": 0.0 if answer_loss is None else float(answer_loss.detach().cpu().item()),
+                "l_answer_first_token": 0.0
+                if answer_first_token_loss is None
+                else float(answer_first_token_loss.detach().cpu().item()),
                 "l_answer_contrast": 0.0
                 if answer_contrast_loss is None
                 else float(answer_contrast_loss.detach().cpu().item()),
@@ -1305,6 +1482,10 @@ def train_reasoner_stage2(
                 else float(answer_probe_loss.detach().cpu().item()),
                 "answer_loss_sample_count": float(answer_loss_sample_count),
                 "answer_loss_token_count_mean": float(answer_token_count_mean),
+                "answer_first_token_sample_count": float(answer_first_token_sample_count),
+                "answer_first_token_accuracy": float(answer_first_token_accuracy),
+                "answer_first_token_rank_mean": float(answer_first_token_rank_mean),
+                "answer_first_token_margin_mean": float(answer_first_token_margin_mean),
                 "answer_contrast_sample_count": float(answer_contrast_sample_count),
                 "answer_contrast_accuracy": float(answer_contrast_accuracy),
                 "answer_probe_sample_count": float(answer_probe_sample_count),
@@ -1316,17 +1497,24 @@ def train_reasoner_stage2(
                 "effective_weight_plan": effective_weights["l_plan"],
                 "effective_weight_contrast": effective_weights["l_contrast"],
                 "effective_weight_answer": effective_weights.get("l_answer", 0.0),
+                "effective_weight_answer_first_token": effective_weights.get("l_answer_first_token", 0.0),
                 "effective_weight_answer_contrast": effective_weights.get("l_answer_contrast", 0.0),
                 "effective_weight_answer_probe": effective_weights.get("l_answer_probe", 0.0),
                 "reasoner_grad_norm": reasoner_grad_norm,
                 "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
                 "latent_answer_probe_grad_norm": latent_answer_probe_grad_norm,
+                "latent_soft_prompt_decoder_grad_norm": latent_soft_prompt_decoder_grad_norm,
                 "hidden_processor_grad_norm": hidden_processor_grad_norm,
                 "handoff_adapter_update_norm": handoff_adapter_update_norm,
                 "latent_answer_probe_update_norm": latent_answer_probe_update_norm,
+                "latent_soft_prompt_decoder_update_norm": latent_soft_prompt_decoder_update_norm,
+                "latent_soft_prompt_decoder_delta_norm": soft_prompt_delta_norm,
                 "trainable_reasoner_parameter_count": float(_parameter_count(reasoner_model)),
                 "trainable_handoff_adapter_parameter_count": float(_parameter_count(latent_handoff_adapter)),
                 "trainable_latent_answer_probe_parameter_count": float(_parameter_count(latent_answer_probe)),
+                "trainable_latent_soft_prompt_decoder_parameter_count": float(
+                    _parameter_count(latent_soft_prompt_decoder)
+                ),
                 "trainable_hidden_processor_parameter_count": float(_parameter_count(hidden_state_processor)),
                 "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
                 "projection_scale_mean": projection_metrics["projection_scale_mean"],
@@ -1373,10 +1561,15 @@ def train_reasoner_stage2(
                         "l_plan": metrics["l_plan"],
                         "l_contrast": metrics["l_contrast"],
                         "l_answer": metrics["l_answer"],
+                        "l_answer_first_token": metrics["l_answer_first_token"],
                         "l_answer_contrast": metrics["l_answer_contrast"],
                         "l_answer_probe": metrics["l_answer_probe"],
                         "answer_loss_sample_count": metrics["answer_loss_sample_count"],
                         "answer_loss_token_count_mean": metrics["answer_loss_token_count_mean"],
+                        "answer_first_token_sample_count": metrics["answer_first_token_sample_count"],
+                        "answer_first_token_accuracy": metrics["answer_first_token_accuracy"],
+                        "answer_first_token_rank_mean": metrics["answer_first_token_rank_mean"],
+                        "answer_first_token_margin_mean": metrics["answer_first_token_margin_mean"],
                         "answer_contrast_sample_count": metrics["answer_contrast_sample_count"],
                         "answer_contrast_accuracy": metrics["answer_contrast_accuracy"],
                         "answer_probe_sample_count": metrics["answer_probe_sample_count"],
@@ -1388,20 +1581,35 @@ def train_reasoner_stage2(
                         "effective_weight_plan": metrics["effective_weight_plan"],
                         "effective_weight_contrast": metrics["effective_weight_contrast"],
                         "effective_weight_answer": metrics["effective_weight_answer"],
+                        "effective_weight_answer_first_token": metrics[
+                            "effective_weight_answer_first_token"
+                        ],
                         "effective_weight_answer_contrast": metrics["effective_weight_answer_contrast"],
                         "effective_weight_answer_probe": metrics["effective_weight_answer_probe"],
                         "reasoner_grad_norm": metrics["reasoner_grad_norm"],
                         "handoff_adapter_grad_norm": metrics["handoff_adapter_grad_norm"],
                         "latent_answer_probe_grad_norm": metrics["latent_answer_probe_grad_norm"],
+                        "latent_soft_prompt_decoder_grad_norm": metrics[
+                            "latent_soft_prompt_decoder_grad_norm"
+                        ],
                         "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],
                         "handoff_adapter_update_norm": metrics["handoff_adapter_update_norm"],
                         "latent_answer_probe_update_norm": metrics["latent_answer_probe_update_norm"],
+                        "latent_soft_prompt_decoder_update_norm": metrics[
+                            "latent_soft_prompt_decoder_update_norm"
+                        ],
+                        "latent_soft_prompt_decoder_delta_norm": metrics[
+                            "latent_soft_prompt_decoder_delta_norm"
+                        ],
                         "trainable_reasoner_parameter_count": metrics["trainable_reasoner_parameter_count"],
                         "trainable_handoff_adapter_parameter_count": metrics[
                             "trainable_handoff_adapter_parameter_count"
                         ],
                         "trainable_latent_answer_probe_parameter_count": metrics[
                             "trainable_latent_answer_probe_parameter_count"
+                        ],
+                        "trainable_latent_soft_prompt_decoder_parameter_count": metrics[
+                            "trainable_latent_soft_prompt_decoder_parameter_count"
                         ],
                         "trainable_hidden_processor_parameter_count": metrics[
                             "trainable_hidden_processor_parameter_count"
@@ -1439,6 +1647,9 @@ def train_reasoner_stage2(
                             "latent_answer_probe_state_dict": None
                             if latent_answer_probe is None
                             else latent_answer_probe.state_dict(),
+                            "latent_soft_prompt_decoder_state_dict": None
+                            if latent_soft_prompt_decoder is None
+                            else latent_soft_prompt_decoder.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "training_config": dataclasses.asdict(config),
                             "alignment_context": alignment_context,
@@ -1468,6 +1679,9 @@ def train_reasoner_stage2(
                     "latent_answer_probe_state_dict": None
                     if latent_answer_probe is None
                     else latent_answer_probe.state_dict(),
+                    "latent_soft_prompt_decoder_state_dict": None
+                    if latent_soft_prompt_decoder is None
+                    else latent_soft_prompt_decoder.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "training_config": dataclasses.asdict(config),
                     "alignment_context": latest_alignment_context,

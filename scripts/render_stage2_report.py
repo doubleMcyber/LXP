@@ -262,6 +262,11 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_candidate_accuracy"))}</div>
         <div class="subhead">Frozen actor candidate ranking from the latent prefix.</div>
       </div>
+      <div class="panel">
+        <h3>First Token</h3>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_first_token_accuracy"))}</div>
+        <div class="subhead">Greedy answer-boundary token accuracy, mean rank {_fmt_number(smoke.get("final_heldout_latent_first_token_rank_mean"))}.</div>
+      </div>
       <div class="panel {phase_class}">
         <div class="status-row"><h3>Phase Gate</h3><span class="badge">{phase_label}</span></div>
         <div class="card-value">{_fmt_number(smoke.get("final_heldout_answer_perplexity"))}</div>
@@ -273,6 +278,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Accuracy Surfaces</h2>
         {_bar_row("Open decode exact match", smoke.get("final_heldout_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Latent first token", smoke.get("final_heldout_latent_first_token_accuracy"))}
         {_bar_row("Latent candidate NLL", smoke.get("final_heldout_latent_candidate_accuracy"))}
         {_bar_row("Latent answer probe", smoke.get("final_heldout_latent_probe_accuracy"), class_name="probe")}
         {_bar_row("Actor text baseline", smoke.get("final_heldout_actor_text_baseline_accuracy"), class_name="baseline")}

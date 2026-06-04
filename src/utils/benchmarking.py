@@ -1427,6 +1427,12 @@ def build_training_phase2_report(
         "final_heldout_latent_probe_accuracy": final_heldout_entry.get(
             "heldout_latent_probe_accuracy"
         ),
+        "final_heldout_latent_first_token_accuracy": final_heldout_entry.get(
+            "heldout_latent_first_token_accuracy"
+        ),
+        "final_heldout_latent_first_token_rank_mean": final_heldout_entry.get(
+            "heldout_latent_first_token_rank_mean"
+        ),
         "accuracy_retention_ratio": accuracy_retention_ratio,
         "alignment_mode": alignment_context.get("alignment_mode"),
         "semantic_anchor_count": alignment_context.get("semantic_anchor_count"),
@@ -1602,6 +1608,12 @@ def build_training_smoke_report(
         ),
         "final_heldout_latent_probe_accuracy": latent_probe_accuracy,
         "final_heldout_latent_probe_unique_predicted_answer_count": latent_probe_unique_count,
+        "final_heldout_latent_first_token_accuracy": final_eval.get(
+            "heldout_latent_first_token_accuracy"
+        ),
+        "final_heldout_latent_first_token_rank_mean": final_eval.get(
+            "heldout_latent_first_token_rank_mean"
+        ),
         "latent_probe_ready": (
             latent_probe_accuracy is not None
             and latent_probe_accuracy >= 100.0

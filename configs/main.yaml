@@ -148,12 +148,14 @@ training:
   lambda_plan: 0.25
   lambda_contrast: 0.1
   lambda_answer: 4.0
+  lambda_answer_first_token: 0.0
   lambda_answer_contrast: 0.0
   lambda_answer_probe: 0.0
   answer_contrast_temperature: 1.0
-  answer_suffix_text: "\nFinal answer:"
+  answer_suffix_text: "\nFinal answer: "
   answer_max_length: 32
   answer_first_token_weight: 2.0
+  answer_first_token_margin: 2.0
   train_reasoner: true
   contrast_temperature: 0.1
   eps: 1.0e-8
@@ -180,6 +182,14 @@ training:
     max_candidates: 64
     hidden_multiplier: 2
     dropout: 0.0
+  latent_soft_prompt_decoder:
+    enabled: false
+    output_steps: 0
+    num_heads: 4
+    hidden_multiplier: 2
+    dropout: 0.0
+    residual_scale: 1.0
+    max_delta_norm: 0.0
   hidden_state_processor:
     enabled: false
     num_heads: 4

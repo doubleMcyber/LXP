@@ -14,6 +14,7 @@ from train_compressor import (
     _compute_latent_answer_loss,
     _compute_latent_answer_probe_loss,
     _compute_latent_candidate_contrast_loss,
+    _compute_latent_first_token_loss,
     _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
@@ -182,6 +183,32 @@ def test_latent_candidate_contrast_loss_backprops_to_prefix() -> None:
     assert sample_count == 2
     assert 0.0 <= accuracy <= 100.0
     contrast_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_first_token_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    first_token_loss, sample_count, accuracy, rank_mean, margin_mean = _compute_latent_first_token_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        margin=2.0,
+    )
+
+    assert first_token_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    assert rank_mean >= 1.0
+    assert isinstance(margin_mean, float)
+    first_token_loss.backward()
     assert latent_prefix.grad is not None
     assert torch.isfinite(latent_prefix.grad).all()
 
@@ -372,6 +399,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         train_reasoner=False,
         latent_answer_probe_enabled=True,
         latent_answer_probe_max_candidates=8,
+        latent_soft_prompt_decoder_enabled=True,
+        latent_soft_prompt_decoder_output_steps=4,
         wandb_enabled=False,
         checkpoint_enabled=False,
         reasoner_max_length=16,
@@ -393,6 +422,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
     assert train_row["handoff_adapter_grad_norm"] > 0.0
     assert train_row["trainable_latent_answer_probe_parameter_count"] > 0.0
     assert train_row["latent_answer_probe_grad_norm"] > 0.0
+    assert train_row["trainable_latent_soft_prompt_decoder_parameter_count"] > 0.0
+    assert train_row["latent_soft_prompt_decoder_grad_norm"] > 0.0
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:

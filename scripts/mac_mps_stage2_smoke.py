@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Sequence
 
 import torch
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.render_stage2_report import render_stage2_report
 
@@ -40,11 +44,15 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 "training.evaluation.smoke_eval_set=train_overfit",
                 "training.curriculum.enabled=false",
                 "training.adaptive_loss.enabled=false",
-                "training.learning_rate=1.0e-4",
-                "training.lambda_answer=20.0",
+                "training.learning_rate=3.0e-4",
+                "training.max_grad_norm=5.0",
+                "training.lambda_answer=40.0",
+                "training.lambda_answer_first_token=80.0",
                 "training.lambda_answer_contrast=20.0",
                 "training.lambda_answer_probe=20.0",
                 "training.answer_contrast_temperature=0.5",
+                "training.answer_first_token_weight=8.0",
+                "training.answer_first_token_margin=4.0",
                 "training.lambda_task=0.1",
                 "training.lambda_pref=0.1",
                 "training.lambda_geom=0.1",
@@ -53,6 +61,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 "training.train_reasoner=false",
                 "training.latent_handoff_adapter.enabled=true",
                 "training.latent_answer_probe.enabled=true",
+                "training.latent_soft_prompt_decoder.enabled=true",
+                "training.latent_soft_prompt_decoder.output_steps=0",
             ]
         )
     return command
@@ -95,6 +105,12 @@ def _print_report_summary(report_path: Path) -> None:
             ),
             "latent_probe_accuracy": smoke_report.get(
                 "final_heldout_latent_probe_accuracy"
+            ),
+            "latent_first_token_accuracy": smoke_report.get(
+                "final_heldout_latent_first_token_accuracy"
+            ),
+            "latent_first_token_rank_mean": smoke_report.get(
+                "final_heldout_latent_first_token_rank_mean"
             ),
             "latent_probe_ready": smoke_report.get("latent_probe_ready"),
             "unique_predicted_answer_count": smoke_report.get(

@@ -134,6 +134,98 @@ class LatentAnswerProbe(nn.Module):
         return self.net(pooled.float())
 
 
+class LatentSoftPromptDecoder(nn.Module):
+    """Condition latent trajectories into virtual actor prompt embeddings."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        output_steps: int = 0,
+        num_heads: int = 4,
+        hidden_multiplier: int = 2,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        max_delta_norm: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.output_steps = max(0, int(output_steps))
+        self.residual_scale = float(residual_scale)
+        self.max_delta_norm = max(0.0, float(max_delta_norm))
+        prompt_hidden = max(int(hidden_size), int(hidden_size) * max(1, int(hidden_multiplier)))
+        attn_heads = max(1, min(int(num_heads), int(hidden_size)))
+        while hidden_size % attn_heads != 0 and attn_heads > 1:
+            attn_heads -= 1
+
+        self.source_norm = nn.LayerNorm(hidden_size)
+        self.prompt_norm = nn.LayerNorm(hidden_size)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=attn_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, prompt_hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(prompt_hidden, hidden_size),
+        )
+        self.query_tokens = (
+            nn.Parameter(torch.empty(self.output_steps, hidden_size))
+            if self.output_steps > 0
+            else None
+        )
+        self.summary_to_prompt = (
+            nn.Linear(hidden_size, self.output_steps * hidden_size)
+            if self.output_steps > 0
+            else None
+        )
+        if self.query_tokens is not None:
+            nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        if self.summary_to_prompt is not None:
+            nn.init.normal_(self.summary_to_prompt.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.summary_to_prompt.bias)
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        source = self.source_norm(hidden_states.float())
+        if self.output_steps > 0:
+            if self.query_tokens is None or self.summary_to_prompt is None:
+                raise RuntimeError("LatentSoftPromptDecoder output projection is not initialized")
+            batch_size = hidden_states.shape[0]
+            summary = source.mean(dim=1)
+            prompt = self.query_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+            prompt = prompt + self.summary_to_prompt(summary).view(
+                batch_size,
+                self.output_steps,
+                hidden_states.shape[-1],
+            )
+            base_prompt = prompt
+        else:
+            prompt = hidden_states.float()
+            base_prompt = prompt
+
+        attended, _ = self.cross_attn(
+            self.prompt_norm(prompt),
+            source,
+            source,
+            need_weights=False,
+        )
+        decoded = prompt + (self.residual_scale * attended)
+        decoded = decoded + (self.residual_scale * self.mlp(decoded))
+        if self.max_delta_norm > 0.0:
+            delta = decoded - base_prompt
+            delta_norm = delta.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            scale = (self.max_delta_norm / delta_norm).clamp_max(1.0)
+            decoded = base_prompt + (delta * scale)
+        return decoded.to(dtype=hidden_states.dtype)
+
+
 def build_plan_summary(hidden_states: torch.Tensor) -> torch.Tensor:
     start = hidden_states[:, :1, :]
     middle = hidden_states.mean(dim=1, keepdim=True)

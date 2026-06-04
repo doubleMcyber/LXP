@@ -329,6 +329,110 @@ def greedy_decode_from_prefix(
     }
 
 
+def _truncate_decoded_text_at_stop(
+    decoded_text: str,
+    stop_regex: Optional[re.Pattern[str]],
+) -> str:
+    if stop_regex is None:
+        return decoded_text
+    match = stop_regex.search(decoded_text)
+    if match is None:
+        return decoded_text
+    return decoded_text[: match.end()]
+
+
+def generate_from_prefix_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_embeds: torch.Tensor,
+    max_new_tokens: int,
+    attention_mask: Optional[torch.Tensor] = None,
+    decoded_text_prefix: str = "",
+    stop_regex: Optional[re.Pattern[str]] = None,
+) -> dict[str, Any]:
+    """Decode from a continuous prompt using the model's native generation path."""
+    model_device = next(model.parameters()).device
+    model_dtype = model.get_input_embeddings().weight.dtype
+    if prefix_embeds.dim() != 3:
+        raise ValueError(
+            "prefix_embeds must have shape [batch, steps, embedding_dim]; "
+            f"received {tuple(prefix_embeds.shape)}"
+        )
+    prefix = prefix_embeds.to(device=model_device, dtype=model_dtype)
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            prefix.shape[:2],
+            dtype=torch.long,
+            device=model_device,
+        )
+    else:
+        attention_mask = attention_mask.to(device=model_device, dtype=torch.long)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+
+    with torch.no_grad():
+        generated = model.generate(
+            inputs_embeds=prefix,
+            attention_mask=attention_mask,
+            max_new_tokens=max(1, int(max_new_tokens)),
+            do_sample=False,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+        )
+    generated_token_ids = generated[0].detach().cpu().tolist()
+    decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    decoded_text = _truncate_decoded_text_at_stop(
+        str(decoded_text_prefix) + decoded_suffix,
+        stop_regex,
+    )
+    return {
+        "decoded_text": decoded_text,
+        "generated_tokens": len(generated_token_ids),
+    }
+
+
+def generate_from_text_prefix(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_text: str,
+    max_new_tokens: int,
+    decoded_text_prefix: str = "",
+    stop_regex: Optional[re.Pattern[str]] = None,
+) -> dict[str, Any]:
+    model_device = next(model.parameters()).device
+    encoded = tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded["input_ids"].to(model_device)
+    attention_mask = encoded["attention_mask"].to(model_device)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+
+    with torch.no_grad():
+        generated = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max(1, int(max_new_tokens)),
+            do_sample=False,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+        )
+    generated_token_ids = generated[0, input_ids.shape[1] :].detach().cpu().tolist()
+    decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    decoded_text = _truncate_decoded_text_at_stop(
+        str(decoded_text_prefix) + decoded_suffix,
+        stop_regex,
+    )
+    return {
+        "decoded_text": decoded_text,
+        "generated_tokens": len(generated_token_ids),
+    }
+
+
 def compute_answer_metrics_from_prefix(
     *,
     model: AutoModelForCausalLM,
@@ -372,6 +476,133 @@ def compute_answer_metrics_from_prefix(
             "answer_perplexity": None,
         }
     return best_metrics
+
+
+def compute_answer_metrics_from_prefix_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_embeds: torch.Tensor,
+    answer_text: Optional[str],
+    answer_variants: Optional[Sequence[str]] = None,
+) -> dict[str, Optional[float]]:
+    candidates: list[str] = []
+    if answer_text is not None and str(answer_text).strip():
+        candidates.append(str(answer_text))
+    for variant in answer_variants or ():
+        if variant is None:
+            continue
+        variant_text = str(variant)
+        if variant_text.strip() and variant_text not in candidates:
+            candidates.append(variant_text)
+    if not candidates:
+        return {
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+        }
+
+    best_metrics: Optional[dict[str, Optional[float]]] = None
+    for candidate in candidates:
+        candidate_metrics = _compute_single_answer_metrics_from_prefix_embeddings(
+            model=model,
+            tokenizer=tokenizer,
+            prefix_embeds=prefix_embeds,
+            answer_text=candidate,
+        )
+        if candidate_metrics["answer_nll"] is None:
+            continue
+        if best_metrics is None or float(candidate_metrics["answer_nll"]) < float(best_metrics["answer_nll"]):
+            best_metrics = candidate_metrics
+    if best_metrics is None:
+        return {
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+        }
+    return best_metrics
+
+
+def compute_first_token_metrics_from_prefix_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_embeds: torch.Tensor,
+    answer_text: Optional[str],
+    answer_variants: Optional[Sequence[str]] = None,
+) -> dict[str, Optional[float | int | str | bool]]:
+    candidates: list[str] = []
+    if answer_text is not None and str(answer_text).strip():
+        candidates.append(str(answer_text))
+    for variant in answer_variants or ():
+        if variant is None:
+            continue
+        variant_text = str(variant)
+        if variant_text.strip() and variant_text not in candidates:
+            candidates.append(variant_text)
+    encoded_candidates = [
+        _token_ids
+        for candidate in candidates
+        if (_token_ids := tokenizer.encode(candidate, add_special_tokens=False))
+    ]
+    if not encoded_candidates:
+        return {
+            "first_token_rank": None,
+            "first_token_top1": None,
+            "first_token_margin": None,
+            "first_token_target_id": None,
+            "first_token_predicted_id": None,
+            "first_token_predicted_text": None,
+        }
+
+    model_device = next(model.parameters()).device
+    embedding = model.get_input_embeddings()
+    prefix = prefix_embeds.to(device=model_device, dtype=embedding.weight.dtype)
+    attention_mask = torch.ones(prefix.shape[:2], dtype=torch.long, device=model_device)
+    with torch.no_grad():
+        outputs = model(
+            inputs_embeds=prefix,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+    )
+    logits = outputs.logits[:, -1, :].float()
+    predicted_id = int(logits.argmax(dim=-1)[0].detach().cpu().item())
+    predicted_text = (
+        tokenizer.decode([predicted_id], skip_special_tokens=True)
+        if hasattr(tokenizer, "decode")
+        else str(predicted_id)
+    )
+    best: dict[str, Optional[float | int | str | bool]] | None = None
+    for token_ids in encoded_candidates:
+        target_id = int(token_ids[0])
+        target_logit = logits[:, target_id]
+        other_logits = logits.clone()
+        other_logits[:, target_id] = float("-inf")
+        best_other = other_logits.max(dim=-1).values
+        rank = int((1 + (logits > target_logit.unsqueeze(1)).sum(dim=-1))[0].detach().cpu().item())
+        margin = float((target_logit - best_other)[0].detach().cpu().item())
+        top1 = predicted_id == target_id
+        candidate_result: dict[str, Optional[float | int | str | bool]] = {
+            "first_token_rank": rank,
+            "first_token_top1": top1,
+            "first_token_margin": margin,
+            "first_token_target_id": target_id,
+            "first_token_predicted_id": predicted_id,
+            "first_token_predicted_text": predicted_text,
+        }
+        if best is None or int(candidate_result["first_token_rank"] or 10**9) < int(
+            best["first_token_rank"] or 10**9
+        ):
+            best = candidate_result
+    return best or {
+        "first_token_rank": None,
+        "first_token_top1": None,
+        "first_token_margin": None,
+        "first_token_target_id": None,
+        "first_token_predicted_id": None,
+        "first_token_predicted_text": None,
+    }
 
 
 def _compute_single_answer_metrics_from_prefix(
@@ -423,6 +654,60 @@ def _compute_single_answer_metrics_from_prefix(
                 use_cache=True,
                 return_dict=True,
             )
+
+    mean_nll = float(torch.stack(per_token_nll).mean().detach().cpu().item())
+    return {
+        "answer_token_count": len(answer_token_ids),
+        "answer_nll": mean_nll,
+        "answer_perplexity": float(math.exp(mean_nll)),
+    }
+
+
+def _compute_single_answer_metrics_from_prefix_embeddings(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_embeds: torch.Tensor,
+    answer_text: str,
+) -> dict[str, Optional[float]]:
+    answer_token_ids = tokenizer.encode(str(answer_text), add_special_tokens=False)
+    if not answer_token_ids:
+        return {
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+        }
+
+    model_device = next(model.parameters()).device
+    embedding = model.get_input_embeddings()
+    prefix = prefix_embeds.to(device=model_device, dtype=embedding.weight.dtype)
+    answer_tensor = torch.tensor(
+        [answer_token_ids],
+        dtype=torch.long,
+        device=model_device,
+    )
+    answer_embeds = embedding(answer_tensor)
+    inputs_embeds = torch.cat([prefix, answer_embeds], dim=1)
+    attention_mask = torch.ones(
+        inputs_embeds.shape[:2],
+        dtype=torch.long,
+        device=model_device,
+    )
+    with torch.no_grad():
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+
+    answer_start = prefix.shape[1]
+    per_token_nll: list[torch.Tensor] = []
+    for offset, token_id in enumerate(answer_token_ids):
+        prediction_position = answer_start + offset - 1
+        target = torch.tensor([token_id], dtype=torch.long, device=model_device)
+        logits = outputs.logits[:, prediction_position, :].float()
+        per_token_nll.append(F.cross_entropy(logits, target, reduction="mean"))
 
     mean_nll = float(torch.stack(per_token_nll).mean().detach().cpu().item())
     return {
