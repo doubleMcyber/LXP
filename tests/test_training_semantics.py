@@ -11,6 +11,7 @@ from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
     _compute_latent_answer_loss,
+    _compute_latent_candidate_contrast_loss,
     _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
@@ -154,6 +155,31 @@ def test_latent_answer_loss_backprops_to_prefix() -> None:
     assert sample_count == 2
     assert average_tokens > 0
     answer_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_candidate_contrast_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    contrast_loss, sample_count, accuracy = _compute_latent_candidate_contrast_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        candidate_answers=("13", "42", "5"),
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        temperature=1.0,
+    )
+
+    assert contrast_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    contrast_loss.backward()
     assert latent_prefix.grad is not None
     assert torch.isfinite(latent_prefix.grad).all()
 

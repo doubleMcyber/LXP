@@ -1579,6 +1579,12 @@ def build_training_smoke_report(
         "final_heldout_candidate_fallback_rate_percentage": final_eval.get(
             "heldout_candidate_fallback_rate_percentage"
         ),
+        "final_heldout_latent_candidate_accuracy": final_eval.get(
+            "heldout_latent_candidate_accuracy"
+        ),
+        "final_heldout_latent_candidate_unique_predicted_answer_count": final_eval.get(
+            "heldout_latent_candidate_unique_predicted_answer_count"
+        ),
         "final_heldout_extraction_failure_count": final_eval.get(
             "heldout_extraction_failure_count"
         ),

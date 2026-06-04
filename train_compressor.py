@@ -54,6 +54,8 @@ class CompressionTrainConfig:
     actor_max_length: int = 128
     lambda_plan: float = 0.25
     lambda_contrast: float = 0.1
+    lambda_answer_contrast: float = 0.0
+    answer_contrast_temperature: float = 1.0
     contrast_temperature: float = 0.1
     curriculum_enabled: bool = True
     curriculum_stages: tuple[str, ...] = ("identity", "orthogonal", "hybrid_affine")
@@ -110,6 +112,8 @@ class CompressionTrainConfig:
             actor_max_length=int(getattr(t, "actor_max_length", 128)),
             lambda_plan=float(getattr(t, "lambda_plan", 0.25)),
             lambda_contrast=float(getattr(t, "lambda_contrast", 0.1)),
+            lambda_answer_contrast=float(getattr(t, "lambda_answer_contrast", 0.0)),
+            answer_contrast_temperature=float(getattr(t, "answer_contrast_temperature", 1.0)),
             contrast_temperature=float(getattr(t, "contrast_temperature", 0.1)),
             curriculum_enabled=bool(getattr(curriculum_cfg, "enabled", True)) if curriculum_cfg else True,
             curriculum_stages=tuple(
@@ -276,6 +280,48 @@ def _extract_prompt_batch(
     ]
 
 
+def _normalized_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    compact = "".join(str(value).strip().casefold().split())
+    return compact or None
+
+
+def _extract_candidate_answers(
+    batch: dict[str, Any],
+    *,
+    answers: Sequence[str | None],
+) -> tuple[str, ...]:
+    raw_candidates = batch.get("answer_candidates")
+    candidates: list[str] = []
+    if raw_candidates is None:
+        raw_candidates = answers
+    if isinstance(raw_candidates, str):
+        raw_candidates = [raw_candidates]
+    for item in raw_candidates:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            iterable = item
+        else:
+            iterable = [item]
+        for candidate in iterable:
+            if candidate is None:
+                continue
+            candidate_text = str(candidate).strip()
+            if candidate_text:
+                candidates.append(candidate_text)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for candidate in candidates:
+        normalized = _normalized_text(candidate)
+        if normalized is None or normalized in seen:
+            continue
+        unique.append(candidate)
+        seen.add(normalized)
+    return tuple(unique)
+
+
 def _encode_token_ids(tokenizer: Any, text: str, *, max_length: int | None = None) -> list[int]:
     if hasattr(tokenizer, "encode"):
         try:
@@ -423,6 +469,140 @@ def _compute_latent_answer_loss(
     answer_loss = (token_losses * weights).sum() / weights.sum().clamp_min(1.0)
     average_answer_tokens = sum(len(token_ids) for token_ids in encoded_answers) / len(encoded_answers)
     return answer_loss, len(encoded_answers), float(average_answer_tokens)
+
+
+def _compute_latent_candidate_contrast_loss(
+    *,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    candidate_answers: Sequence[str],
+    suffix_text: str,
+    max_answer_length: int,
+    temperature: float,
+) -> tuple[torch.Tensor | None, int, float]:
+    if len(candidate_answers) < 2:
+        return None, 0, 0.0
+
+    candidate_norms = [_normalized_text(candidate) for candidate in candidate_answers]
+    valid_rows: list[int] = []
+    target_indices: list[int] = []
+    for row_index, answer in enumerate(answers):
+        target_norm = _normalized_text(answer)
+        if target_norm is None:
+            continue
+        try:
+            target_index = candidate_norms.index(target_norm)
+        except ValueError:
+            continue
+        valid_rows.append(row_index)
+        target_indices.append(target_index)
+    if not valid_rows:
+        return None, 0, 0.0
+
+    actor_device = _model_device(actor_model)
+    embedding = actor_model.get_input_embeddings()
+    row_index_tensor = torch.tensor(valid_rows, dtype=torch.long, device=latent_prefix.device)
+    selected_prefix = latent_prefix.index_select(0, row_index_tensor)
+    pair_prefix = selected_prefix.repeat_interleave(len(candidate_answers), dim=0).to(
+        device=actor_device,
+        dtype=embedding.weight.dtype,
+    )
+    pair_answers = [
+        candidate
+        for _ in valid_rows
+        for candidate in candidate_answers
+    ]
+    encoded_pair_answers: list[list[int]] = []
+    for answer in pair_answers:
+        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
+        if continuation is None:
+            encoded_pair_answers.append([])
+            continue
+        encoded_pair_answers.append(
+            _encode_token_ids(
+                actor_tokenizer,
+                continuation,
+                max_length=max(1, int(max_answer_length)),
+            )
+        )
+    if any(not token_ids for token_ids in encoded_pair_answers):
+        return None, 0, 0.0
+
+    suffix_ids = _encode_token_ids(actor_tokenizer, suffix_text)
+    suffix_width = len(suffix_ids)
+    answer_width = max(len(token_ids) for token_ids in encoded_pair_answers)
+    pad_token_id = int(
+        getattr(
+            actor_tokenizer,
+            "pad_token_id",
+            getattr(actor_tokenizer, "eos_token_id", 0) or 0,
+        )
+        or 0
+    )
+    suffix_tensor = torch.tensor(
+        suffix_ids,
+        dtype=torch.long,
+        device=actor_device,
+    ).unsqueeze(0).expand(pair_prefix.shape[0], suffix_width)
+    answer_tensor = torch.full(
+        (pair_prefix.shape[0], answer_width),
+        pad_token_id,
+        dtype=torch.long,
+        device=actor_device,
+    )
+    answer_mask = torch.zeros(
+        (pair_prefix.shape[0], answer_width),
+        dtype=torch.long,
+        device=actor_device,
+    )
+    for pair_index, token_ids in enumerate(encoded_pair_answers):
+        answer_tensor[pair_index, : len(token_ids)] = torch.tensor(
+            token_ids,
+            dtype=torch.long,
+            device=actor_device,
+        )
+        answer_mask[pair_index, : len(token_ids)] = 1
+
+    suffix_embeds = embedding(suffix_tensor) if suffix_width else pair_prefix[:, :0, :]
+    answer_embeds = embedding(answer_tensor)
+    inputs_embeds = torch.cat([pair_prefix, suffix_embeds, answer_embeds], dim=1)
+    attention_mask = torch.cat(
+        [
+            torch.ones(pair_prefix.shape[:2], dtype=torch.long, device=actor_device),
+            torch.ones((pair_prefix.shape[0], suffix_width), dtype=torch.long, device=actor_device),
+            answer_mask,
+        ],
+        dim=1,
+    )
+    outputs = actor_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    answer_start = pair_prefix.shape[1] + suffix_width
+    pair_nlls: list[torch.Tensor] = []
+    for pair_index, token_ids in enumerate(encoded_pair_answers):
+        width = len(token_ids)
+        prediction_positions = torch.arange(
+            answer_start - 1,
+            answer_start + width - 1,
+            dtype=torch.long,
+            device=actor_device,
+        )
+        logits = outputs.logits[pair_index].index_select(0, prediction_positions).float()
+        targets = answer_tensor[pair_index, :width]
+        pair_nlls.append(F.cross_entropy(logits, targets, reduction="mean"))
+    nll_matrix = torch.stack(pair_nlls).reshape(len(valid_rows), len(candidate_answers))
+    score_matrix = -nll_matrix / max(float(temperature), 1.0e-6)
+    target_tensor = torch.tensor(target_indices, dtype=torch.long, device=actor_device)
+    contrast_loss = F.cross_entropy(score_matrix, target_tensor)
+    predictions = score_matrix.argmax(dim=-1)
+    accuracy = float((predictions == target_tensor).float().mean().detach().cpu().item() * 100.0)
+    return contrast_loss, len(valid_rows), accuracy
 
 
 def _ensure_padding_token(tokenizer: Any) -> None:
@@ -791,6 +971,7 @@ def train_reasoner_stage2(
             "l_plan": config.lambda_plan,
             "l_contrast": config.lambda_contrast,
             "l_answer": config.lambda_answer,
+            "l_answer_contrast": config.lambda_answer_contrast,
         },
         config=AdaptiveLossBalancerConfig(
             enabled=config.adaptive_loss_enabled,
@@ -851,6 +1032,7 @@ def train_reasoner_stage2(
             texts = _extract_text_batch(batch)
             reasoner_texts = _extract_prompt_batch(batch, fallback_texts=texts)
             answers = _extract_answer_batch(batch, expected_count=len(texts))
+            candidate_answers = _extract_candidate_answers(batch, answers=answers)
             reasoner_batch = _tokenize_text_batch(
                 reasoner_tokenizer,
                 reasoner_texts,
@@ -955,6 +1137,18 @@ def train_reasoner_stage2(
                 max_answer_length=config.answer_max_length,
                 first_token_weight=config.answer_first_token_weight,
             )
+            answer_contrast_loss, answer_contrast_sample_count, answer_contrast_accuracy = (
+                _compute_latent_candidate_contrast_loss(
+                    actor_model=actor_model,
+                    actor_tokenizer=actor_tokenizer,
+                    latent_prefix=compressed_latents_aligned,
+                    answers=answers,
+                    candidate_answers=candidate_answers,
+                    suffix_text=config.answer_suffix_text,
+                    max_answer_length=config.answer_max_length,
+                    temperature=config.answer_contrast_temperature,
+                )
+            )
             loss_terms = {
                 "l_task": loss_outputs["l_task"],
                 "l_pref": loss_outputs["l_pref"],
@@ -964,6 +1158,8 @@ def train_reasoner_stage2(
             }
             if answer_loss is not None:
                 loss_terms["l_answer"] = answer_loss.to(reasoner_device)
+            if answer_contrast_loss is not None:
+                loss_terms["l_answer_contrast"] = answer_contrast_loss.to(reasoner_device)
             total_loss, effective_weights = loss_balancer.combine(loss_terms)
 
             optimizer.zero_grad(set_to_none=True)
@@ -990,14 +1186,21 @@ def train_reasoner_stage2(
                 "l_plan": float(l_plan.detach().cpu().item()),
                 "l_contrast": float(l_contrast.detach().cpu().item()),
                 "l_answer": 0.0 if answer_loss is None else float(answer_loss.detach().cpu().item()),
+                "l_answer_contrast": 0.0
+                if answer_contrast_loss is None
+                else float(answer_contrast_loss.detach().cpu().item()),
                 "answer_loss_sample_count": float(answer_loss_sample_count),
                 "answer_loss_token_count_mean": float(answer_token_count_mean),
+                "answer_contrast_sample_count": float(answer_contrast_sample_count),
+                "answer_contrast_accuracy": float(answer_contrast_accuracy),
+                "answer_candidate_count": float(len(candidate_answers)),
                 "effective_weight_task": effective_weights["l_task"],
                 "effective_weight_pref": effective_weights["l_pref"],
                 "effective_weight_geom": effective_weights["l_geom"],
                 "effective_weight_plan": effective_weights["l_plan"],
                 "effective_weight_contrast": effective_weights["l_contrast"],
                 "effective_weight_answer": effective_weights.get("l_answer", 0.0),
+                "effective_weight_answer_contrast": effective_weights.get("l_answer_contrast", 0.0),
                 "reasoner_grad_norm": reasoner_grad_norm,
                 "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
                 "hidden_processor_grad_norm": hidden_processor_grad_norm,
@@ -1050,14 +1253,19 @@ def train_reasoner_stage2(
                         "l_plan": metrics["l_plan"],
                         "l_contrast": metrics["l_contrast"],
                         "l_answer": metrics["l_answer"],
+                        "l_answer_contrast": metrics["l_answer_contrast"],
                         "answer_loss_sample_count": metrics["answer_loss_sample_count"],
                         "answer_loss_token_count_mean": metrics["answer_loss_token_count_mean"],
+                        "answer_contrast_sample_count": metrics["answer_contrast_sample_count"],
+                        "answer_contrast_accuracy": metrics["answer_contrast_accuracy"],
+                        "answer_candidate_count": metrics["answer_candidate_count"],
                         "effective_weight_task": metrics["effective_weight_task"],
                         "effective_weight_pref": metrics["effective_weight_pref"],
                         "effective_weight_geom": metrics["effective_weight_geom"],
                         "effective_weight_plan": metrics["effective_weight_plan"],
                         "effective_weight_contrast": metrics["effective_weight_contrast"],
                         "effective_weight_answer": metrics["effective_weight_answer"],
+                        "effective_weight_answer_contrast": metrics["effective_weight_answer_contrast"],
                         "reasoner_grad_norm": metrics["reasoner_grad_norm"],
                         "handoff_adapter_grad_norm": metrics["handoff_adapter_grad_norm"],
                         "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],

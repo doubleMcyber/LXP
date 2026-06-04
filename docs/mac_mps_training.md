@@ -80,6 +80,10 @@ Interpretation:
 - The Stage-II loop includes a latent-prefix answer loss (`l_answer`) so the
   optimized task matches evaluation: latent prefix plus `Final answer:` should
   make the frozen actor assign high likelihood to the target answer.
+- The overfit readiness path also enables `l_answer_contrast`, which ranks the
+  target answer against smoke answer candidates by NLL. This isolates whether
+  the latent prefix contains enough answer information even when greedy decode
+  is still brittle.
 - Structured training rows feed prompt-only text to the reasoner; answers are
   used as targets, not as reasoner input.
 - `initial_eval_diagnostics` records the latent path before training. Compare it

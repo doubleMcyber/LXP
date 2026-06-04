@@ -151,4 +151,6 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
     assert "training.evaluation.baseline_few_shot_examples=4" in command
     assert "training.train_reasoner=false" in command
     assert "training.lambda_answer=20.0" in command
+    assert "training.lambda_answer_contrast=20.0" in command
+    assert "training.answer_contrast_temperature=0.5" in command
     assert "training.adaptive_loss.enabled=false" in command

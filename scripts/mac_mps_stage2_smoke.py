@@ -40,6 +40,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 "training.adaptive_loss.enabled=false",
                 "training.learning_rate=1.0e-4",
                 "training.lambda_answer=20.0",
+                "training.lambda_answer_contrast=20.0",
+                "training.answer_contrast_temperature=0.5",
                 "training.lambda_task=0.1",
                 "training.lambda_pref=0.1",
                 "training.lambda_geom=0.1",
@@ -83,6 +85,9 @@ def _print_report_summary(report_path: Path) -> None:
             ),
             "candidate_fallback_rate": smoke_report.get(
                 "final_heldout_candidate_fallback_rate_percentage"
+            ),
+            "latent_candidate_accuracy": smoke_report.get(
+                "final_heldout_latent_candidate_accuracy"
             ),
             "unique_predicted_answer_count": smoke_report.get(
                 "final_heldout_unique_predicted_answer_count"

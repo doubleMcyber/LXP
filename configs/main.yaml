@@ -148,6 +148,8 @@ training:
   lambda_plan: 0.25
   lambda_contrast: 0.1
   lambda_answer: 4.0
+  lambda_answer_contrast: 0.0
+  answer_contrast_temperature: 1.0
   answer_suffix_text: "\nFinal answer:"
   answer_max_length: 32
   answer_first_token_weight: 2.0

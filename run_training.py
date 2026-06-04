@@ -190,19 +190,28 @@ def _collate_training_batch(batch: list[Any]) -> dict[str, list[str | None]]:
     texts: list[str] = []
     prompts: list[str | None] = []
     answers: list[str | None] = []
+    answer_candidates: list[list[str]] = []
     for item in batch:
         if isinstance(item, dict):
             prompt = item.get("prompt")
             answer = item.get("answer")
             text = item.get("supervision_text") or item.get("text") or prompt
+            candidates = item.get("answer_candidates") or ()
             texts.append(str(text))
             prompts.append(None if prompt is None else str(prompt))
             answers.append(None if answer is None else str(answer))
+            answer_candidates.append([str(candidate) for candidate in candidates if candidate is not None])
             continue
         texts.append(str(item))
         prompts.append(None)
         answers.append(None)
-    return {"texts": texts, "prompts": prompts, "answers": answers}
+        answer_candidates.append([])
+    return {
+        "texts": texts,
+        "prompts": prompts,
+        "answers": answers,
+        "answer_candidates": answer_candidates,
+    }
 
 
 def _build_text_dataloader(
@@ -219,14 +228,16 @@ def _build_text_dataloader(
     )
 
 
-def _smoke_training_examples(num_samples: int) -> list[dict[str, str]]:
+def _smoke_training_examples(num_samples: int) -> list[dict[str, Any]]:
     examples = []
+    candidate_answers = list(dict.fromkeys(example["answer"] for example in _SMOKE_TRAIN_EXAMPLES))
     for index in range(num_samples):
         example = _SMOKE_TRAIN_EXAMPLES[index % len(_SMOKE_TRAIN_EXAMPLES)]
         examples.append(
             {
                 "prompt": example["prompt"],
                 "answer": example["answer"],
+                "answer_candidates": candidate_answers,
                 "supervision_text": f"Question: {example['prompt']}\nAnswer: {example['answer']}",
             }
         )
@@ -544,12 +555,14 @@ def _build_evaluation_callback(
         extracted_answer_count = 0
         candidate_fallback_count = 0
         extraction_failure_count = 0
+        latent_candidate_correct_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
         baseline_candidate_correct_count = 0
         total_answer_tokens = 0
         total_answer_nll = 0.0
         predicted_answers: list[str | None] = []
+        latent_candidate_predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
         baseline_candidate_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
@@ -655,17 +668,23 @@ def _build_evaluation_callback(
                 decoded_text,
                 target_answer,
             )
-            extraction_source = "decode"
-            if predicted_answer is not None and str(predicted_answer).strip():
-                decode_extracted_answer_count += 1
-                extracted_answer_count += 1
-            elif candidate_answers:
-                predicted_answer, _ = _select_candidate_answer_by_nll(
+            latent_candidate_predicted_answer = None
+            if candidate_answers:
+                latent_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
                     prefix_state=answer_prefix_state,
                     candidate_answers=candidate_answers,
                 )
+                latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
+                if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
+                    latent_candidate_correct_count += 1
+            extraction_source = "decode"
+            if predicted_answer is not None and str(predicted_answer).strip():
+                decode_extracted_answer_count += 1
+                extracted_answer_count += 1
+            elif candidate_answers:
+                predicted_answer = latent_candidate_predicted_answer
                 if predicted_answer is not None:
                     extraction_source = "candidate_nll"
                     candidate_fallback_count += 1
@@ -687,6 +706,7 @@ def _build_evaluation_callback(
                         (
                             f"target={target_answer}",
                             f"predicted={predicted_answer}",
+                            f"candidate_predicted={latent_candidate_predicted_answer}",
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
@@ -710,6 +730,16 @@ def _build_evaluation_callback(
             ),
             "heldout_candidate_fallback_rate_percentage": (
                 100.0 * candidate_fallback_count / len(eval_examples)
+            ),
+            "heldout_latent_candidate_accuracy": (
+                100.0 * latent_candidate_correct_count / len(eval_examples)
+                if candidate_answers
+                else None
+            ),
+            "heldout_latent_candidate_unique_predicted_answer_count": (
+                float(_unique_normalized_answer_count(latent_candidate_predicted_answers))
+                if candidate_answers
+                else None
             ),
             "heldout_extraction_failure_count": float(extraction_failure_count),
             "heldout_unique_predicted_answer_count": float(
@@ -883,6 +913,8 @@ def main() -> None:
                 f"loss={entry['loss']:.4f} l_task={entry['l_task']:.4f} "
                 f"l_pref={entry['l_pref']:.4f} l_geom={entry['l_geom']:.4f} "
                 f"l_answer={entry.get('l_answer', 0.0):.4f} "
+                f"l_answer_contrast={entry.get('l_answer_contrast', 0.0):.4f} "
+                f"answer_contrast_accuracy={entry.get('answer_contrast_accuracy', 0.0):.2f} "
                 f"adapter_grad={entry.get('handoff_adapter_grad_norm', 0.0):.4f} "
                 f"adapter_update={entry.get('handoff_adapter_update_norm', 0.0):.6f} "
             )
