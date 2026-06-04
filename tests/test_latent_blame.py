@@ -7,6 +7,7 @@ from src.utils.latent_blame import (
     LatentRunRecord,
     RunOutcome,
     apply_packet_intervention,
+    build_latent_provenance_report,
     generate_blame_report,
     rank_packet_blame,
     record_latent_packet,
@@ -109,3 +110,54 @@ def test_replacement_intervention_requires_compatible_tensor_shape() -> None:
             intervention="replace",
             replacement_packet=incompatible,
         )
+
+
+def test_static_latent_provenance_classifies_verified_answer_gap() -> None:
+    rows = [
+        {
+            "method": "sender_answer_text_handoff",
+            "sample_index": 11,
+            "target_answer": "300",
+            "predicted_answer": "300",
+            "correct": True,
+            "decoded_text": "Final answer: 300",
+        },
+        {
+            "method": "generated_context_latent_handoff",
+            "sample_index": 11,
+            "target_answer": "300",
+            "predicted_answer": "175",
+            "sender_predicted_answer": "300",
+            "sender_answer_matches_target": True,
+            "sender_initial_predicted_answer": "175",
+            "sender_revision_predicted_answer": "300",
+            "sender_revision_decision_predicted_answer": "300",
+            "decoded_text": "Final answer: 175",
+            "correct": False,
+            "sender_trace_cache_hit": True,
+            "sender_trace_cache_path": ".cache/generated_trajectory_traces/trace.pt",
+            "handoff_adapter_status": "generated_trajectory_loaded_raw",
+            "handoff_adapter_cache_path": ".cache/generated_trajectory_adapter/adapter.pt",
+            "handoff_adapter_training_row_cache_path": ".cache/generated_trajectory_rows/rows.pt",
+            "receiver_context_latent_position": "after_context",
+            "post_alignment_cosine_distance": 0.11,
+            "embedding_manifold_applied": True,
+            "generated_adapter_local_residual_applied": True,
+        },
+    ]
+
+    report = build_latent_provenance_report(
+        rows,
+        baseline_methods=("sender_answer_text_handoff",),
+        latent_methods=("generated_context_latent_handoff",),
+    )
+
+    assert report["method_accuracy_percentage"]["sender_answer_text_handoff"] == 100.0
+    assert report["method_accuracy_percentage"]["generated_context_latent_handoff"] == 0.0
+    assert report["failure_counts_by_class"] == {
+        "latent_receiver_gap_verified_answer_available": 1
+    }
+    wrong_row = report["wrong_latent_rows"][0]
+    assert wrong_row["sample_index"] == 11
+    assert wrong_row["baseline_comparisons"][0]["predicted_answer"] == "300"
+    assert report["cache_paths"]["adapter"] == [".cache/generated_trajectory_adapter/adapter.pt"]

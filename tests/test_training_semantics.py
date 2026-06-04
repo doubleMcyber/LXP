@@ -7,8 +7,16 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from latent_pipeline import _build_alignment_cache_key
+from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead
 from train_compressor import (
     CompressionTrainConfig,
+    _coerce_history_value,
+    _compute_latent_answer_loss,
+    _compute_latent_answer_probe_loss,
+    _compute_latent_candidate_contrast_loss,
+    _compute_latent_first_token_loss,
+    _compute_latent_logit_steering_loss,
+    _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
     train_reasoner_stage2,
@@ -32,6 +40,10 @@ class _TinyTokenizer:
             ((sum(ord(char) for char in piece) + self.offset) % (self.vocab_size - 2)) + 2
             for piece in pieces
         ]
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return self._encode_text(text)
 
     def __call__(
         self,
@@ -120,6 +132,185 @@ def _make_tiny_models(hidden_dim: int = 16, vocab_size: int = 128, with_layers: 
     return TinyModel(), TinyModel()
 
 
+def test_training_history_preserves_diagnostic_metrics() -> None:
+    assert _coerce_history_value("target=13 | predicted=13") == "target=13 | predicted=13"
+    assert _coerce_history_value(torch.tensor(2.5)) == 2.5
+    assert _coerce_history_value(torch.tensor([1.0, 2.0])) == "[1.0, 2.0]"
+    assert _numeric_metrics({"loss": 1.0, "diagnostics": "x", "flag": True}) == {"loss": 1.0}
+
+
+def test_latent_answer_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    answer_loss, sample_count, average_tokens = _compute_latent_answer_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        first_token_weight=2.0,
+    )
+
+    assert answer_loss is not None
+    assert sample_count == 2
+    assert average_tokens > 0
+    answer_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_candidate_contrast_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    contrast_loss, sample_count, accuracy = _compute_latent_candidate_contrast_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        candidate_answers=("13", "42", "5"),
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        temperature=1.0,
+    )
+
+    assert contrast_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    contrast_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_first_token_loss_backprops_to_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    first_token_loss, sample_count, accuracy, rank_mean, margin_mean = _compute_latent_first_token_loss(
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        suffix_text="\nFinal answer:",
+        max_answer_length=8,
+        margin=2.0,
+    )
+
+    assert first_token_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    assert rank_mean >= 1.0
+    assert isinstance(margin_mean, float)
+    first_token_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_logit_steering_head_is_token_tied_and_trainable() -> None:
+    steering = LatentLogitSteeringHead(16, rank=4, pooling="mean_last")
+    low_rank_steering = LatentLogitSteeringHead(
+        16,
+        rank=4,
+        vocabulary_size=32,
+        vocabulary_mode="low_rank",
+        pooling="mean",
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+    vocabulary_weight = torch.randn(32, 16)
+
+    logits_bias = steering(latent_prefix, vocabulary_weight)
+    low_rank_logits_bias = low_rank_steering(latent_prefix, vocabulary_weight)
+    loss = logits_bias[:, 3].sum()
+    loss.backward()
+
+    assert logits_bias.shape == (2, 32)
+    assert low_rank_logits_bias.shape == (2, 32)
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in steering.parameters()
+        if parameter.grad is not None
+    )
+    assert grad_norm > 0.0
+
+
+def test_latent_logit_steering_loss_backprops_to_head_and_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    steering = LatentLogitSteeringHead(
+        16,
+        rank=4,
+        vocabulary_size=128,
+        vocabulary_mode="low_rank",
+        pooling="mean",
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    steering_loss, sample_count, accuracy, rank_mean, margin_mean, bias_norm = (
+        _compute_latent_logit_steering_loss(
+            latent_logit_steering=steering,
+            actor_model=actor,
+            actor_tokenizer=_TinyTokenizer(),
+            latent_prefix=latent_prefix,
+            answers=["13", "42"],
+            suffix_text="\nFinal answer: ",
+            max_answer_length=8,
+            margin=2.0,
+        )
+    )
+
+    assert steering_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    assert rank_mean >= 1.0
+    assert isinstance(margin_mean, float)
+    assert bias_norm >= 0.0
+    steering_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in steering.parameters()
+        if parameter.grad is not None
+    )
+    assert grad_norm > 0.0
+
+
+def test_latent_answer_probe_loss_backprops_to_probe_and_prefix() -> None:
+    probe = LatentAnswerProbe(16, max_candidates=4, hidden_multiplier=1)
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    probe_loss, sample_count, accuracy = _compute_latent_answer_probe_loss(
+        latent_answer_probe=probe,
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        candidate_answers=("13", "42", "5"),
+    )
+
+    assert probe_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    probe_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    probe_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in probe.parameters()
+        if parameter.grad is not None
+    )
+    assert probe_grad_norm > 0.0
+
+
 def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:
     texts = ["alpha beta", "gamma delta"]
     dataloader = DataLoader(
@@ -194,6 +385,124 @@ def test_train_reasoner_stage2_uses_actor_tokenizer_for_actor_labels() -> None:
 
     assert torch.equal(_CapturingLoss.captured_actor_labels.cpu(), expected_actor_labels)
     assert not torch.equal(expected_actor_labels, reasoner_labels)
+
+
+def test_train_reasoner_stage2_uses_prompt_only_reasoner_inputs() -> None:
+    supervision_texts = ["Question: What is 2 + 2?\nAnswer: 4"]
+    prompts = ["What is 2 + 2?"]
+    dataloader = DataLoader(
+        [
+            {
+                "text": supervision_texts[0],
+                "prompt": prompts[0],
+                "answer": "4",
+            }
+        ],
+        batch_size=1,
+        collate_fn=lambda batch: {
+            "texts": [item["text"] for item in batch],
+            "prompts": [item["prompt"] for item in batch],
+            "answers": [item["answer"] for item in batch],
+        },
+    )
+    reasoner, actor = _make_tiny_models()
+    config = CompressionTrainConfig(
+        compressed_steps=4,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        num_epochs=1,
+        wandb_enabled=False,
+        checkpoint_enabled=False,
+        reasoner_max_length=16,
+        actor_max_length=16,
+    )
+    original_tokenize = _tokenize_text_batch
+    tokenized_text_calls: list[list[str]] = []
+
+    def recording_tokenize(tokenizer, texts, *, device, max_length):
+        tokenized_text_calls.append(list(texts))
+        return original_tokenize(tokenizer, texts, device=device, max_length=max_length)
+
+    with patch("train_compressor._tokenize_text_batch", recording_tokenize):
+        train_reasoner_stage2(
+            reasoner,
+            actor,
+            dataloader,
+            config,
+            reasoner_tokenizer=_TinyTokenizer(offset=0),
+            actor_tokenizer=_TinyTokenizer(offset=23),
+        )
+
+    assert tokenized_text_calls[0] == prompts
+    assert tokenized_text_calls[1] == supervision_texts
+
+
+def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
+    dataloader = DataLoader(
+        [
+            {
+                "text": "Question: What is 2 + 2?\nAnswer: 4",
+                "prompt": "What is 2 + 2?",
+                "answer": "4",
+                "answer_candidates": ["4", "5"],
+            }
+        ],
+        batch_size=1,
+        collate_fn=lambda batch: {
+            "texts": [item["text"] for item in batch],
+            "prompts": [item["prompt"] for item in batch],
+            "answers": [item["answer"] for item in batch],
+            "answer_candidates": [item["answer_candidates"] for item in batch],
+        },
+    )
+    reasoner, actor = _make_tiny_models()
+    config = CompressionTrainConfig(
+        compressed_steps=4,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        num_epochs=1,
+        lambda_answer=20.0,
+        lambda_logit_steering=20.0,
+        lambda_answer_probe=20.0,
+        lambda_task=0.1,
+        lambda_pref=0.1,
+        lambda_geom=0.1,
+        lambda_plan=0.0,
+        lambda_contrast=0.0,
+        adaptive_loss_enabled=False,
+        train_reasoner=False,
+        latent_answer_probe_enabled=True,
+        latent_answer_probe_max_candidates=8,
+        latent_logit_steering_enabled=True,
+        latent_logit_steering_rank=4,
+        latent_logit_steering_vocabulary_mode="low_rank",
+        latent_soft_prompt_decoder_enabled=True,
+        latent_soft_prompt_decoder_output_steps=4,
+        wandb_enabled=False,
+        checkpoint_enabled=False,
+        reasoner_max_length=16,
+        actor_max_length=16,
+    )
+
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        dataloader,
+        config,
+        reasoner_tokenizer=_TinyTokenizer(offset=0),
+        actor_tokenizer=_TinyTokenizer(offset=23),
+    )
+
+    train_row = next(entry for entry in history if "loss" in entry)
+    assert train_row["trainable_reasoner_parameter_count"] == 0.0
+    assert train_row["trainable_handoff_adapter_parameter_count"] > 0.0
+    assert train_row["handoff_adapter_grad_norm"] > 0.0
+    assert train_row["trainable_latent_answer_probe_parameter_count"] > 0.0
+    assert train_row["latent_answer_probe_grad_norm"] > 0.0
+    assert train_row["trainable_latent_soft_prompt_decoder_parameter_count"] > 0.0
+    assert train_row["latent_soft_prompt_decoder_grad_norm"] > 0.0
+    assert train_row["trainable_latent_logit_steering_parameter_count"] > 0.0
+    assert train_row["latent_logit_steering_grad_norm"] > 0.0
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:

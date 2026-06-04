@@ -8,6 +8,13 @@ simulated_continuous_steps: 50
 device_map: "auto"
 torch_dtype: "bfloat16"
 
+runtime:
+  device: "auto"  # auto, mps, cuda, cpu
+  mps:
+    enabled: true
+    fallback_to_cpu: true
+    torch_dtype: "float32"
+
 datasets:
   gsm8k:
     validation_size: 256
@@ -19,7 +26,9 @@ benchmark:
   text_hybrid_reasoning_max_new_tokens: 64
   sender_revision:
     enabled: false
-    max_new_tokens: 256
+    max_new_tokens: 512
+    disagreement_verifier_enabled: true
+    disagreement_verifier_max_new_tokens: 512
   latent_steps_sweep: [1, 2, 4, 8, 16, 32, 64]
   q_generalization:
     heldout_anchor_ratio: 0.2
@@ -138,6 +147,18 @@ training:
   lambda_geom: 1.0
   lambda_plan: 0.25
   lambda_contrast: 0.1
+  lambda_answer: 4.0
+  lambda_answer_first_token: 0.0
+  lambda_logit_steering: 0.0
+  lambda_answer_contrast: 0.0
+  lambda_answer_probe: 0.0
+  answer_contrast_temperature: 1.0
+  answer_suffix_text: "\nFinal answer: "
+  answer_max_length: 32
+  answer_first_token_weight: 2.0
+  answer_first_token_margin: 2.0
+  logit_steering_margin: 2.0
+  train_reasoner: true
   contrast_temperature: 0.1
   eps: 1.0e-8
   curriculum:
@@ -153,6 +174,35 @@ training:
     enabled: true
     strength: 0.15
     clip_std_multiplier: 4.0
+  latent_handoff_adapter:
+    enabled: true
+    rank: 64
+    scale: 1.0
+    dropout: 0.0
+  latent_answer_probe:
+    enabled: false
+    max_candidates: 64
+    hidden_multiplier: 2
+    dropout: 0.0
+  latent_soft_prompt_decoder:
+    enabled: false
+    output_steps: 0
+    num_heads: 4
+    hidden_multiplier: 2
+    dropout: 0.0
+    residual_scale: 1.0
+    max_delta_norm: 0.0
+  latent_logit_steering:
+    enabled: false
+    rank: 64
+    vocabulary_mode: tied
+    lr_multiplier: 1.0
+    output_steps: 1
+    dropout: 0.0
+    scale: 1.0
+    generation_scale: 1.0
+    pooling: attention
+    max_bias_norm: 0.0
   hidden_state_processor:
     enabled: false
     num_heads: 4
@@ -169,6 +219,9 @@ training:
     max_new_tokens: 16
     baseline_accuracy_percentage: null
     seed_count: 1
+    evaluate_before_training: true
+    baseline_few_shot_examples: 6
+    smoke_eval_set: heldout
   checkpointing:
     enabled: true
     dir: "checkpoints"

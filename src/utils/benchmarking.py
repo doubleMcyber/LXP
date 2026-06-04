@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 18
+REPORT_SCHEMA_VERSION = 19
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -55,6 +56,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "sender_revision_applied",
     "sender_initial_predicted_answer",
     "sender_revision_predicted_answer",
+    "sender_revision_decision_applied",
+    "sender_revision_decision_predicted_answer",
     "sender_final_answer_marker",
     "sender_predicted_answer",
     "sender_answer_matches_target",
@@ -80,10 +83,12 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "handoff_adapter_delta_norm",
     "handoff_adapter_cache_hit",
     "handoff_adapter_cache_path",
+    "handoff_adapter_cache_key_digest",
     "handoff_adapter_training_prompt_count",
     "handoff_adapter_training_token_count",
     "handoff_adapter_training_row_cache_hit",
     "handoff_adapter_training_row_cache_path",
+    "handoff_adapter_training_rows_cache_key_digest",
     "handoff_adapter_training_trace_cache_hit_count",
     "handoff_adapter_training_trace_cache_miss_count",
     "handoff_adapter_training_trace_cache_hit_rate_percentage",
@@ -146,6 +151,7 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "sender_final_answer_marker_rate_percentage",
     "sender_trace_cache_hit_rate_percentage",
     "sender_revision_applied_rate_percentage",
+    "sender_revision_decision_applied_rate_percentage",
     "sender_accuracy_percentage",
     "sender_correct_sample_count",
     "accuracy_when_sender_correct_percentage",
@@ -361,6 +367,15 @@ def aggregate_standard_rows(
         sender_revision_values = [
             value for value in sender_revision_rows if value is not None
         ]
+        sender_revision_decision_rows = [
+            _optional_bool_value(row.get("sender_revision_decision_applied"))
+            for row in group_rows
+            if row.get("sender_revision_decision_applied") is not None
+            and row.get("sender_revision_decision_applied") != ""
+        ]
+        sender_revision_decision_values = [
+            value for value in sender_revision_decision_rows if value is not None
+        ]
         sender_correct_values = [
             value
             for value in (
@@ -486,6 +501,10 @@ def aggregate_standard_rows(
                 "sender_revision_applied_rate_percentage": _percentage(
                     sum(sender_revision_values),
                     len(sender_revision_values),
+                ),
+                "sender_revision_decision_applied_rate_percentage": _percentage(
+                    sum(sender_revision_decision_values),
+                    len(sender_revision_decision_values),
                 ),
                 "sender_accuracy_percentage": _percentage(
                     sum(sender_correct_values),
@@ -1357,8 +1376,10 @@ def build_training_phase2_report(
     required_seed_count: int,
     min_accuracy_retention_ratio: float,
     baseline_accuracy_percentage: Optional[float] = None,
+    runtime_metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     heldout_entries = [entry for entry in history if "heldout_exact_match_accuracy" in entry]
+    final_heldout_entry = heldout_entries[-1] if heldout_entries else {}
     final_heldout_accuracy = None if not heldout_entries else float(heldout_entries[-1]["heldout_exact_match_accuracy"])
     final_heldout_answer_perplexity = (
         None if not heldout_entries else heldout_entries[-1].get("heldout_answer_perplexity")
@@ -1382,7 +1403,7 @@ def build_training_phase2_report(
             f"is below required {min_accuracy_retention_ratio:.4f}."
         )
 
-    return {
+    report = {
         "evaluation_surface": "run_training",
         "method": "stage2_compression_training",
         "phase": "phase_2",
@@ -1400,6 +1421,18 @@ def build_training_phase2_report(
         "baseline_accuracy_percentage": baseline_accuracy_percentage,
         "final_heldout_exact_match_accuracy": final_heldout_accuracy,
         "final_heldout_answer_perplexity": final_heldout_answer_perplexity,
+        "final_heldout_latent_candidate_accuracy": final_heldout_entry.get(
+            "heldout_latent_candidate_accuracy"
+        ),
+        "final_heldout_latent_probe_accuracy": final_heldout_entry.get(
+            "heldout_latent_probe_accuracy"
+        ),
+        "final_heldout_latent_first_token_accuracy": final_heldout_entry.get(
+            "heldout_latent_first_token_accuracy"
+        ),
+        "final_heldout_latent_first_token_rank_mean": final_heldout_entry.get(
+            "heldout_latent_first_token_rank_mean"
+        ),
         "accuracy_retention_ratio": accuracy_retention_ratio,
         "alignment_mode": alignment_context.get("alignment_mode"),
         "semantic_anchor_count": alignment_context.get("semantic_anchor_count"),
@@ -1407,6 +1440,207 @@ def build_training_phase2_report(
             alignment_context.get("reasoning_layer_weights")
         ),
         "model_pair": f"{_cfg_value(cfg, 'agent_a_model', '')} -> {_cfg_value(cfg, 'agent_b_model', '')}",
+        "missing_requirements": missing_requirements,
+    }
+    if runtime_metadata is not None:
+        report["runtime"] = dict(runtime_metadata)
+        if runtime_metadata.get("effective_torch_dtype"):
+            report["effective_torch_dtype"] = str(runtime_metadata["effective_torch_dtype"])
+        if runtime_metadata.get("effective_device"):
+            report["effective_device"] = str(runtime_metadata["effective_device"])
+    return report
+
+
+_TRAINING_DIAGNOSTIC_PREDICTED_REGEX = re.compile(r"(?:^|\|\s*)predicted=([^|]+)")
+
+
+def _unique_training_prediction_count(
+    final_eval: Mapping[str, Any],
+    *,
+    eval_samples: int,
+) -> int | None:
+    unique_prediction_raw = final_eval.get("heldout_unique_predicted_answer_count")
+    if unique_prediction_raw is not None and unique_prediction_raw != "":
+        return int(float(unique_prediction_raw))
+
+    diagnostics = str(final_eval.get("heldout_eval_diagnostics") or "")
+    predicted_answers: list[str] = []
+    for line in diagnostics.splitlines():
+        match = _TRAINING_DIAGNOSTIC_PREDICTED_REGEX.search(line)
+        if match is None:
+            continue
+        predicted = match.group(1).strip().casefold().replace(" ", "")
+        if predicted and predicted != "none":
+            predicted_answers.append(predicted)
+    if eval_samples > 0 and len(predicted_answers) >= eval_samples:
+        return len(set(predicted_answers))
+    return None
+
+
+def build_training_smoke_report(
+    history: Sequence[dict[str, Any]],
+    *,
+    min_eval_samples: int = 1,
+    max_loss: float = 1000.0,
+    max_answer_perplexity: float = 10000.0,
+    min_answer_extraction_rate_percentage: float = 100.0,
+) -> dict[str, Any]:
+    loss_entries = [entry for entry in history if "loss" in entry]
+    heldout_entries = [entry for entry in history if "heldout_eval_samples" in entry]
+    initial_eval = heldout_entries[0] if len(heldout_entries) > 1 else {}
+    final_eval = heldout_entries[-1] if heldout_entries else {}
+    losses = [float(entry["loss"]) for entry in loss_entries if entry.get("loss") is not None]
+    finite_losses = [value for value in losses if math.isfinite(value)]
+    final_perplexity_raw = final_eval.get("heldout_answer_perplexity")
+    final_perplexity = (
+        None if final_perplexity_raw is None else float(final_perplexity_raw)
+    )
+    final_extraction_rate_raw = final_eval.get("heldout_answer_extraction_rate_percentage")
+    final_extraction_rate = (
+        None if final_extraction_rate_raw is None else float(final_extraction_rate_raw)
+    )
+    final_accuracy_raw = final_eval.get("heldout_exact_match_accuracy")
+    final_accuracy = None if final_accuracy_raw is None else float(final_accuracy_raw)
+    eval_samples = int(float(final_eval.get("heldout_eval_samples", 0) or 0))
+    unique_prediction_count = _unique_training_prediction_count(
+        final_eval,
+        eval_samples=eval_samples,
+    )
+    actor_baseline_accuracy_raw = final_eval.get("heldout_actor_text_baseline_accuracy")
+    actor_baseline_accuracy = (
+        None if actor_baseline_accuracy_raw is None else float(actor_baseline_accuracy_raw)
+    )
+    actor_baseline_unique_raw = final_eval.get(
+        "heldout_actor_text_baseline_unique_predicted_answer_count"
+    )
+    actor_baseline_unique_count = (
+        None if actor_baseline_unique_raw is None else int(float(actor_baseline_unique_raw))
+    )
+    latent_probe_accuracy_raw = final_eval.get("heldout_latent_probe_accuracy")
+    latent_probe_accuracy = (
+        None if latent_probe_accuracy_raw is None else float(latent_probe_accuracy_raw)
+    )
+    latent_probe_unique_raw = final_eval.get("heldout_latent_probe_unique_predicted_answer_count")
+    latent_probe_unique_count = (
+        None if latent_probe_unique_raw is None else int(float(latent_probe_unique_raw))
+    )
+
+    missing_requirements: list[str] = []
+    if not loss_entries:
+        missing_requirements.append("No training loss entries were logged.")
+    if len(finite_losses) != len(losses):
+        missing_requirements.append("At least one logged training loss is non-finite.")
+    if finite_losses and max(finite_losses) > max_loss:
+        missing_requirements.append(
+            f"Maximum training loss {max(finite_losses):.4f} exceeds smoke limit {max_loss:.4f}."
+        )
+    if not heldout_entries:
+        missing_requirements.append("No heldout evaluation entry was logged.")
+    if eval_samples < min_eval_samples:
+        missing_requirements.append(
+            f"Heldout eval samples {eval_samples} is below required {min_eval_samples}."
+        )
+    if final_perplexity is None or not math.isfinite(final_perplexity):
+        missing_requirements.append("Final heldout answer perplexity is missing or non-finite.")
+    elif final_perplexity > max_answer_perplexity:
+        missing_requirements.append(
+            f"Final heldout answer perplexity {final_perplexity:.4f} exceeds smoke limit "
+            f"{max_answer_perplexity:.4f}."
+        )
+    if final_extraction_rate is None or not math.isfinite(final_extraction_rate):
+        missing_requirements.append("Final heldout answer extraction rate is missing or non-finite.")
+    elif final_extraction_rate < min_answer_extraction_rate_percentage:
+        missing_requirements.append(
+            f"Answer extraction rate {final_extraction_rate:.2f}% is below required "
+            f"{min_answer_extraction_rate_percentage:.2f}%."
+        )
+    degenerate_prediction = (
+        eval_samples > 1
+        and unique_prediction_count is not None
+        and unique_prediction_count <= 1
+        and final_accuracy is not None
+        and final_accuracy < 100.0
+    )
+    if degenerate_prediction:
+        missing_requirements.append(
+            "Heldout predictions are degenerate: one unique predicted answer was emitted "
+            f"across {eval_samples} samples while exact-match accuracy was {final_accuracy:.2f}%."
+        )
+    actor_text_baseline_degenerate = (
+        eval_samples > 1
+        and actor_baseline_unique_count is not None
+        and actor_baseline_unique_count <= 1
+        and actor_baseline_accuracy is not None
+        and actor_baseline_accuracy < 100.0
+    )
+    if actor_text_baseline_degenerate:
+        missing_requirements.append(
+            "Actor text baseline is degenerate: one unique predicted answer was emitted "
+            f"across {eval_samples} samples while baseline accuracy was "
+            f"{actor_baseline_accuracy:.2f}%."
+        )
+
+    return {
+        "phase": "training_smoke",
+        "passed": not missing_requirements,
+        "loss_entry_count": len(loss_entries),
+        "max_loss": None if not finite_losses else max(finite_losses),
+        "initial_heldout_exact_match_accuracy": initial_eval.get(
+            "heldout_exact_match_accuracy"
+        ),
+        "initial_heldout_unique_predicted_answer_count": initial_eval.get(
+            "heldout_unique_predicted_answer_count"
+        ),
+        "initial_heldout_eval_diagnostics": initial_eval.get("heldout_eval_diagnostics"),
+        "final_heldout_exact_match_accuracy": final_accuracy,
+        "final_heldout_answer_extraction_rate_percentage": final_extraction_rate,
+        "final_heldout_decode_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_candidate_fallback_rate_percentage": final_eval.get(
+            "heldout_candidate_fallback_rate_percentage"
+        ),
+        "final_heldout_latent_candidate_accuracy": final_eval.get(
+            "heldout_latent_candidate_accuracy"
+        ),
+        "final_heldout_latent_candidate_unique_predicted_answer_count": final_eval.get(
+            "heldout_latent_candidate_unique_predicted_answer_count"
+        ),
+        "final_heldout_latent_probe_accuracy": latent_probe_accuracy,
+        "final_heldout_latent_probe_unique_predicted_answer_count": latent_probe_unique_count,
+        "final_heldout_latent_first_token_accuracy": final_eval.get(
+            "heldout_latent_first_token_accuracy"
+        ),
+        "final_heldout_latent_first_token_rank_mean": final_eval.get(
+            "heldout_latent_first_token_rank_mean"
+        ),
+        "latent_probe_ready": (
+            latent_probe_accuracy is not None
+            and latent_probe_accuracy >= 100.0
+            and latent_probe_unique_count is not None
+            and latent_probe_unique_count > 1
+        ),
+        "final_heldout_extraction_failure_count": final_eval.get(
+            "heldout_extraction_failure_count"
+        ),
+        "final_heldout_unique_predicted_answer_count": unique_prediction_count,
+        "final_heldout_degenerate_prediction": degenerate_prediction,
+        "final_heldout_actor_text_baseline_accuracy": actor_baseline_accuracy,
+        "final_heldout_actor_text_baseline_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_actor_text_baseline_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_actor_text_baseline_unique_predicted_answer_count": actor_baseline_unique_count,
+        "final_heldout_actor_text_baseline_degenerate_prediction": actor_text_baseline_degenerate,
+        "final_heldout_actor_text_baseline_candidate_accuracy": final_eval.get(
+            "heldout_actor_text_baseline_candidate_accuracy"
+        ),
+        "final_heldout_actor_text_baseline_candidate_unique_predicted_answer_count": final_eval.get(
+            "heldout_actor_text_baseline_candidate_unique_predicted_answer_count"
+        ),
+        "latent_training_ready": not missing_requirements,
+        "final_heldout_answer_perplexity": final_perplexity,
+        "heldout_eval_diagnostics": final_eval.get("heldout_eval_diagnostics"),
+        "heldout_eval_samples": eval_samples,
         "missing_requirements": missing_requirements,
     }
 

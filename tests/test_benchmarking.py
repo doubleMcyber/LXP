@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from omegaconf import OmegaConf
 import pytest
 import torch
@@ -15,19 +17,31 @@ from benchmark_all import (
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
     _build_generated_adapter_local_residual_state,
+    _build_eval_manifest,
     _answers_match,
+    _cache_key_digest,
     _cache_key_metadata,
+    _final_answer_tail_needs_scalar_verification,
+    _format_sender_answer_text_handoff_prompt,
+    _format_token_context_handoff_prompt,
+    _format_verified_token_context_handoff_prompt,
+    _format_verified_final_answer_text,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
+    _generated_trajectory_adapter_target_text,
+    _generated_trajectory_adapter_trace_cache_path,
     _generated_trajectory_adapter_training_rows_cache_key,
     _generated_trajectory_trace_cache_key,
     _generated_adapter_include_prompt_values,
     _handoff_decode_prompt,
     _load_generated_trajectory_training_rows_from_disk,
     _load_generated_trajectory_trace_from_disk,
+    _load_eval_manifest,
+    _load_generated_trajectory_adapter_from_disk,
     _methods_for_suite,
     _predicted_answer,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
+    _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
 )
@@ -41,6 +55,7 @@ from src.utils.benchmarking import (
     build_semantic_smoke_report,
     build_standard_row_base,
     build_training_phase2_report,
+    build_training_smoke_report,
 )
 
 
@@ -138,6 +153,8 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "sender_revision_applied": True,
             "sender_initial_predicted_answer": "0",
             "sender_revision_predicted_answer": "1",
+            "sender_revision_decision_applied": True,
+            "sender_revision_decision_predicted_answer": "1",
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "1",
             "sender_answer_matches_target": True,
@@ -186,6 +203,8 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "sender_revision_applied": False,
             "sender_initial_predicted_answer": "2",
             "sender_revision_predicted_answer": None,
+            "sender_revision_decision_applied": False,
+            "sender_revision_decision_predicted_answer": None,
             "sender_final_answer_marker": True,
             "sender_predicted_answer": "2",
             "sender_answer_matches_target": True,
@@ -224,6 +243,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
     assert summary["sender_final_answer_marker_rate_percentage"] == 100.0
     assert summary["sender_trace_cache_hit_rate_percentage"] == 50.0
     assert summary["sender_revision_applied_rate_percentage"] == 50.0
+    assert summary["sender_revision_decision_applied_rate_percentage"] == 50.0
     assert summary["sender_accuracy_percentage"] == 100.0
     assert summary["sender_correct_sample_count"] == 2
     assert summary["accuracy_when_sender_correct_percentage"] == 50.0
@@ -630,6 +650,91 @@ def test_gsm8k_prediction_uses_latest_final_answer_marker() -> None:
     assert _predicted_answer("gsm8k", decoded) == "107"
 
 
+def test_gsm8k_prediction_prefers_complete_boxed_final_answer() -> None:
+    decoded = (
+        "Final answer: \\boxed{28}\n\n"
+        "```\nFinal answer: \\boxed{28}\n```\n\n"
+        "```\nFinal answer: \\boxed{2"
+    )
+
+    assert _predicted_answer("gsm8k", decoded) == "28"
+
+
+def test_final_answer_tail_flags_non_scalar_sender_answers() -> None:
+    assert _final_answer_tail_needs_scalar_verification("Final answer: 10 boys") is True
+    assert _final_answer_tail_needs_scalar_verification("Final answer: 17.") is False
+
+
+def test_verified_final_answer_payload_stays_compact() -> None:
+    assert _format_verified_final_answer_text("300") == (
+        "\n\nVerification decision:\nFinal answer: 300.\n"
+    )
+
+
+def test_sender_answer_text_handoff_prompt_is_copy_only() -> None:
+    prompt = _format_sender_answer_text_handoff_prompt("300")
+
+    assert "Verified upstream final answer" in prompt
+    assert "300" in prompt
+    assert prompt.rstrip().endswith("Final answer:")
+    assert "original problem" not in prompt.casefold()
+
+
+def test_token_context_handoff_prompt_uses_sender_reasoning() -> None:
+    prompt = _format_token_context_handoff_prompt(
+        "What is 2 + 2?",
+        "Final answer: 4.",
+    )
+
+    assert "What is 2 + 2?" in prompt
+    assert "Transferred token context from Agent A" in prompt
+    assert "Final answer: 4." in prompt
+
+
+def test_verified_token_context_handoff_prompt_prioritizes_verified_answer() -> None:
+    prompt = _format_verified_token_context_handoff_prompt(
+        "4",
+        "Reasoning was noisy. Final answer: 5.",
+    )
+
+    assert "Verified upstream final answer" in prompt
+    assert "4" in prompt
+    assert "Transferred token context from Agent A" in prompt
+    assert "Final answer: 5." in prompt
+    assert "authoritative" in prompt
+    assert prompt.rstrip().endswith("Final answer:")
+
+
+def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
+    manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="gsm8k",
+        dataset_split="validation",
+        limit=3,
+        sample_indices=[9, 11, 19],
+        methods=("sender_answer_text_handoff", "generated_context_latent_handoff"),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=7,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+    )
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = _load_eval_manifest(path)
+
+    assert loaded["manifest_digest"] == manifest["manifest_digest"]
+    assert loaded["sample_indices"] == [9, 11, 19]
+
+    tampered = dict(manifest)
+    tampered["sample_indices"] = [9, 11, 18]
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        _load_eval_manifest(path)
+
+
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
     assert _answers_match("gsm8k", "252.00", "252")
     assert _answers_match("gsm8k", "9,800.0", "9800")
@@ -641,6 +746,8 @@ def test_final_answer_stop_regex_waits_for_numeric_delimiter() -> None:
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 9800 ") is not None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: 2.") is not None
     assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: **252**") is not None
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: \\boxed{28}") is not None
+    assert FINAL_ANSWER_COMPLETE_REGEX.search("Final answer: \\boxed{2") is None
 
 
 def test_generated_trajectory_adapter_input_space_is_validated() -> None:
@@ -668,6 +775,93 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
     cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
     with pytest.raises(ValueError, match="generated_text"):
         _generated_trajectory_adapter_target_alignment(cfg)
+
+
+def test_generated_trajectory_final_answer_target_uses_latest_marker() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "target_mode": "final_answer_line",
+                },
+            },
+        }
+    )
+    generated_text = (
+        "Initial attempt.\nFinal answer: 175.\n\n"
+        "Verification decision:\nFinal answer: 300.\n"
+    )
+
+    assert _generated_trajectory_adapter_target_text(cfg, generated_text) == (
+        "Final answer: 300"
+    )
+
+
+def test_text_hybrid_reuses_generated_sender_trace_cache(tmp_path) -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "agent-a",
+            "agent_b_model": "agent-b",
+            "torch_dtype": "bfloat16",
+            "max_new_tokens": 64,
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 64,
+                "sender_revision": {
+                    "enabled": True,
+                    "max_new_tokens": 512,
+                    "disagreement_verifier_enabled": True,
+                    "disagreement_verifier_max_new_tokens": 512,
+                },
+            },
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "trace_cache_enabled": True,
+                    "trace_cache_dir": str(tmp_path),
+                },
+            },
+        }
+    )
+    state = {
+        "global_reasoning_layer_indices": (1, 2),
+        "global_reasoning_layer_weights": (0.4, 0.6),
+    }
+    prompt = "What is 40 + 2?"
+    cache_key = _generated_trajectory_trace_cache_key(
+        cfg,
+        state,
+        prompt,
+        include_prompt=False,
+    )
+    cache_path = _generated_trajectory_adapter_trace_cache_path(cfg, cache_key)
+    torch.save(
+        {
+            "trace_cache_format_version": 2,
+            "cache_key": _cache_key_metadata(cache_key),
+            "consensus_hidden_states": torch.zeros(1, 1, 2),
+            "generated_token_ids": [4, 2],
+            "generated_reasoning_text": "Final answer: 42.",
+            "generated_reasoning_token_count": 2,
+            "generated_reasoning_status": "complete",
+            "generated_reasoning_final_answer_marker": True,
+            "generated_latent_includes_prompt": False,
+            "sender_revision_enabled": True,
+            "sender_revision_applied": True,
+            "sender_initial_predicted_answer": "41",
+            "sender_revision_predicted_answer": "42",
+            "sender_revision_decision_applied": True,
+            "sender_revision_decision_predicted_answer": "42",
+        },
+        cache_path,
+    )
+
+    metadata = _reasoner_metadata_for_text_hybrid(prompt, cfg, state)
+
+    assert metadata["token_ids"] == [4, 2]
+    assert metadata["reasoning_text"] == "Final answer: 42."
+    assert metadata["trace_cache_hit"] is True
+    assert metadata["trace_cache_path"] == str(cache_path)
+    assert metadata["sender_revision_decision_predicted_answer"] == "42"
 
 
 def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() -> None:
@@ -719,7 +913,19 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
         state,
         include_prompt=False,
     ) != first_key
+    revision_key = _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    )
+    cfg.benchmark.sender_revision.disagreement_verifier_enabled = False
+    assert _generated_trajectory_adapter_training_rows_cache_key(
+        cfg,
+        state,
+        include_prompt=False,
+    ) != revision_key
     cfg.benchmark.sender_revision.enabled = False
+    cfg.benchmark.sender_revision.disagreement_verifier_enabled = True
 
     cfg.handoff.generated_trajectory_adapter.strategy = "ridge"
     cfg.handoff.generated_trajectory_adapter.local_residual.enabled = True
@@ -740,23 +946,79 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
 
 def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) -> None:
     cache_path = tmp_path / "rows.pt"
+    expected_key = ("rows", "expected")
     torch.save(
         {
             "source_matrix": torch.zeros(2, 3),
             "target_matrix": torch.ones(2, 4),
             "training_prompt_count": 1,
             "training_token_count": 2,
+            "training_rows_cache_key_digest": _cache_key_digest(expected_key),
         },
         cache_path,
     )
 
-    loaded = _load_generated_trajectory_training_rows_from_disk(cache_path)
+    loaded = _load_generated_trajectory_training_rows_from_disk(
+        cache_path,
+        expected_cache_key=expected_key,
+    )
 
     assert loaded is not None
     assert loaded["source_matrix"].shape == (2, 3)
 
+    torch.save(
+        {
+            "source_matrix": torch.zeros(2, 3),
+            "target_matrix": torch.ones(2, 4),
+            "training_rows_cache_key_digest": _cache_key_digest(("rows", "other")),
+        },
+        cache_path,
+    )
+    assert (
+        _load_generated_trajectory_training_rows_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is None
+    )
+
     torch.save({"source_matrix": torch.zeros(2, 3), "target_matrix": torch.ones(3, 4)}, cache_path)
     assert _load_generated_trajectory_training_rows_from_disk(cache_path) is None
+
+
+def test_load_generated_trajectory_adapter_rejects_digest_mismatch(tmp_path) -> None:
+    cache_path = tmp_path / "adapter.pt"
+    expected_key = ("adapter", "expected")
+    torch.save(
+        {
+            "mapping_matrix": torch.eye(2),
+            "adapter_cache_key_digest": _cache_key_digest(("adapter", "other")),
+        },
+        cache_path,
+    )
+
+    assert (
+        _load_generated_trajectory_adapter_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is None
+    )
+
+    torch.save(
+        {
+            "mapping_matrix": torch.eye(2),
+            "adapter_cache_key_digest": _cache_key_digest(expected_key),
+        },
+        cache_path,
+    )
+    assert (
+        _load_generated_trajectory_adapter_from_disk(
+            cache_path,
+            expected_cache_key=expected_key,
+        )
+        is not None
+    )
 
 
 def test_generated_trajectory_trace_cache_key_tracks_prompt_and_sender_setup() -> None:
@@ -1123,11 +1385,153 @@ def test_build_training_phase2_report_flags_missing_real_mode_requirements() -> 
         required_seed_count=3,
         min_accuracy_retention_ratio=0.85,
         baseline_accuracy_percentage=None,
+        runtime_metadata={
+            "effective_device": "mps",
+            "effective_torch_dtype": "float32",
+        },
     )
 
     assert report["passed"] is False
     assert report["final_heldout_exact_match_accuracy"] == 60.0
+    assert report["effective_device"] == "mps"
+    assert report["effective_torch_dtype"] == "float32"
     assert "Training mode is not 'real'." in report["missing_requirements"]
+
+
+def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_decode_answer_extraction_rate_percentage": 33.333,
+                "heldout_candidate_fallback_rate_percentage": 66.667,
+                "heldout_extraction_failure_count": 0.0,
+                "heldout_eval_diagnostics": "target=13 | predicted=13 | source=candidate_nll",
+                "heldout_answer_perplexity": 250.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is True
+    assert report["final_heldout_exact_match_accuracy"] == 0.0
+    assert report["final_heldout_answer_extraction_rate_percentage"] == 100.0
+    assert report["final_heldout_decode_answer_extraction_rate_percentage"] == 33.333
+    assert report["final_heldout_candidate_fallback_rate_percentage"] == 66.667
+    assert report["final_heldout_extraction_failure_count"] == 0.0
+    assert "source=candidate_nll" in report["heldout_eval_diagnostics"]
+
+
+def test_build_training_smoke_report_flags_nonfinite_loss() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": float("nan")},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 1.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert any("non-finite" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_flags_low_extraction_rate() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_answer_extraction_rate_percentage": 33.333,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert any("Answer extraction rate" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_flags_degenerate_predictions() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 1.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["final_heldout_degenerate_prediction"] is True
+    assert any("degenerate" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_detects_degenerate_predictions_from_diagnostics() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 0.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+                "heldout_eval_diagnostics": "\n".join(
+                    [
+                        "target=13 | predicted=100000000000000 | source=decode",
+                        "target=42 | predicted=100000000000000 | source=decode",
+                        "target=3x^2 | predicted=100000000000000 | source=decode",
+                    ]
+                ),
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["final_heldout_unique_predicted_answer_count"] == 1
+    assert report["final_heldout_degenerate_prediction"] is True
+
+
+def test_build_training_smoke_report_flags_degenerate_actor_text_baseline() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 100.0,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 3.0,
+                "heldout_actor_text_baseline_accuracy": 0.0,
+                "heldout_actor_text_baseline_unique_predicted_answer_count": 1.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["latent_training_ready"] is False
+    assert report["final_heldout_actor_text_baseline_degenerate_prediction"] is True
+    assert any("Actor text baseline is degenerate" in item for item in report["missing_requirements"])
 
 
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
@@ -1137,10 +1541,16 @@ def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     assert phase1_methods == [
         "pure_text_cot",
         "text_text_hybrid",
+        "token_context_handoff",
+        "verified_token_context_handoff",
+        "sender_answer_text_handoff",
         "homogeneous_ridge_latent",
         "homogeneous_orthogonal_latent",
     ]
     assert "text_text_hybrid" in standard_methods
+    assert "token_context_handoff" in standard_methods
+    assert "verified_token_context_handoff" in standard_methods
+    assert "sender_answer_text_handoff" in standard_methods
     assert "global_anchor_orthogonal" in standard_methods
     assert "global_anchor_ridge" in standard_methods
     assert "global_anchor_hybrid_affine" in standard_methods

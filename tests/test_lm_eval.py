@@ -3,8 +3,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from torch import nn
 
-from src.utils.lm_eval import compute_answer_metrics_from_prefix
+from src.utils.lm_eval import (
+    compute_answer_metrics_from_prefix,
+    compute_answer_metrics_from_prefix_embeddings,
+    compute_first_token_metrics_from_prefix_embeddings,
+    generate_from_prefix_embeddings,
+    generate_from_text_prefix,
+)
 
 
 class _SingleTokenTokenizer:
@@ -29,6 +36,55 @@ class _StaticLogitModel:
         return SimpleNamespace(logits=self.logits.clone(), past_key_values=None)
 
 
+class _EmbeddingTokenizer(_SingleTokenTokenizer):
+    pad_token_id = 0
+    eos_token_id = 3
+
+    def __call__(self, text: str, **kwargs):
+        del kwargs
+        return {
+            "input_ids": torch.tensor([self.encode(text)], dtype=torch.long),
+            "attention_mask": torch.ones(1, 1, dtype=torch.long),
+        }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        del skip_special_tokens
+        values = [int(token_id) for token_id in token_ids]
+        if values == [1]:
+            return "1"
+        if values == [2]:
+            return "Final answer: 1"
+        return " ".join(str(value) for value in values)
+
+
+class _EmbeddingLogitModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(4, 3)
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def forward(self, **kwargs):
+        inputs_embeds = kwargs["inputs_embeds"]
+        logits = torch.full((inputs_embeds.shape[0], inputs_embeds.shape[1], 4), -10.0)
+        logits[:, :, 2] = 10.0
+        return SimpleNamespace(logits=logits)
+
+    def generate(self, **kwargs):
+        if "input_ids" in kwargs:
+            return torch.cat(
+                [kwargs["input_ids"], torch.tensor([[2]], dtype=torch.long)],
+                dim=1,
+            )
+        batch_size = int(kwargs["inputs_embeds"].shape[0])
+        scores = torch.full((batch_size, 4), -10.0)
+        scores[:, 2] = 10.0
+        for processor in kwargs.get("logits_processor", []):
+            scores = processor(torch.zeros((batch_size, 0), dtype=torch.long), scores)
+        return scores.argmax(dim=-1, keepdim=True)
+
+
 def test_answer_metrics_can_score_final_answer_line_variants() -> None:
     model = _StaticLogitModel()
     prefix_state = {
@@ -47,3 +103,89 @@ def test_answer_metrics_can_score_final_answer_line_variants() -> None:
 
     assert metrics["answer_token_count"] == 1
     assert metrics["answer_nll"] < 1e-3
+
+
+def test_embedding_answer_metrics_can_score_final_answer_line_variants() -> None:
+    model = _EmbeddingLogitModel()
+    prefix_embeds = torch.zeros(1, 1, 3)
+
+    metrics = compute_answer_metrics_from_prefix_embeddings(
+        model=model,
+        tokenizer=_SingleTokenTokenizer(),
+        prefix_embeds=prefix_embeds,
+        answer_text="1",
+        answer_variants=("Final answer: 1",),
+    )
+
+    assert metrics["answer_token_count"] == 1
+    assert metrics["answer_nll"] < 1e-3
+
+
+def test_embedding_first_token_metrics_report_rank_and_top1() -> None:
+    model = _EmbeddingLogitModel()
+
+    metrics = compute_first_token_metrics_from_prefix_embeddings(
+        model=model,
+        tokenizer=_SingleTokenTokenizer(),
+        prefix_embeds=torch.zeros(1, 1, 3),
+        answer_text="1",
+        answer_variants=("Final answer: 1",),
+    )
+
+    assert metrics["first_token_rank"] == 1
+    assert metrics["first_token_top1"] is True
+    assert metrics["first_token_predicted_id"] == 2
+
+
+def test_native_generate_helpers_decode_text_and_embedding_prefixes() -> None:
+    model = _EmbeddingLogitModel()
+    tokenizer = _EmbeddingTokenizer()
+
+    text_metrics = generate_from_text_prefix(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_text="1",
+        max_new_tokens=1,
+    )
+    embedding_metrics = generate_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        max_new_tokens=1,
+    )
+
+    assert text_metrics["decoded_text"] == "Final answer: 1"
+    assert embedding_metrics["decoded_text"] == "Final answer: 1"
+
+
+def test_embedding_generation_and_first_token_metrics_apply_first_step_bias() -> None:
+    model = _EmbeddingLogitModel()
+    tokenizer = _EmbeddingTokenizer()
+    logits_bias = torch.tensor([[0.0, 30.0, 0.0, 0.0]])
+
+    embedding_metrics = generate_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        max_new_tokens=1,
+        first_step_logits_bias=logits_bias,
+    )
+    first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        answer_text="1",
+        first_step_logits_bias=logits_bias,
+    )
+    answer_metrics = compute_answer_metrics_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        answer_text="1",
+        first_step_logits_bias=logits_bias,
+    )
+
+    assert embedding_metrics["decoded_text"] == "1"
+    assert first_token_metrics["first_token_top1"] is True
+    assert first_token_metrics["first_token_predicted_id"] == 1
+    assert answer_metrics["answer_nll"] < 1e-3
