@@ -284,6 +284,57 @@ def test_train_reasoner_stage2_uses_prompt_only_reasoner_inputs() -> None:
     assert tokenized_text_calls[1] == supervision_texts
 
 
+def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
+    dataloader = DataLoader(
+        [
+            {
+                "text": "Question: What is 2 + 2?\nAnswer: 4",
+                "prompt": "What is 2 + 2?",
+                "answer": "4",
+            }
+        ],
+        batch_size=1,
+        collate_fn=lambda batch: {
+            "texts": [item["text"] for item in batch],
+            "prompts": [item["prompt"] for item in batch],
+            "answers": [item["answer"] for item in batch],
+        },
+    )
+    reasoner, actor = _make_tiny_models()
+    config = CompressionTrainConfig(
+        compressed_steps=4,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        num_epochs=1,
+        lambda_answer=20.0,
+        lambda_task=0.1,
+        lambda_pref=0.1,
+        lambda_geom=0.1,
+        lambda_plan=0.0,
+        lambda_contrast=0.0,
+        adaptive_loss_enabled=False,
+        train_reasoner=False,
+        wandb_enabled=False,
+        checkpoint_enabled=False,
+        reasoner_max_length=16,
+        actor_max_length=16,
+    )
+
+    history = train_reasoner_stage2(
+        reasoner,
+        actor,
+        dataloader,
+        config,
+        reasoner_tokenizer=_TinyTokenizer(offset=0),
+        actor_tokenizer=_TinyTokenizer(offset=23),
+    )
+
+    train_row = next(entry for entry in history if "loss" in entry)
+    assert train_row["trainable_reasoner_parameter_count"] == 0.0
+    assert train_row["trainable_handoff_adapter_parameter_count"] > 0.0
+    assert train_row["handoff_adapter_grad_norm"] > 0.0
+
+
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:
     cfg = OmegaConf.create(
         {

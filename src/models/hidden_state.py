@@ -80,6 +80,33 @@ class HiddenStateProcessor(nn.Module):
         return hidden_states + self.mlp(hidden_states)
 
 
+class LatentHandoffAdapter(nn.Module):
+    """Identity-initialized residual adapter for Stage-II latent prefixes."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        rank: int = 64,
+        scale: float = 1.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        adapter_rank = max(1, min(int(rank), int(hidden_size)))
+        self.scale = float(scale)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.down = nn.Linear(hidden_size, adapter_rank, bias=False)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(float(dropout))
+        self.up = nn.Linear(adapter_rank, hidden_size, bias=False)
+        nn.init.normal_(self.down.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = self.up(self.dropout(self.activation(self.down(self.norm(hidden_states)))))
+        return hidden_states + (self.scale * residual.to(dtype=hidden_states.dtype))
+
+
 def build_plan_summary(hidden_states: torch.Tensor) -> torch.Tensor:
     start = hidden_states[:, :1, :]
     middle = hidden_states.mean(dim=1, keepdim=True)

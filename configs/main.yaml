@@ -151,6 +151,7 @@ training:
   answer_suffix_text: "\nFinal answer:"
   answer_max_length: 32
   answer_first_token_weight: 2.0
+  train_reasoner: true
   contrast_temperature: 0.1
   eps: 1.0e-8
   curriculum:
@@ -166,6 +167,11 @@ training:
     enabled: true
     strength: 0.15
     clip_std_multiplier: 4.0
+  latent_handoff_adapter:
+    enabled: true
+    rank: 64
+    scale: 1.0
+    dropout: 0.0
   hidden_state_processor:
     enabled: false
     num_heads: 4

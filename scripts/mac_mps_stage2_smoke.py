@@ -33,7 +33,22 @@ def build_command(args: argparse.Namespace) -> list[str]:
         f"reporting.training.report_output={output_dir / 'mac_mps_training_report.json'}",
     ]
     if args.eval_on_train:
-        command.append("training.evaluation.smoke_eval_set=train_overfit")
+        command.extend(
+            [
+                "training.evaluation.smoke_eval_set=train_overfit",
+                "training.curriculum.enabled=false",
+                "training.adaptive_loss.enabled=false",
+                "training.learning_rate=1.0e-4",
+                "training.lambda_answer=20.0",
+                "training.lambda_task=0.1",
+                "training.lambda_pref=0.1",
+                "training.lambda_geom=0.1",
+                "training.lambda_plan=0.0",
+                "training.lambda_contrast=0.0",
+                "training.train_reasoner=false",
+                "training.latent_handoff_adapter.enabled=true",
+            ]
+        )
     return command
 
 

@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from transformers import AutoModelForCausalLM
 
-from src.models.hidden_state import AdaptiveProjection, CurriculumStage, HiddenStateProcessor
+from src.models.hidden_state import AdaptiveProjection, CurriculumStage, HiddenStateProcessor, LatentHandoffAdapter
 from src.models.losses import (
     AdaptiveLossBalancer,
     AdaptiveLossBalancerConfig,
@@ -43,6 +43,7 @@ class CompressionTrainConfig:
     answer_max_length: int = 32
     answer_first_token_weight: float = 2.0
     evaluate_before_training: bool = False
+    train_reasoner: bool = True
     wandb_enabled: bool = True
     wandb_project: str = "lxp-stage2"
     wandb_entity: Optional[str] = None
@@ -64,6 +65,10 @@ class CompressionTrainConfig:
     adaptive_projection_enabled: bool = True
     adaptive_projection_strength: float = 0.15
     adaptive_projection_clip_std_multiplier: float = 4.0
+    latent_handoff_adapter_enabled: bool = True
+    latent_handoff_adapter_rank: int = 64
+    latent_handoff_adapter_scale: float = 1.0
+    latent_handoff_adapter_dropout: float = 0.0
     hidden_state_processor_enabled: bool = False
     hidden_state_processor_num_heads: int = 4
     hidden_state_processor_dropout: float = 0.0
@@ -75,6 +80,7 @@ class CompressionTrainConfig:
         curriculum_cfg = getattr(t, "curriculum", None)
         adaptive_loss_cfg = getattr(t, "adaptive_loss", None)
         projection_cfg = getattr(t, "adaptive_projection", None)
+        handoff_adapter_cfg = getattr(t, "latent_handoff_adapter", None)
         processor_cfg = getattr(t, "hidden_state_processor", None)
         return cls(
             compressed_steps=t.compressed_steps,
@@ -93,6 +99,7 @@ class CompressionTrainConfig:
             evaluate_before_training=bool(
                 getattr(getattr(t, "evaluation", None), "evaluate_before_training", False)
             ),
+            train_reasoner=bool(getattr(t, "train_reasoner", True)),
             wandb_enabled=bool(wandb_cfg.enabled) if wandb_cfg else False,
             wandb_project=str(wandb_cfg.project) if wandb_cfg else "lxp-stage2",
             wandb_entity=str(wandb_cfg.entity) if wandb_cfg and wandb_cfg.entity else None,
@@ -120,6 +127,18 @@ class CompressionTrainConfig:
             adaptive_projection_clip_std_multiplier=float(
                 getattr(projection_cfg, "clip_std_multiplier", 4.0)
             ) if projection_cfg else 4.0,
+            latent_handoff_adapter_enabled=bool(
+                getattr(handoff_adapter_cfg, "enabled", True)
+            ) if handoff_adapter_cfg else True,
+            latent_handoff_adapter_rank=int(
+                getattr(handoff_adapter_cfg, "rank", 64)
+            ) if handoff_adapter_cfg else 64,
+            latent_handoff_adapter_scale=float(
+                getattr(handoff_adapter_cfg, "scale", 1.0)
+            ) if handoff_adapter_cfg else 1.0,
+            latent_handoff_adapter_dropout=float(
+                getattr(handoff_adapter_cfg, "dropout", 0.0)
+            ) if handoff_adapter_cfg else 0.0,
             hidden_state_processor_enabled=bool(getattr(processor_cfg, "enabled", False)) if processor_cfg else False,
             hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
             hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
@@ -143,6 +162,47 @@ def _numeric_metrics(metrics: dict[str, Any]) -> dict[str, float]:
         key: float(value)
         for key, value in metrics.items()
         if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+
+
+def _parameter_count(module: Optional[nn.Module]) -> int:
+    if module is None:
+        return 0
+    return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+
+def _gradient_norm(module: Optional[nn.Module]) -> float:
+    if module is None:
+        return 0.0
+    squared_norm = 0.0
+    for parameter in module.parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        squared_norm += float(torch.sum(grad * grad).cpu().item())
+    return squared_norm ** 0.5
+
+
+def _module_update_norm(before: dict[str, torch.Tensor], module: Optional[nn.Module]) -> float:
+    if module is None or not before:
+        return 0.0
+    squared_norm = 0.0
+    for name, parameter in module.named_parameters():
+        previous = before.get(name)
+        if previous is None:
+            continue
+        delta = parameter.detach().cpu().float() - previous
+        squared_norm += float(torch.sum(delta * delta).item())
+    return squared_norm ** 0.5
+
+
+def _snapshot_module_parameters(module: Optional[nn.Module]) -> dict[str, torch.Tensor]:
+    if module is None:
+        return {}
+    return {
+        name: parameter.detach().cpu().float().clone()
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
     }
 
 
@@ -592,6 +652,12 @@ def freeze_actor(actor_model: AutoModelForCausalLM) -> None:
         parameter.requires_grad = False
 
 
+def freeze_reasoner(reasoner_model: AutoModelForCausalLM) -> None:
+    reasoner_model.eval()
+    for parameter in reasoner_model.parameters():
+        parameter.requires_grad = False
+
+
 def train_reasoner_stage2(
     reasoner_model: AutoModelForCausalLM,
     actor_model: AutoModelForCausalLM,
@@ -616,7 +682,10 @@ def train_reasoner_stage2(
         )
 
     freeze_actor(actor_model)
-    reasoner_model.train()
+    if config.train_reasoner:
+        reasoner_model.train()
+    else:
+        freeze_reasoner(reasoner_model)
 
     loss_fn = LatentCompressorLoss(
         lambda_task=config.lambda_task,
@@ -642,11 +711,25 @@ def train_reasoner_stage2(
         if config.hidden_state_processor_enabled
         else None
     )
+    latent_handoff_adapter = (
+        LatentHandoffAdapter(
+            actor_hidden_size,
+            rank=config.latent_handoff_adapter_rank,
+            scale=config.latent_handoff_adapter_scale,
+            dropout=config.latent_handoff_adapter_dropout,
+        )
+        if config.latent_handoff_adapter_enabled
+        else None
+    )
     if hidden_state_processor is not None:
         hidden_state_processor.train()
+    if latent_handoff_adapter is not None:
+        latent_handoff_adapter.to(_model_device(reasoner_model))
+        latent_handoff_adapter.train()
     optimizer = torch.optim.AdamW(
         (
             list(p for p in reasoner_model.parameters() if p.requires_grad)
+            + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
             + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
         ),
         lr=config.learning_rate,
@@ -658,6 +741,8 @@ def train_reasoner_stage2(
     reasoner_backbone = _model_backbone(reasoner_model)
     if hidden_state_processor is not None:
         hidden_state_processor.to(reasoner_device)
+    if latent_handoff_adapter is not None:
+        latent_handoff_adapter.to(reasoner_device)
     curriculum_stages = _curriculum_schedule(config) if config.curriculum_enabled else (
         CurriculumStage(
             name="default",
@@ -723,12 +808,17 @@ def train_reasoner_stage2(
         nonlocal global_step
         if evaluation_fn is None:
             return
+        eval_context = dict(latest_alignment_context)
+        if latent_handoff_adapter is not None:
+            eval_context["stage2_latent_handoff_adapter"] = latent_handoff_adapter
+        if hidden_state_processor is not None:
+            eval_context["stage2_hidden_state_processor"] = hidden_state_processor
         evaluation_metrics = {
             key: _coerce_history_value(value)
             for key, value in evaluation_fn(
                 reasoner_model,
                 actor_model,
-                latest_alignment_context,
+                eval_context,
             ).items()
         }
         eval_history_entry = {
@@ -803,6 +893,8 @@ def train_reasoner_stage2(
                     compressed_latents_aligned,
                     full_latents_aligned.detach(),
                 )
+            if latent_handoff_adapter is not None:
+                compressed_latents_aligned = latent_handoff_adapter(compressed_latents_aligned)
             if hidden_state_processor is not None:
                 compressed_latents_aligned = hidden_state_processor(compressed_latents_aligned)
 
@@ -875,11 +967,18 @@ def train_reasoner_stage2(
             total_loss, effective_weights = loss_balancer.combine(loss_terms)
 
             optimizer.zero_grad(set_to_none=True)
+            adapter_before = _snapshot_module_parameters(latent_handoff_adapter)
             total_loss.backward()
+            reasoner_grad_norm = _gradient_norm(reasoner_model)
+            handoff_adapter_grad_norm = _gradient_norm(latent_handoff_adapter)
+            hidden_processor_grad_norm = _gradient_norm(hidden_state_processor)
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
+            if latent_handoff_adapter is not None:
+                nn.utils.clip_grad_norm_(latent_handoff_adapter.parameters(), config.max_grad_norm)
             if hidden_state_processor is not None:
                 nn.utils.clip_grad_norm_(hidden_state_processor.parameters(), config.max_grad_norm)
             optimizer.step()
+            handoff_adapter_update_norm = _module_update_norm(adapter_before, latent_handoff_adapter)
 
             metrics = {
                 "epoch": float(epoch),
@@ -899,6 +998,13 @@ def train_reasoner_stage2(
                 "effective_weight_plan": effective_weights["l_plan"],
                 "effective_weight_contrast": effective_weights["l_contrast"],
                 "effective_weight_answer": effective_weights.get("l_answer", 0.0),
+                "reasoner_grad_norm": reasoner_grad_norm,
+                "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
+                "hidden_processor_grad_norm": hidden_processor_grad_norm,
+                "handoff_adapter_update_norm": handoff_adapter_update_norm,
+                "trainable_reasoner_parameter_count": float(_parameter_count(reasoner_model)),
+                "trainable_handoff_adapter_parameter_count": float(_parameter_count(latent_handoff_adapter)),
+                "trainable_hidden_processor_parameter_count": float(_parameter_count(hidden_state_processor)),
                 "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
                 "projection_scale_mean": projection_metrics["projection_scale_mean"],
                 "projection_scale_std": projection_metrics["projection_scale_std"],
@@ -952,6 +1058,17 @@ def train_reasoner_stage2(
                         "effective_weight_plan": metrics["effective_weight_plan"],
                         "effective_weight_contrast": metrics["effective_weight_contrast"],
                         "effective_weight_answer": metrics["effective_weight_answer"],
+                        "reasoner_grad_norm": metrics["reasoner_grad_norm"],
+                        "handoff_adapter_grad_norm": metrics["handoff_adapter_grad_norm"],
+                        "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],
+                        "handoff_adapter_update_norm": metrics["handoff_adapter_update_norm"],
+                        "trainable_reasoner_parameter_count": metrics["trainable_reasoner_parameter_count"],
+                        "trainable_handoff_adapter_parameter_count": metrics[
+                            "trainable_handoff_adapter_parameter_count"
+                        ],
+                        "trainable_hidden_processor_parameter_count": metrics[
+                            "trainable_hidden_processor_parameter_count"
+                        ],
                         "projection_scale_mean": metrics["projection_scale_mean"],
                         "projection_scale_std": metrics["projection_scale_std"],
                         "projection_clip_fraction": metrics["projection_clip_fraction"],
@@ -979,6 +1096,9 @@ def train_reasoner_stage2(
                             "hidden_state_processor_state_dict": None
                             if hidden_state_processor is None
                             else hidden_state_processor.state_dict(),
+                            "latent_handoff_adapter_state_dict": None
+                            if latent_handoff_adapter is None
+                            else latent_handoff_adapter.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "training_config": dataclasses.asdict(config),
                             "alignment_context": alignment_context,
@@ -1002,6 +1122,9 @@ def train_reasoner_stage2(
                     "hidden_state_processor_state_dict": None
                     if hidden_state_processor is None
                     else hidden_state_processor.state_dict(),
+                    "latent_handoff_adapter_state_dict": None
+                    if latent_handoff_adapter is None
+                    else latent_handoff_adapter.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "training_config": dataclasses.asdict(config),
                     "alignment_context": latest_alignment_context,

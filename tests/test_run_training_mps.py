@@ -61,6 +61,14 @@ def test_smoke_answer_extraction_is_target_aware() -> None:
     assert _predicted_answer_for_target("smoke", "Final answer: 13.", "13") == "13"
     assert _predicted_answer_for_target("smoke", "The answer is 42.", "42") == "42"
     assert _predicted_answer_for_target("smoke", "3x^2", "3x^2") == "3x^2"
+    assert (
+        _predicted_answer_for_target(
+            "smoke",
+            "Final answer: 42 Final answer: 4",
+            "4",
+        )
+        == "42"
+    )
 
 
 def test_smoke_candidate_answers_are_unique_and_ordered() -> None:
@@ -141,3 +149,6 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
 
     assert "training.evaluation.smoke_eval_set=train_overfit" in command
     assert "training.evaluation.baseline_few_shot_examples=4" in command
+    assert "training.train_reasoner=false" in command
+    assert "training.lambda_answer=20.0" in command
+    assert "training.adaptive_loss.enabled=false" in command

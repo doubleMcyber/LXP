@@ -45,7 +45,11 @@ _DTYPE_NAME_BY_VALUE = {value: key for key, value in _DTYPE_MAP.items()}
 _GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 _NUMERIC_ANSWER_REGEX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 _FINAL_ANSWER_MARKER_REGEX = re.compile(
-    r"final\s+answer\s*[:=]\s*\$?([^.\n]+)",
+    r"final\s+answer\s*[:=]\s*\$?(.+?)(?=(?:\s+final\s+answer\s*[:=])|[.\n]|$)",
+    re.IGNORECASE,
+)
+_FINAL_ANSWER_STOP_REGEX = re.compile(
+    r"final\s+answer\s*[:=]\s*\$?(?:-?\d[\d,]*(?:\.\d+)?|[a-z0-9^*/+\-]+)(?:[\s.]|$)",
     re.IGNORECASE,
 )
 _ANSWER_SUFFIX_TEXT = "\nFinal answer:"
@@ -564,6 +568,7 @@ def _build_evaluation_callback(
                 tokenizer=actor_tokenizer,
                 prefix_state=actor_text_prefix_state,
                 max_new_tokens=max_new_tokens,
+                stop_regex=_FINAL_ANSWER_STOP_REGEX,
             )
             baseline_decoded_text = str(baseline_decode_metrics["decoded_text"])
             baseline_predicted_answer = _predicted_answer_for_target(
@@ -606,6 +611,14 @@ def _build_evaluation_callback(
                 compressed_steps=config.compressed_steps,
             )
             aligned_latents = apply_alignment(compressed_latents, alignment_state)
+            latent_adapter = alignment_context.get("stage2_latent_handoff_adapter")
+            if latent_adapter is not None:
+                with torch.no_grad():
+                    aligned_latents = latent_adapter(aligned_latents)
+            hidden_processor = alignment_context.get("stage2_hidden_state_processor")
+            if hidden_processor is not None:
+                with torch.no_grad():
+                    aligned_latents = hidden_processor(aligned_latents)
             prefix_state = prepare_latent_prefix_state(
                 model=actor_model,
                 handoff_step=aligned_latents,
@@ -623,6 +636,7 @@ def _build_evaluation_callback(
                 tokenizer=actor_tokenizer,
                 prefix_state=answer_prefix_state,
                 max_new_tokens=max_new_tokens,
+                stop_regex=_FINAL_ANSWER_STOP_REGEX,
             )
             decoded_text = str(decode_metrics["decoded_text"])
             answer_metrics = compute_answer_metrics_from_prefix(
@@ -869,6 +883,8 @@ def main() -> None:
                 f"loss={entry['loss']:.4f} l_task={entry['l_task']:.4f} "
                 f"l_pref={entry['l_pref']:.4f} l_geom={entry['l_geom']:.4f} "
                 f"l_answer={entry.get('l_answer', 0.0):.4f} "
+                f"adapter_grad={entry.get('handoff_adapter_grad_norm', 0.0):.4f} "
+                f"adapter_update={entry.get('handoff_adapter_update_norm', 0.0):.6f} "
             )
             continue
         print(
