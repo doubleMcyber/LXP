@@ -1409,6 +1409,13 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
                 "heldout_answer_extraction_rate_percentage": 100.0,
                 "heldout_decode_answer_extraction_rate_percentage": 33.333,
                 "heldout_candidate_fallback_rate_percentage": 66.667,
+                "heldout_latent_sequence_decoder_token_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_sequence_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_length_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_unique_predicted_answer_count": 3.0,
+                "heldout_latent_generation_smoke_ready": True,
+                "heldout_latent_generation_smoke_skipped_count": 0.0,
+                "heldout_latent_generation_sequence_accuracy_threshold": 95.0,
                 "heldout_extraction_failure_count": 0.0,
                 "heldout_eval_diagnostics": "target=13 | predicted=13 | source=candidate_nll",
                 "heldout_answer_perplexity": 250.0,
@@ -1422,6 +1429,8 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
     assert report["final_heldout_answer_extraction_rate_percentage"] == 100.0
     assert report["final_heldout_decode_answer_extraction_rate_percentage"] == 33.333
     assert report["final_heldout_candidate_fallback_rate_percentage"] == 66.667
+    assert report["final_heldout_latent_sequence_decoder_sequence_accuracy"] == 100.0
+    assert report["latent_sequence_decoder_ready"] is True
     assert report["final_heldout_extraction_failure_count"] == 0.0
     assert "source=candidate_nll" in report["heldout_eval_diagnostics"]
 

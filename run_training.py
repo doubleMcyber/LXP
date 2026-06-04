@@ -32,6 +32,7 @@ from src.models.hidden_state import lm_vocabulary_weight
 from train_compressor import (
     CompressionTrainConfig,
     compress_latent_trajectory,
+    evaluate_latent_sequence_decoder_predictions,
     resolve_training_alignment_context,
     train_reasoner_stage2,
 )
@@ -564,11 +565,17 @@ def _build_evaluation_callback(
         extraction_failure_count = 0
         latent_candidate_correct_count = 0
         latent_probe_correct_count = 0
+        latent_sequence_decoder_sample_count = 0
+        latent_sequence_decoder_token_count = 0
+        latent_sequence_decoder_token_correct_count = 0
+        latent_sequence_decoder_correct_count = 0
+        latent_sequence_decoder_length_correct_count = 0
         latent_first_token_correct_count = 0
         latent_first_token_rank_total = 0.0
         latent_first_token_rank_count = 0
         latent_logit_steering_bias_norm_total = 0.0
         latent_logit_steering_bias_norm_count = 0
+        latent_generation_smoke_skipped_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
         baseline_candidate_correct_count = 0
@@ -580,11 +587,89 @@ def _build_evaluation_callback(
         predicted_answers: list[str | None] = []
         latent_candidate_predicted_answers: list[str | None] = []
         latent_probe_predicted_answers: list[str | None] = []
+        latent_sequence_decoder_predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
         baseline_candidate_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
 
-        for example in eval_examples:
+        def aligned_latents_for_prompt(prompt: str) -> torch.Tensor:
+            input_ids, attention_mask = _tokenize_prompt(
+                reasoner_tokenizer,
+                prompt,
+                device=reasoner_device,
+                max_length=config.reasoner_max_length,
+            )
+            with torch.no_grad():
+                outputs = reasoner_backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            compressed_latents = compress_latent_trajectory(
+                outputs.last_hidden_state,
+                compressed_steps=config.compressed_steps,
+            )
+            aligned_latents = apply_alignment(compressed_latents, alignment_state)
+            latent_adapter = alignment_context.get("stage2_latent_handoff_adapter")
+            if latent_adapter is not None:
+                with torch.no_grad():
+                    aligned_latents = latent_adapter(aligned_latents)
+            hidden_processor = alignment_context.get("stage2_hidden_state_processor")
+            if hidden_processor is not None:
+                with torch.no_grad():
+                    aligned_latents = hidden_processor(aligned_latents)
+            return aligned_latents
+
+        latent_sequence_decoder = alignment_context.get("stage2_latent_sequence_decoder")
+        sequence_generation_threshold = float(
+            alignment_context.get(
+                "stage2_latent_sequence_decoder_generation_min_accuracy",
+                config.latent_sequence_decoder_generation_min_accuracy,
+            )
+        )
+        sequence_decoder_predictions: list[str | None] = [None for _ in eval_examples]
+        sequence_decoder_lengths: list[int] = [0 for _ in eval_examples]
+        latent_generation_smoke_ready = latent_sequence_decoder is None
+        if latent_sequence_decoder is not None:
+            latent_prefix_rows = [
+                aligned_latents_for_prompt(str(example["prompt"]))
+                for example in eval_examples
+            ]
+            latent_prefix_batch = torch.cat(latent_prefix_rows, dim=0)
+            sequence_metrics = evaluate_latent_sequence_decoder_predictions(
+                latent_sequence_decoder=latent_sequence_decoder,
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                latent_prefix=latent_prefix_batch,
+                answers=[example.get("answer") for example in eval_examples],
+                suffix_text=_ANSWER_SUFFIX_TEXT,
+                max_answer_length=config.latent_sequence_decoder_max_answer_length,
+                answer_variants=[
+                    _answer_metric_variants(example.get("answer"))
+                    for example in eval_examples
+                ],
+            )
+            latent_sequence_decoder_sample_count = int(sequence_metrics["sample_count"])
+            latent_sequence_decoder_token_count = int(sequence_metrics["token_count"])
+            latent_sequence_decoder_token_correct_count = int(
+                sequence_metrics["token_correct_count"]
+            )
+            latent_sequence_decoder_correct_count = int(
+                sequence_metrics["sequence_correct_count"]
+            )
+            latent_sequence_decoder_length_correct_count = int(
+                sequence_metrics["length_correct_count"]
+            )
+            sequence_decoder_predictions = list(sequence_metrics["predicted_texts"])
+            sequence_decoder_lengths = list(sequence_metrics["predicted_lengths"])
+            sequence_accuracy = sequence_metrics["sequence_accuracy"]
+            latent_generation_smoke_ready = (
+                sequence_accuracy is not None
+                and float(sequence_accuracy) >= sequence_generation_threshold
+            )
+
+        for example_index, example in enumerate(eval_examples):
             prompt = str(example["prompt"])
             target_answer = example["answer"]
             actor_answer_prefix_text = (
@@ -644,32 +729,7 @@ def _build_evaluation_callback(
                 if _answers_match(dataset_name, baseline_candidate_predicted_answer, target_answer):
                     baseline_candidate_correct_count += 1
 
-            input_ids, attention_mask = _tokenize_prompt(
-                reasoner_tokenizer,
-                prompt,
-                device=reasoner_device,
-                max_length=config.reasoner_max_length,
-            )
-            with torch.no_grad():
-                outputs = reasoner_backbone(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    return_dict=True,
-                )
-            compressed_latents = compress_latent_trajectory(
-                outputs.last_hidden_state,
-                compressed_steps=config.compressed_steps,
-            )
-            aligned_latents = apply_alignment(compressed_latents, alignment_state)
-            latent_adapter = alignment_context.get("stage2_latent_handoff_adapter")
-            if latent_adapter is not None:
-                with torch.no_grad():
-                    aligned_latents = latent_adapter(aligned_latents)
-            hidden_processor = alignment_context.get("stage2_hidden_state_processor")
-            if hidden_processor is not None:
-                with torch.no_grad():
-                    aligned_latents = hidden_processor(aligned_latents)
+            aligned_latents = aligned_latents_for_prompt(prompt)
             latent_probe_predicted_answer = None
             latent_probe = alignment_context.get("stage2_latent_answer_probe")
             latent_probe_candidates = tuple(
@@ -689,6 +749,9 @@ def _build_evaluation_callback(
                     latent_probe_predicted_answers.append(latent_probe_predicted_answer)
                     if _answers_match(dataset_name, latent_probe_predicted_answer, target_answer):
                         latent_probe_correct_count += 1
+            latent_sequence_decoder_predicted_answer = sequence_decoder_predictions[example_index]
+            if latent_sequence_decoder_predicted_answer is not None:
+                latent_sequence_decoder_predicted_answers.append(latent_sequence_decoder_predicted_answer)
             latent_soft_prompt_decoder = alignment_context.get("stage2_latent_soft_prompt_decoder")
             if latent_soft_prompt_decoder is not None:
                 with torch.no_grad():
@@ -722,16 +785,23 @@ def _build_evaluation_callback(
                 prefix_embeds=aligned_latents,
                 suffix_text=_ANSWER_SUFFIX_TEXT,
             )
-            decode_metrics = generate_from_prefix_embeddings(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_embeds=answer_prefix_embeds,
-                max_new_tokens=max_new_tokens,
-                decoded_text_prefix=_ANSWER_DECODED_PREFIX,
-                stop_regex=_FINAL_ANSWER_STOP_REGEX,
-                step_logits_bias=step_logits_bias,
-                step_logits_bias_scale=step_logits_bias_scale,
-            )
+            if latent_generation_smoke_ready:
+                decode_metrics = generate_from_prefix_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_embeds=answer_prefix_embeds,
+                    max_new_tokens=max_new_tokens,
+                    decoded_text_prefix=_ANSWER_DECODED_PREFIX,
+                    stop_regex=_FINAL_ANSWER_STOP_REGEX,
+                    step_logits_bias=step_logits_bias,
+                    step_logits_bias_scale=step_logits_bias_scale,
+                )
+            else:
+                latent_generation_smoke_skipped_count += 1
+                decode_metrics = {
+                    "decoded_text": "",
+                    "first_generated_token_text": None,
+                }
             decoded_text = str(decode_metrics["decoded_text"])
             answer_metrics = compute_answer_metrics_from_prefix_embeddings(
                 model=actor_model,
@@ -762,10 +832,14 @@ def _build_evaluation_callback(
                 token_count = int(answer_metrics["answer_token_count"] or 0)
                 total_answer_tokens += token_count
                 total_answer_nll += float(answer_metrics["answer_nll"]) * token_count
-            predicted_answer = _predicted_answer_for_target(
-                dataset_name,
-                decoded_text,
-                target_answer,
+            predicted_answer = (
+                _predicted_answer_for_target(
+                    dataset_name,
+                    decoded_text,
+                    target_answer,
+                )
+                if latent_generation_smoke_ready
+                else latent_sequence_decoder_predicted_answer
             )
             latent_candidate_predicted_answer = None
             if candidate_answers:
@@ -778,9 +852,10 @@ def _build_evaluation_callback(
                 latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
                 if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
                     latent_candidate_correct_count += 1
-            extraction_source = "decode"
+            extraction_source = "decode" if latent_generation_smoke_ready else "sequence_decoder"
             if predicted_answer is not None and str(predicted_answer).strip():
-                decode_extracted_answer_count += 1
+                if latent_generation_smoke_ready:
+                    decode_extracted_answer_count += 1
                 extracted_answer_count += 1
             elif candidate_answers:
                 predicted_answer = latent_candidate_predicted_answer
@@ -807,6 +882,9 @@ def _build_evaluation_callback(
                             f"predicted={predicted_answer}",
                             f"candidate_predicted={latent_candidate_predicted_answer}",
                             f"probe_predicted={latent_probe_predicted_answer}",
+                            f"sequence_predicted={latent_sequence_decoder_predicted_answer}",
+                            f"sequence_predicted_length={sequence_decoder_lengths[example_index]}",
+                            f"generation_ready={latent_generation_smoke_ready}",
                             f"latent_first_token_rank={latent_first_token_metrics.get('first_token_rank')}",
                             f"latent_first_token_predicted={latent_first_token_metrics.get('first_token_predicted_text')}",
                             f"generated_first_token={decode_metrics.get('first_generated_token_text')}",
@@ -853,6 +931,34 @@ def _build_evaluation_callback(
                 float(_unique_normalized_answer_count(latent_probe_predicted_answers))
                 if latent_probe is not None and latent_probe_candidates
                 else None
+            ),
+            "heldout_latent_sequence_decoder_token_accuracy": (
+                100.0 * latent_sequence_decoder_token_correct_count / latent_sequence_decoder_token_count
+                if latent_sequence_decoder_token_count
+                else None
+            ),
+            "heldout_latent_sequence_decoder_sequence_accuracy": (
+                100.0 * latent_sequence_decoder_correct_count / latent_sequence_decoder_sample_count
+                if latent_sequence_decoder_sample_count
+                else None
+            ),
+            "heldout_latent_sequence_decoder_length_accuracy": (
+                100.0 * latent_sequence_decoder_length_correct_count / latent_sequence_decoder_sample_count
+                if latent_sequence_decoder_sample_count
+                else None
+            ),
+            "heldout_latent_sequence_decoder_sample_count": float(latent_sequence_decoder_sample_count),
+            "heldout_latent_sequence_decoder_unique_predicted_answer_count": (
+                float(_unique_normalized_answer_count(latent_sequence_decoder_predicted_answers))
+                if latent_sequence_decoder is not None
+                else None
+            ),
+            "heldout_latent_generation_smoke_ready": bool(latent_generation_smoke_ready),
+            "heldout_latent_generation_smoke_skipped_count": float(
+                latent_generation_smoke_skipped_count
+            ),
+            "heldout_latent_generation_sequence_accuracy_threshold": (
+                sequence_generation_threshold
             ),
             "heldout_latent_first_token_accuracy": (
                 100.0 * latent_first_token_correct_count / latent_first_token_rank_count
@@ -1060,6 +1166,8 @@ def main() -> None:
                 f"answer_contrast_accuracy={entry.get('answer_contrast_accuracy', 0.0):.2f} "
                 f"l_answer_probe={entry.get('l_answer_probe', 0.0):.4f} "
                 f"answer_probe_accuracy={entry.get('answer_probe_accuracy', 0.0):.2f} "
+                f"l_sequence_decoder={entry.get('l_latent_sequence_decoder', 0.0):.4f} "
+                f"sequence_acc={entry.get('latent_sequence_decoder_sequence_accuracy', 0.0):.2f} "
                 f"adapter_grad={entry.get('handoff_adapter_grad_norm', 0.0):.4f} "
                 f"adapter_update={entry.get('handoff_adapter_update_norm', 0.0):.6f} "
                 f"probe_grad={entry.get('latent_answer_probe_grad_norm', 0.0):.4f} "
@@ -1076,6 +1184,8 @@ def main() -> None:
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
             f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
             f"latent_probe_accuracy={entry.get('heldout_latent_probe_accuracy', 0.0) or 0.0:.2f} "
+            f"latent_sequence_accuracy={entry.get('heldout_latent_sequence_decoder_sequence_accuracy', 0.0) or 0.0:.2f} "
+            f"generation_ready={entry.get('heldout_latent_generation_smoke_ready', True)} "
             f"latent_first_token_accuracy={entry.get('heldout_latent_first_token_accuracy', 0.0) or 0.0:.2f} "
             f"unique_predictions={entry.get('heldout_unique_predicted_answer_count', 0.0):.0f} "
             f"actor_text_baseline_accuracy={entry.get('heldout_actor_text_baseline_accuracy', 0.0):.2f}"

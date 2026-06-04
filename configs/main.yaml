@@ -152,6 +152,7 @@ training:
   lambda_logit_steering: 0.0
   lambda_answer_contrast: 0.0
   lambda_answer_probe: 0.0
+  lambda_latent_sequence_decoder: 4.0
   answer_contrast_temperature: 1.0
   answer_suffix_text: "\nFinal answer: "
   answer_max_length: 32
@@ -184,6 +185,15 @@ training:
     max_candidates: 64
     hidden_multiplier: 2
     dropout: 0.0
+  latent_sequence_decoder:
+    enabled: true
+    max_answer_length: 32
+    vocabulary_mode: tied
+    num_heads: 4
+    hidden_multiplier: 2
+    dropout: 0.0
+    scale: 1.0
+    generation_min_sequence_accuracy: 95.0
   latent_soft_prompt_decoder:
     enabled: false
     output_steps: 0

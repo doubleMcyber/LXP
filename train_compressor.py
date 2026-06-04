@@ -21,6 +21,7 @@ from src.models.hidden_state import (
     LatentAnswerProbe,
     LatentHandoffAdapter,
     LatentLogitSteeringHead,
+    LatentSequenceDecoderHead,
     LatentSoftPromptDecoder,
     lm_vocabulary_weight,
 )
@@ -69,6 +70,7 @@ class CompressionTrainConfig:
     lambda_contrast: float = 0.1
     lambda_answer_contrast: float = 0.0
     lambda_answer_probe: float = 0.0
+    lambda_latent_sequence_decoder: float = 4.0
     answer_contrast_temperature: float = 1.0
     contrast_temperature: float = 0.1
     curriculum_enabled: bool = True
@@ -89,6 +91,14 @@ class CompressionTrainConfig:
     latent_answer_probe_max_candidates: int = 64
     latent_answer_probe_hidden_multiplier: int = 2
     latent_answer_probe_dropout: float = 0.0
+    latent_sequence_decoder_enabled: bool = True
+    latent_sequence_decoder_max_answer_length: int = 32
+    latent_sequence_decoder_vocabulary_mode: str = "tied"
+    latent_sequence_decoder_num_heads: int = 4
+    latent_sequence_decoder_hidden_multiplier: int = 2
+    latent_sequence_decoder_dropout: float = 0.0
+    latent_sequence_decoder_scale: float = 1.0
+    latent_sequence_decoder_generation_min_accuracy: float = 95.0
     latent_soft_prompt_decoder_enabled: bool = False
     latent_soft_prompt_decoder_output_steps: int = 0
     latent_soft_prompt_decoder_num_heads: int = 4
@@ -119,6 +129,7 @@ class CompressionTrainConfig:
         projection_cfg = getattr(t, "adaptive_projection", None)
         handoff_adapter_cfg = getattr(t, "latent_handoff_adapter", None)
         answer_probe_cfg = getattr(t, "latent_answer_probe", None)
+        sequence_decoder_cfg = getattr(t, "latent_sequence_decoder", None)
         soft_prompt_cfg = getattr(t, "latent_soft_prompt_decoder", None)
         logit_steering_cfg = getattr(t, "latent_logit_steering", None)
         processor_cfg = getattr(t, "hidden_state_processor", None)
@@ -156,6 +167,7 @@ class CompressionTrainConfig:
             lambda_contrast=float(getattr(t, "lambda_contrast", 0.1)),
             lambda_answer_contrast=float(getattr(t, "lambda_answer_contrast", 0.0)),
             lambda_answer_probe=float(getattr(t, "lambda_answer_probe", 0.0)),
+            lambda_latent_sequence_decoder=float(getattr(t, "lambda_latent_sequence_decoder", 4.0)),
             answer_contrast_temperature=float(getattr(t, "answer_contrast_temperature", 1.0)),
             contrast_temperature=float(getattr(t, "contrast_temperature", 0.1)),
             curriculum_enabled=bool(getattr(curriculum_cfg, "enabled", True)) if curriculum_cfg else True,
@@ -198,6 +210,30 @@ class CompressionTrainConfig:
             latent_answer_probe_dropout=float(
                 getattr(answer_probe_cfg, "dropout", 0.0)
             ) if answer_probe_cfg else 0.0,
+            latent_sequence_decoder_enabled=bool(
+                getattr(sequence_decoder_cfg, "enabled", True)
+            ) if sequence_decoder_cfg else True,
+            latent_sequence_decoder_max_answer_length=int(
+                getattr(sequence_decoder_cfg, "max_answer_length", getattr(t, "answer_max_length", 32))
+            ) if sequence_decoder_cfg else int(getattr(t, "answer_max_length", 32)),
+            latent_sequence_decoder_vocabulary_mode=str(
+                getattr(sequence_decoder_cfg, "vocabulary_mode", "tied")
+            ) if sequence_decoder_cfg else "tied",
+            latent_sequence_decoder_num_heads=int(
+                getattr(sequence_decoder_cfg, "num_heads", 4)
+            ) if sequence_decoder_cfg else 4,
+            latent_sequence_decoder_hidden_multiplier=int(
+                getattr(sequence_decoder_cfg, "hidden_multiplier", 2)
+            ) if sequence_decoder_cfg else 2,
+            latent_sequence_decoder_dropout=float(
+                getattr(sequence_decoder_cfg, "dropout", 0.0)
+            ) if sequence_decoder_cfg else 0.0,
+            latent_sequence_decoder_scale=float(
+                getattr(sequence_decoder_cfg, "scale", 1.0)
+            ) if sequence_decoder_cfg else 1.0,
+            latent_sequence_decoder_generation_min_accuracy=float(
+                getattr(sequence_decoder_cfg, "generation_min_sequence_accuracy", 95.0)
+            ) if sequence_decoder_cfg else 95.0,
             latent_soft_prompt_decoder_enabled=bool(
                 getattr(soft_prompt_cfg, "enabled", False)
             ) if soft_prompt_cfg else False,
@@ -976,6 +1012,280 @@ def _compute_latent_answer_probe_loss(
     return probe_loss, len(valid_rows), accuracy
 
 
+def _answer_token_variants(
+    *,
+    actor_tokenizer: Any,
+    answer: str | None,
+    suffix_text: str,
+    max_answer_length: int,
+    answer_variants: Sequence[str | None] = (),
+) -> list[list[int]]:
+    token_variants: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for candidate in (answer, *answer_variants):
+        continuation = _format_answer_continuation(candidate, suffix_text=suffix_text)
+        if continuation is None:
+            continue
+        token_ids = _encode_token_ids(
+            actor_tokenizer,
+            continuation,
+            max_length=max(1, int(max_answer_length)),
+        )
+        if not token_ids:
+            continue
+        key = tuple(token_ids)
+        if key in seen:
+            continue
+        seen.add(key)
+        token_variants.append(token_ids)
+    return token_variants
+
+
+def _target_answer_token_sequences(
+    *,
+    actor_tokenizer: Any,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+) -> tuple[list[int], list[list[int]]]:
+    valid_indices: list[int] = []
+    encoded_answers: list[list[int]] = []
+    for index, answer in enumerate(answers):
+        token_variants = _answer_token_variants(
+            actor_tokenizer=actor_tokenizer,
+            answer=answer,
+            suffix_text=suffix_text,
+            max_answer_length=max_answer_length,
+        )
+        if not token_variants:
+            continue
+        valid_indices.append(index)
+        encoded_answers.append(token_variants[0])
+    return valid_indices, encoded_answers
+
+
+def _compute_latent_sequence_decoder_loss(
+    *,
+    latent_sequence_decoder: LatentSequenceDecoderHead | None,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+) -> tuple[torch.Tensor | None, int, float, float, float, float, float]:
+    if latent_sequence_decoder is None:
+        return None, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+    valid_indices, encoded_answers = _target_answer_token_sequences(
+        actor_tokenizer=actor_tokenizer,
+        answers=answers,
+        suffix_text=suffix_text,
+        max_answer_length=min(
+            int(max_answer_length),
+            int(latent_sequence_decoder.max_answer_length),
+        ),
+    )
+    if not encoded_answers:
+        return None, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    decoder_device = next(latent_sequence_decoder.parameters()).device
+    row_index_tensor = torch.tensor(valid_indices, dtype=torch.long, device=latent_prefix.device)
+    selected_prefix = latent_prefix.index_select(0, row_index_tensor).to(decoder_device)
+    vocabulary_weight = lm_vocabulary_weight(actor_model).detach().to(decoder_device)
+    decoder_outputs = latent_sequence_decoder(selected_prefix, vocabulary_weight)
+    token_logits = decoder_outputs["token_logits"].float()
+    length_logits = decoder_outputs["length_logits"].float()
+    output_steps = int(token_logits.shape[1])
+    pad_target = -100
+    token_targets = torch.full(
+        (len(encoded_answers), output_steps),
+        pad_target,
+        dtype=torch.long,
+        device=decoder_device,
+    )
+    token_mask = torch.zeros(
+        (len(encoded_answers), output_steps),
+        dtype=torch.bool,
+        device=decoder_device,
+    )
+    length_targets = torch.empty(len(encoded_answers), dtype=torch.long, device=decoder_device)
+    for row_index, token_ids in enumerate(encoded_answers):
+        width = min(len(token_ids), output_steps)
+        token_targets[row_index, :width] = torch.tensor(
+            token_ids[:width],
+            dtype=torch.long,
+            device=decoder_device,
+        )
+        token_mask[row_index, :width] = True
+        length_targets[row_index] = width
+
+    token_loss = F.cross_entropy(
+        token_logits.reshape(-1, token_logits.shape[-1]),
+        token_targets.reshape(-1),
+        ignore_index=pad_target,
+    )
+    length_loss = F.cross_entropy(length_logits, length_targets)
+    decoder_loss = token_loss + length_loss
+    predicted_tokens = token_logits.argmax(dim=-1)
+    predicted_lengths = length_logits.argmax(dim=-1).clamp(0, output_steps)
+    token_correct = (
+        (predicted_tokens == token_targets).masked_select(token_mask).float().sum()
+        if token_mask.any()
+        else token_logits.sum() * 0.0
+    )
+    token_count = int(token_mask.sum().detach().cpu().item())
+    sequence_correct_count = 0
+    for row_index, token_ids in enumerate(encoded_answers):
+        target_width = int(length_targets[row_index].detach().cpu().item())
+        predicted_width = int(predicted_lengths[row_index].detach().cpu().item())
+        if predicted_width != target_width:
+            continue
+        predicted_sequence = predicted_tokens[row_index, :predicted_width].detach().cpu().tolist()
+        if predicted_sequence == token_ids[:target_width]:
+            sequence_correct_count += 1
+    token_accuracy = 0.0 if token_count == 0 else float(token_correct.detach().cpu().item() * 100.0 / token_count)
+    sequence_accuracy = 100.0 * sequence_correct_count / len(encoded_answers)
+    length_accuracy = float((predicted_lengths == length_targets).float().mean().detach().cpu().item() * 100.0)
+    target_length_mean = sum(len(token_ids) for token_ids in encoded_answers) / len(encoded_answers)
+    predicted_length_mean = float(predicted_lengths.float().mean().detach().cpu().item())
+    return (
+        decoder_loss,
+        len(encoded_answers),
+        token_accuracy,
+        sequence_accuracy,
+        length_accuracy,
+        float(target_length_mean),
+        predicted_length_mean,
+    )
+
+
+def evaluate_latent_sequence_decoder_predictions(
+    *,
+    latent_sequence_decoder: LatentSequenceDecoderHead | None,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+    answer_variants: Sequence[Sequence[str | None]] | None = None,
+) -> dict[str, Any]:
+    if latent_sequence_decoder is None:
+        return {
+            "sample_count": 0,
+            "token_count": 0,
+            "token_correct_count": 0,
+            "sequence_correct_count": 0,
+            "length_correct_count": 0,
+            "token_accuracy": None,
+            "sequence_accuracy": None,
+            "length_accuracy": None,
+            "predicted_texts": [],
+            "predicted_token_ids": [],
+            "predicted_lengths": [],
+        }
+
+    max_length = min(int(max_answer_length), int(latent_sequence_decoder.max_answer_length))
+    target_variants: list[list[list[int]]] = []
+    valid_indices: list[int] = []
+    for index, answer in enumerate(answers):
+        variants = () if answer_variants is None else tuple(answer_variants[index])
+        token_variants = _answer_token_variants(
+            actor_tokenizer=actor_tokenizer,
+            answer=answer,
+            suffix_text=suffix_text,
+            max_answer_length=max_length,
+            answer_variants=variants,
+        )
+        if not token_variants:
+            continue
+        valid_indices.append(index)
+        target_variants.append(token_variants)
+    if not valid_indices:
+        return {
+            "sample_count": 0,
+            "token_count": 0,
+            "token_correct_count": 0,
+            "sequence_correct_count": 0,
+            "length_correct_count": 0,
+            "token_accuracy": None,
+            "sequence_accuracy": None,
+            "length_accuracy": None,
+            "predicted_texts": [None for _ in answers],
+            "predicted_token_ids": [[] for _ in answers],
+            "predicted_lengths": [0 for _ in answers],
+        }
+
+    decoder_device = next(latent_sequence_decoder.parameters()).device
+    row_index_tensor = torch.tensor(valid_indices, dtype=torch.long, device=latent_prefix.device)
+    selected_prefix = latent_prefix.index_select(0, row_index_tensor).to(decoder_device)
+    vocabulary_weight = lm_vocabulary_weight(actor_model).detach().to(decoder_device)
+    with torch.no_grad():
+        decoder_outputs = latent_sequence_decoder(selected_prefix, vocabulary_weight)
+        token_logits = decoder_outputs["token_logits"].float()
+        length_logits = decoder_outputs["length_logits"].float()
+        predicted_tokens = token_logits.argmax(dim=-1)
+        predicted_lengths = length_logits.argmax(dim=-1).clamp(0, token_logits.shape[1])
+
+    predicted_texts: list[str | None] = [None for _ in answers]
+    predicted_token_ids: list[list[int]] = [[] for _ in answers]
+    predicted_length_values: list[int] = [0 for _ in answers]
+    token_count = 0
+    token_correct_count = 0
+    sequence_correct_count = 0
+    length_correct_count = 0
+    for local_index, source_index in enumerate(valid_indices):
+        predicted_length = int(predicted_lengths[local_index].detach().cpu().item())
+        token_ids = predicted_tokens[local_index, :predicted_length].detach().cpu().tolist()
+        predicted_token_ids[source_index] = [int(token_id) for token_id in token_ids]
+        predicted_length_values[source_index] = predicted_length
+        predicted_texts[source_index] = (
+            actor_tokenizer.decode(token_ids, skip_special_tokens=True)
+            if token_ids and hasattr(actor_tokenizer, "decode")
+            else ""
+        )
+
+        best_token_correct = -1
+        best_target_length = len(target_variants[local_index][0])
+        sequence_correct = False
+        length_correct = False
+        for target_ids in target_variants[local_index]:
+            target_length = len(target_ids)
+            overlap = min(predicted_length, target_length)
+            matches = sum(
+                1
+                for left, right in zip(token_ids[:overlap], target_ids[:overlap])
+                if int(left) == int(right)
+            )
+            exact = predicted_length == target_length and token_ids == target_ids
+            if exact:
+                sequence_correct = True
+            if predicted_length == target_length:
+                length_correct = True
+            if matches > best_token_correct:
+                best_token_correct = matches
+                best_target_length = target_length
+        token_correct_count += max(0, best_token_correct)
+        token_count += best_target_length
+        sequence_correct_count += int(sequence_correct)
+        length_correct_count += int(length_correct)
+
+    sample_count = len(valid_indices)
+    return {
+        "sample_count": sample_count,
+        "token_count": token_count,
+        "token_correct_count": token_correct_count,
+        "sequence_correct_count": sequence_correct_count,
+        "length_correct_count": length_correct_count,
+        "token_accuracy": None if token_count == 0 else 100.0 * token_correct_count / token_count,
+        "sequence_accuracy": 100.0 * sequence_correct_count / sample_count,
+        "length_accuracy": 100.0 * length_correct_count / sample_count,
+        "predicted_texts": predicted_texts,
+        "predicted_token_ids": predicted_token_ids,
+        "predicted_lengths": predicted_length_values,
+    }
+
+
 def _ensure_padding_token(tokenizer: Any) -> None:
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1282,6 +1592,20 @@ def train_reasoner_stage2(
         if config.latent_answer_probe_enabled
         else None
     )
+    latent_sequence_decoder = (
+        LatentSequenceDecoderHead(
+            actor_hidden_size,
+            max_answer_length=config.latent_sequence_decoder_max_answer_length,
+            vocabulary_size=int(lm_vocabulary_weight(actor_model).shape[0]),
+            vocabulary_mode=config.latent_sequence_decoder_vocabulary_mode,
+            num_heads=config.latent_sequence_decoder_num_heads,
+            hidden_multiplier=config.latent_sequence_decoder_hidden_multiplier,
+            dropout=config.latent_sequence_decoder_dropout,
+            scale=config.latent_sequence_decoder_scale,
+        )
+        if config.latent_sequence_decoder_enabled
+        else None
+    )
     latent_soft_prompt_decoder = (
         LatentSoftPromptDecoder(
             actor_hidden_size,
@@ -1318,6 +1642,9 @@ def train_reasoner_stage2(
     if latent_answer_probe is not None:
         latent_answer_probe.to(_model_device(reasoner_model))
         latent_answer_probe.train()
+    if latent_sequence_decoder is not None:
+        latent_sequence_decoder.to(_model_device(reasoner_model))
+        latent_sequence_decoder.train()
     if latent_soft_prompt_decoder is not None:
         latent_soft_prompt_decoder.to(_model_device(reasoner_model))
         latent_soft_prompt_decoder.train()
@@ -1328,6 +1655,7 @@ def train_reasoner_stage2(
         list(p for p in reasoner_model.parameters() if p.requires_grad)
         + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
         + ([] if latent_answer_probe is None else list(latent_answer_probe.parameters()))
+        + ([] if latent_sequence_decoder is None else list(latent_sequence_decoder.parameters()))
         + ([] if latent_soft_prompt_decoder is None else list(latent_soft_prompt_decoder.parameters()))
         + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
     )
@@ -1365,6 +1693,8 @@ def train_reasoner_stage2(
         latent_handoff_adapter.to(reasoner_device)
     if latent_answer_probe is not None:
         latent_answer_probe.to(reasoner_device)
+    if latent_sequence_decoder is not None:
+        latent_sequence_decoder.to(reasoner_device)
     if latent_soft_prompt_decoder is not None:
         latent_soft_prompt_decoder.to(reasoner_device)
     if latent_logit_steering is not None:
@@ -1421,6 +1751,7 @@ def train_reasoner_stage2(
             "l_logit_steering": config.lambda_logit_steering,
             "l_answer_contrast": config.lambda_answer_contrast,
             "l_answer_probe": config.lambda_answer_probe,
+            "l_latent_sequence_decoder": config.lambda_latent_sequence_decoder,
         },
         config=AdaptiveLossBalancerConfig(
             enabled=config.adaptive_loss_enabled,
@@ -1447,6 +1778,11 @@ def train_reasoner_stage2(
         if latent_answer_probe is not None:
             eval_context["stage2_latent_answer_probe"] = latent_answer_probe
             eval_context["stage2_latent_answer_candidates"] = latest_candidate_answers
+        if latent_sequence_decoder is not None:
+            eval_context["stage2_latent_sequence_decoder"] = latent_sequence_decoder
+            eval_context["stage2_latent_sequence_decoder_generation_min_accuracy"] = (
+                config.latent_sequence_decoder_generation_min_accuracy
+            )
         if latent_soft_prompt_decoder is not None:
             eval_context["stage2_latent_soft_prompt_decoder"] = latent_soft_prompt_decoder
         if latent_logit_steering is not None:
@@ -1460,6 +1796,7 @@ def train_reasoner_stage2(
                 latent_handoff_adapter,
                 hidden_state_processor,
                 latent_answer_probe,
+                latent_sequence_decoder,
                 latent_soft_prompt_decoder,
                 latent_logit_steering,
             )
@@ -1684,6 +2021,23 @@ def train_reasoner_stage2(
                     candidate_answers=candidate_answers,
                 )
             )
+            (
+                latent_sequence_decoder_loss,
+                latent_sequence_decoder_sample_count,
+                latent_sequence_decoder_token_accuracy,
+                latent_sequence_decoder_sequence_accuracy,
+                latent_sequence_decoder_length_accuracy,
+                latent_sequence_decoder_target_length_mean,
+                latent_sequence_decoder_predicted_length_mean,
+            ) = _compute_latent_sequence_decoder_loss(
+                latent_sequence_decoder=latent_sequence_decoder,
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                latent_prefix=compressed_latents_aligned,
+                answers=answers,
+                suffix_text=config.answer_suffix_text,
+                max_answer_length=config.latent_sequence_decoder_max_answer_length,
+            )
             loss_terms = {
                 "l_task": loss_outputs["l_task"],
                 "l_pref": loss_outputs["l_pref"],
@@ -1701,17 +2055,21 @@ def train_reasoner_stage2(
                 loss_terms["l_answer_contrast"] = answer_contrast_loss.to(reasoner_device)
             if answer_probe_loss is not None:
                 loss_terms["l_answer_probe"] = answer_probe_loss.to(reasoner_device)
+            if latent_sequence_decoder_loss is not None:
+                loss_terms["l_latent_sequence_decoder"] = latent_sequence_decoder_loss.to(reasoner_device)
             total_loss, effective_weights = loss_balancer.combine(loss_terms)
 
             optimizer.zero_grad(set_to_none=True)
             adapter_before = _snapshot_module_parameters(latent_handoff_adapter)
             answer_probe_before = _snapshot_module_parameters(latent_answer_probe)
+            sequence_decoder_before = _snapshot_module_parameters(latent_sequence_decoder)
             soft_prompt_decoder_before = _snapshot_module_parameters(latent_soft_prompt_decoder)
             logit_steering_before = _snapshot_module_parameters(latent_logit_steering)
             total_loss.backward()
             reasoner_grad_norm = _gradient_norm(reasoner_model)
             handoff_adapter_grad_norm = _gradient_norm(latent_handoff_adapter)
             latent_answer_probe_grad_norm = _gradient_norm(latent_answer_probe)
+            latent_sequence_decoder_grad_norm = _gradient_norm(latent_sequence_decoder)
             latent_soft_prompt_decoder_grad_norm = _gradient_norm(latent_soft_prompt_decoder)
             latent_logit_steering_grad_norm = _gradient_norm(latent_logit_steering)
             hidden_processor_grad_norm = _gradient_norm(hidden_state_processor)
@@ -1720,6 +2078,8 @@ def train_reasoner_stage2(
                 nn.utils.clip_grad_norm_(latent_handoff_adapter.parameters(), config.max_grad_norm)
             if latent_answer_probe is not None:
                 nn.utils.clip_grad_norm_(latent_answer_probe.parameters(), config.max_grad_norm)
+            if latent_sequence_decoder is not None:
+                nn.utils.clip_grad_norm_(latent_sequence_decoder.parameters(), config.max_grad_norm)
             if latent_soft_prompt_decoder is not None:
                 nn.utils.clip_grad_norm_(latent_soft_prompt_decoder.parameters(), config.max_grad_norm)
             if latent_logit_steering is not None:
@@ -1729,6 +2089,10 @@ def train_reasoner_stage2(
             optimizer.step()
             handoff_adapter_update_norm = _module_update_norm(adapter_before, latent_handoff_adapter)
             latent_answer_probe_update_norm = _module_update_norm(answer_probe_before, latent_answer_probe)
+            latent_sequence_decoder_update_norm = _module_update_norm(
+                sequence_decoder_before,
+                latent_sequence_decoder,
+            )
             latent_soft_prompt_decoder_update_norm = _module_update_norm(
                 soft_prompt_decoder_before,
                 latent_soft_prompt_decoder,
@@ -1760,6 +2124,9 @@ def train_reasoner_stage2(
                 "l_answer_probe": 0.0
                 if answer_probe_loss is None
                 else float(answer_probe_loss.detach().cpu().item()),
+                "l_latent_sequence_decoder": 0.0
+                if latent_sequence_decoder_loss is None
+                else float(latent_sequence_decoder_loss.detach().cpu().item()),
                 "answer_loss_sample_count": float(answer_loss_sample_count),
                 "answer_loss_token_count_mean": float(answer_token_count_mean),
                 "answer_first_token_sample_count": float(answer_first_token_sample_count),
@@ -1775,6 +2142,14 @@ def train_reasoner_stage2(
                 "answer_contrast_accuracy": float(answer_contrast_accuracy),
                 "answer_probe_sample_count": float(answer_probe_sample_count),
                 "answer_probe_accuracy": float(answer_probe_accuracy),
+                "latent_sequence_decoder_sample_count": float(latent_sequence_decoder_sample_count),
+                "latent_sequence_decoder_token_accuracy": float(latent_sequence_decoder_token_accuracy),
+                "latent_sequence_decoder_sequence_accuracy": float(latent_sequence_decoder_sequence_accuracy),
+                "latent_sequence_decoder_length_accuracy": float(latent_sequence_decoder_length_accuracy),
+                "latent_sequence_decoder_target_length_mean": float(latent_sequence_decoder_target_length_mean),
+                "latent_sequence_decoder_predicted_length_mean": float(
+                    latent_sequence_decoder_predicted_length_mean
+                ),
                 "answer_candidate_count": float(len(candidate_answers)),
                 "effective_weight_task": effective_weights["l_task"],
                 "effective_weight_pref": effective_weights["l_pref"],
@@ -1786,20 +2161,29 @@ def train_reasoner_stage2(
                 "effective_weight_logit_steering": effective_weights.get("l_logit_steering", 0.0),
                 "effective_weight_answer_contrast": effective_weights.get("l_answer_contrast", 0.0),
                 "effective_weight_answer_probe": effective_weights.get("l_answer_probe", 0.0),
+                "effective_weight_latent_sequence_decoder": effective_weights.get(
+                    "l_latent_sequence_decoder",
+                    0.0,
+                ),
                 "reasoner_grad_norm": reasoner_grad_norm,
                 "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
                 "latent_answer_probe_grad_norm": latent_answer_probe_grad_norm,
+                "latent_sequence_decoder_grad_norm": latent_sequence_decoder_grad_norm,
                 "latent_soft_prompt_decoder_grad_norm": latent_soft_prompt_decoder_grad_norm,
                 "latent_logit_steering_grad_norm": latent_logit_steering_grad_norm,
                 "hidden_processor_grad_norm": hidden_processor_grad_norm,
                 "handoff_adapter_update_norm": handoff_adapter_update_norm,
                 "latent_answer_probe_update_norm": latent_answer_probe_update_norm,
+                "latent_sequence_decoder_update_norm": latent_sequence_decoder_update_norm,
                 "latent_soft_prompt_decoder_update_norm": latent_soft_prompt_decoder_update_norm,
                 "latent_logit_steering_update_norm": latent_logit_steering_update_norm,
                 "latent_soft_prompt_decoder_delta_norm": soft_prompt_delta_norm,
                 "trainable_reasoner_parameter_count": float(_parameter_count(reasoner_model)),
                 "trainable_handoff_adapter_parameter_count": float(_parameter_count(latent_handoff_adapter)),
                 "trainable_latent_answer_probe_parameter_count": float(_parameter_count(latent_answer_probe)),
+                "trainable_latent_sequence_decoder_parameter_count": float(
+                    _parameter_count(latent_sequence_decoder)
+                ),
                 "trainable_latent_soft_prompt_decoder_parameter_count": float(
                     _parameter_count(latent_soft_prompt_decoder)
                 ),
@@ -1856,6 +2240,7 @@ def train_reasoner_stage2(
                         "l_logit_steering": metrics["l_logit_steering"],
                         "l_answer_contrast": metrics["l_answer_contrast"],
                         "l_answer_probe": metrics["l_answer_probe"],
+                        "l_latent_sequence_decoder": metrics["l_latent_sequence_decoder"],
                         "answer_loss_sample_count": metrics["answer_loss_sample_count"],
                         "answer_loss_token_count_mean": metrics["answer_loss_token_count_mean"],
                         "answer_first_token_sample_count": metrics["answer_first_token_sample_count"],
@@ -1871,6 +2256,24 @@ def train_reasoner_stage2(
                         "answer_contrast_accuracy": metrics["answer_contrast_accuracy"],
                         "answer_probe_sample_count": metrics["answer_probe_sample_count"],
                         "answer_probe_accuracy": metrics["answer_probe_accuracy"],
+                        "latent_sequence_decoder_sample_count": metrics[
+                            "latent_sequence_decoder_sample_count"
+                        ],
+                        "latent_sequence_decoder_token_accuracy": metrics[
+                            "latent_sequence_decoder_token_accuracy"
+                        ],
+                        "latent_sequence_decoder_sequence_accuracy": metrics[
+                            "latent_sequence_decoder_sequence_accuracy"
+                        ],
+                        "latent_sequence_decoder_length_accuracy": metrics[
+                            "latent_sequence_decoder_length_accuracy"
+                        ],
+                        "latent_sequence_decoder_target_length_mean": metrics[
+                            "latent_sequence_decoder_target_length_mean"
+                        ],
+                        "latent_sequence_decoder_predicted_length_mean": metrics[
+                            "latent_sequence_decoder_predicted_length_mean"
+                        ],
                         "answer_candidate_count": metrics["answer_candidate_count"],
                         "effective_weight_task": metrics["effective_weight_task"],
                         "effective_weight_pref": metrics["effective_weight_pref"],
@@ -1886,9 +2289,13 @@ def train_reasoner_stage2(
                         ],
                         "effective_weight_answer_contrast": metrics["effective_weight_answer_contrast"],
                         "effective_weight_answer_probe": metrics["effective_weight_answer_probe"],
+                        "effective_weight_latent_sequence_decoder": metrics[
+                            "effective_weight_latent_sequence_decoder"
+                        ],
                         "reasoner_grad_norm": metrics["reasoner_grad_norm"],
                         "handoff_adapter_grad_norm": metrics["handoff_adapter_grad_norm"],
                         "latent_answer_probe_grad_norm": metrics["latent_answer_probe_grad_norm"],
+                        "latent_sequence_decoder_grad_norm": metrics["latent_sequence_decoder_grad_norm"],
                         "latent_soft_prompt_decoder_grad_norm": metrics[
                             "latent_soft_prompt_decoder_grad_norm"
                         ],
@@ -1898,6 +2305,9 @@ def train_reasoner_stage2(
                         "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],
                         "handoff_adapter_update_norm": metrics["handoff_adapter_update_norm"],
                         "latent_answer_probe_update_norm": metrics["latent_answer_probe_update_norm"],
+                        "latent_sequence_decoder_update_norm": metrics[
+                            "latent_sequence_decoder_update_norm"
+                        ],
                         "latent_soft_prompt_decoder_update_norm": metrics[
                             "latent_soft_prompt_decoder_update_norm"
                         ],
@@ -1913,6 +2323,9 @@ def train_reasoner_stage2(
                         ],
                         "trainable_latent_answer_probe_parameter_count": metrics[
                             "trainable_latent_answer_probe_parameter_count"
+                        ],
+                        "trainable_latent_sequence_decoder_parameter_count": metrics[
+                            "trainable_latent_sequence_decoder_parameter_count"
                         ],
                         "trainable_latent_soft_prompt_decoder_parameter_count": metrics[
                             "trainable_latent_soft_prompt_decoder_parameter_count"
@@ -1956,6 +2369,9 @@ def train_reasoner_stage2(
                             "latent_answer_probe_state_dict": None
                             if latent_answer_probe is None
                             else latent_answer_probe.state_dict(),
+                            "latent_sequence_decoder_state_dict": None
+                            if latent_sequence_decoder is None
+                            else latent_sequence_decoder.state_dict(),
                             "latent_soft_prompt_decoder_state_dict": None
                             if latent_soft_prompt_decoder is None
                             else latent_soft_prompt_decoder.state_dict(),
@@ -1991,6 +2407,9 @@ def train_reasoner_stage2(
                     "latent_answer_probe_state_dict": None
                     if latent_answer_probe is None
                     else latent_answer_probe.state_dict(),
+                    "latent_sequence_decoder_state_dict": None
+                    if latent_sequence_decoder is None
+                    else latent_sequence_decoder.state_dict(),
                     "latent_soft_prompt_decoder_state_dict": None
                     if latent_soft_prompt_decoder is None
                     else latent_soft_prompt_decoder.state_dict(),

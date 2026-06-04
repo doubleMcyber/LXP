@@ -361,6 +361,142 @@ class LatentLogitSteeringHead(nn.Module):
         return self.forward_sequence(hidden_states, vocabulary_weight, output_steps=1)[:, 0, :]
 
 
+class LatentSequenceDecoderHead(nn.Module):
+    """Cheap latent-to-answer-token decoder with an explicit stop length."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        max_answer_length: int = 32,
+        vocabulary_size: int | None = None,
+        vocabulary_mode: str = "tied",
+        num_heads: int = 4,
+        hidden_multiplier: int = 2,
+        dropout: float = 0.0,
+        scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.max_answer_length = max(1, int(max_answer_length))
+        self.vocabulary_mode = str(vocabulary_mode).strip().lower()
+        self.scale = float(scale)
+        decoder_hidden = max(int(hidden_size), int(hidden_size) * max(1, int(hidden_multiplier)))
+        attn_heads = max(1, min(int(num_heads), int(hidden_size)))
+        while hidden_size % attn_heads != 0 and attn_heads > 1:
+            attn_heads -= 1
+
+        self.source_norm = nn.LayerNorm(hidden_size)
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=attn_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.query_tokens = nn.Parameter(torch.empty(self.max_answer_length, hidden_size))
+        self.summary_to_queries = nn.Linear(hidden_size, self.max_answer_length * hidden_size)
+        self.token_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, decoder_hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(decoder_hidden, hidden_size),
+        )
+        self.length_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, decoder_hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(decoder_hidden, self.max_answer_length + 1),
+        )
+        self.token_out = (
+            nn.Linear(hidden_size, hidden_size, bias=False)
+            if self.vocabulary_mode == "tied"
+            else None
+        )
+        if self.vocabulary_mode == "low_rank":
+            if vocabulary_size is None or int(vocabulary_size) < 1:
+                raise ValueError("vocabulary_size is required for low_rank sequence decoding")
+            self.vocab_out = nn.Linear(hidden_size, int(vocabulary_size), bias=True)
+        else:
+            self.vocab_out = None
+        if self.vocabulary_mode not in {"tied", "low_rank"}:
+            raise ValueError("vocabulary_mode must be one of: tied, low_rank")
+
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.summary_to_queries.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.summary_to_queries.bias)
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+        nn.init.zeros_(self.token_mlp[-1].weight)
+        nn.init.zeros_(self.token_mlp[-1].bias)
+        if self.token_out is not None:
+            nn.init.normal_(self.token_out.weight, mean=0.0, std=0.02)
+        if self.vocab_out is not None:
+            nn.init.normal_(self.vocab_out.weight, mean=0.0, std=0.001)
+            nn.init.zeros_(self.vocab_out.bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        vocabulary_weight: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if hidden_states.dim() != 3:
+            raise ValueError(
+                "hidden_states must have shape [batch, steps, hidden_size]; "
+                f"received {tuple(hidden_states.shape)}"
+            )
+        if vocabulary_weight.dim() != 2:
+            raise ValueError(
+                "vocabulary_weight must have shape [vocab_size, hidden_size]; "
+                f"received {tuple(vocabulary_weight.shape)}"
+            )
+        if int(hidden_states.shape[-1]) != int(vocabulary_weight.shape[-1]):
+            raise ValueError(
+                "hidden size mismatch between latent prefix and vocabulary weight: "
+                f"{hidden_states.shape[-1]} != {vocabulary_weight.shape[-1]}"
+            )
+
+        source = self.source_norm(hidden_states.float())
+        batch_size = int(source.shape[0])
+        summary = source.mean(dim=1)
+        queries = self.query_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        queries = queries + self.summary_to_queries(summary).view(
+            batch_size,
+            self.max_answer_length,
+            hidden_states.shape[-1],
+        )
+        attended, _ = self.cross_attn(
+            self.query_norm(queries),
+            source,
+            source,
+            need_weights=False,
+        )
+        token_features = queries + attended
+        token_features = token_features + self.token_mlp(token_features)
+        if self.vocabulary_mode == "low_rank":
+            if self.vocab_out is None:
+                raise RuntimeError("low_rank sequence decoder output is not initialized")
+            token_logits = self.vocab_out(token_features).float()
+            if int(token_logits.shape[-1]) != int(vocabulary_weight.shape[0]):
+                raise ValueError(
+                    "low_rank sequence decoder output size does not match vocabulary weight: "
+                    f"{token_logits.shape[-1]} != {vocabulary_weight.shape[0]}"
+                )
+        else:
+            if self.token_out is None:
+                raise RuntimeError("tied sequence decoder projection is not initialized")
+            token_hidden = self.token_out(token_features)
+            token_logits = torch.matmul(
+                token_hidden.float(),
+                vocabulary_weight.float().transpose(0, 1),
+            )
+        return {
+            "token_logits": token_logits * self.scale,
+            "length_logits": self.length_head(summary).float(),
+        }
+
+
 def lm_vocabulary_weight(model: Any) -> torch.Tensor:
     """Return the output vocabulary projection weight, falling back to input embeddings."""
 

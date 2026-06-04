@@ -142,6 +142,11 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     history = _load_history(history_path)
     smoke = report.get("training_smoke_report") or {}
     probe_class, probe_label = _status_label(bool(smoke.get("latent_probe_ready")) if "latent_probe_ready" in smoke else None)
+    sequence_class, sequence_label = _status_label(
+        bool(smoke.get("latent_sequence_decoder_ready"))
+        if "latent_sequence_decoder_ready" in smoke
+        else None
+    )
     decode_class, decode_label = _status_label(bool(smoke.get("latent_training_ready")) if "latent_training_ready" in smoke else None)
     phase_class, phase_label = _status_label(bool(report.get("passed")) if "passed" in report else None)
     loss_values = _metric_series(history, "loss")
@@ -255,7 +260,12 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel {decode_class}">
         <div class="status-row"><h3>Free Decode</h3><span class="badge">{decode_label}</span></div>
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_exact_match_accuracy"))}</div>
-        <div class="subhead">Open-ended actor generation after latent handoff.</div>
+        <div class="subhead">Open-ended actor generation after latent handoff; gated by sequence accuracy.</div>
+      </div>
+      <div class="panel {sequence_class}">
+        <div class="status-row"><h3>Sequence Decoder</h3><span class="badge">{sequence_label}</span></div>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_sequence_decoder_sequence_accuracy"))}</div>
+        <div class="subhead">Exact answer-token sequence accuracy with length stop.</div>
       </div>
       <div class="panel">
         <h3>Candidate NLL</h3>
@@ -278,6 +288,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Accuracy Surfaces</h2>
         {_bar_row("Open decode exact match", smoke.get("final_heldout_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Latent sequence decoder", smoke.get("final_heldout_latent_sequence_decoder_sequence_accuracy"), class_name="probe")}
         {_bar_row("Latent first token", smoke.get("final_heldout_latent_first_token_accuracy"))}
         {_bar_row("Latent candidate NLL", smoke.get("final_heldout_latent_candidate_accuracy"))}
         {_bar_row("Latent answer probe", smoke.get("final_heldout_latent_probe_accuracy"), class_name="probe")}
@@ -286,10 +297,10 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Recommendation</h2>
         <p>
-          Present the current result as a latent-readout workbench: the probe verifies that the compressed latent prefix carries answer information, while the free-form decoder remains a known interface failure.
+          Treat the sequence decoder as the readiness gate: run open-ended generation only after exact answer-token sequence accuracy clears the configured threshold.
         </p>
         <p>
-          The next production step is to replace the fixed probe with a candidate-conditioned readout or train the actor-side decoder objective until open decode stops collapsing.
+          If generation remains skipped, improve the latent sequence decoder and length stop before tuning actor-side free decode.
         </p>
       </div>
     </section>

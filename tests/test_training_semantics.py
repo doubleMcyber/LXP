@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from latent_pipeline import _build_alignment_cache_key
-from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead
+from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead, LatentSequenceDecoderHead
 from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
@@ -16,8 +16,10 @@ from train_compressor import (
     _compute_latent_candidate_contrast_loss,
     _compute_latent_first_token_loss,
     _compute_latent_logit_steering_loss,
+    _compute_latent_sequence_decoder_loss,
     _numeric_metrics,
     _tokenize_text_batch,
+    evaluate_latent_sequence_decoder_predictions,
     resolve_training_alignment_context,
     train_reasoner_stage2,
 )
@@ -286,6 +288,116 @@ def test_latent_logit_steering_loss_backprops_to_head_and_prefix() -> None:
     assert grad_norm > 0.0
 
 
+def test_latent_sequence_decoder_head_predicts_tokens_and_length() -> None:
+    decoder = LatentSequenceDecoderHead(
+        16,
+        max_answer_length=5,
+        vocabulary_size=32,
+        vocabulary_mode="low_rank",
+        num_heads=4,
+        hidden_multiplier=1,
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+    vocabulary_weight = torch.randn(32, 16)
+
+    outputs = decoder(latent_prefix, vocabulary_weight)
+    loss = outputs["token_logits"].sum() + outputs["length_logits"].sum()
+    loss.backward()
+
+    assert outputs["token_logits"].shape == (2, 5, 32)
+    assert outputs["length_logits"].shape == (2, 6)
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+
+
+def test_latent_sequence_decoder_loss_tracks_sequence_accuracy() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    decoder = LatentSequenceDecoderHead(
+        16,
+        max_answer_length=4,
+        vocabulary_size=128,
+        vocabulary_mode="low_rank",
+        num_heads=4,
+        hidden_multiplier=1,
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    (
+        sequence_loss,
+        sample_count,
+        token_accuracy,
+        sequence_accuracy,
+        length_accuracy,
+        target_length_mean,
+        predicted_length_mean,
+    ) = _compute_latent_sequence_decoder_loss(
+        latent_sequence_decoder=decoder,
+        actor_model=actor,
+        actor_tokenizer=_TinyTokenizer(),
+        latent_prefix=latent_prefix,
+        answers=["13", "42"],
+        suffix_text="\nFinal answer: ",
+        max_answer_length=4,
+    )
+
+    assert sequence_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= token_accuracy <= 100.0
+    assert 0.0 <= sequence_accuracy <= 100.0
+    assert 0.0 <= length_accuracy <= 100.0
+    assert target_length_mean > 0.0
+    assert predicted_length_mean >= 0.0
+    sequence_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    decoder_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in decoder.parameters()
+        if parameter.grad is not None
+    )
+    assert decoder_grad_norm > 0.0
+
+
+def test_latent_sequence_decoder_eval_requires_exact_token_sequence_and_length() -> None:
+    _, actor = _make_tiny_models(vocab_size=16)
+    tokenizer = _TinyTokenizer(vocab_size=16)
+    decoder = LatentSequenceDecoderHead(
+        16,
+        max_answer_length=2,
+        vocabulary_size=16,
+        vocabulary_mode="low_rank",
+        num_heads=4,
+        hidden_multiplier=1,
+    )
+    latent_prefix = torch.randn(1, 4, 16)
+
+    with torch.no_grad():
+        target_id = tokenizer.encode("13", add_special_tokens=False)[0]
+        decoder.vocab_out.weight.zero_()
+        decoder.vocab_out.bias.fill_(-10.0)
+        decoder.vocab_out.bias[target_id] = 10.0
+        decoder.length_head[-1].weight.zero_()
+        decoder.length_head[-1].bias.fill_(-10.0)
+        decoder.length_head[-1].bias[1] = 10.0
+
+    metrics = evaluate_latent_sequence_decoder_predictions(
+        latent_sequence_decoder=decoder,
+        actor_model=actor,
+        actor_tokenizer=tokenizer,
+        latent_prefix=latent_prefix,
+        answers=["13"],
+        suffix_text="\nFinal answer: ",
+        max_answer_length=2,
+    )
+
+    assert metrics["sample_count"] == 1
+    assert metrics["token_accuracy"] == 100.0
+    assert metrics["sequence_accuracy"] == 100.0
+    assert metrics["length_accuracy"] == 100.0
+
+
 def test_latent_answer_probe_loss_backprops_to_probe_and_prefix() -> None:
     probe = LatentAnswerProbe(16, max_candidates=4, hidden_multiplier=1)
     latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
@@ -473,6 +585,10 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         train_reasoner=False,
         latent_answer_probe_enabled=True,
         latent_answer_probe_max_candidates=8,
+        latent_sequence_decoder_enabled=True,
+        latent_sequence_decoder_max_answer_length=4,
+        latent_sequence_decoder_vocabulary_mode="low_rank",
+        latent_sequence_decoder_hidden_multiplier=1,
         latent_logit_steering_enabled=True,
         latent_logit_steering_rank=4,
         latent_logit_steering_vocabulary_mode="low_rank",
@@ -499,6 +615,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
     assert train_row["handoff_adapter_grad_norm"] > 0.0
     assert train_row["trainable_latent_answer_probe_parameter_count"] > 0.0
     assert train_row["latent_answer_probe_grad_norm"] > 0.0
+    assert train_row["trainable_latent_sequence_decoder_parameter_count"] > 0.0
+    assert train_row["latent_sequence_decoder_grad_norm"] > 0.0
     assert train_row["trainable_latent_soft_prompt_decoder_parameter_count"] > 0.0
     assert train_row["latent_soft_prompt_decoder_grad_norm"] > 0.0
     assert train_row["trainable_latent_logit_steering_parameter_count"] > 0.0
