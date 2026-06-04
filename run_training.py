@@ -28,6 +28,7 @@ from src.utils.lm_eval import (
     generate_from_text_prefix,
 )
 from src.utils.metrics import extract_boxed_text, normalize_answer
+from src.models.hidden_state import lm_vocabulary_weight
 from train_compressor import (
     CompressionTrainConfig,
     compress_latent_trajectory,
@@ -566,6 +567,8 @@ def _build_evaluation_callback(
         latent_first_token_correct_count = 0
         latent_first_token_rank_total = 0.0
         latent_first_token_rank_count = 0
+        latent_logit_steering_bias_norm_total = 0.0
+        latent_logit_steering_bias_norm_count = 0
         baseline_correct_count = 0
         baseline_extracted_answer_count = 0
         baseline_candidate_correct_count = 0
@@ -693,6 +696,26 @@ def _build_evaluation_callback(
                     aligned_latents = latent_soft_prompt_decoder(aligned_latents.to(decoder_device)).to(
                         reasoner_device
                     )
+            step_logits_bias = None
+            first_step_logits_bias = None
+            step_logits_bias_scale = 1.0
+            latent_logit_steering = alignment_context.get("stage2_latent_logit_steering")
+            if latent_logit_steering is not None:
+                with torch.no_grad():
+                    steering_device = next(latent_logit_steering.parameters()).device
+                    vocabulary_weight = lm_vocabulary_weight(actor_model)
+                    step_logits_bias = latent_logit_steering.forward_sequence(
+                        aligned_latents.to(device=steering_device, dtype=vocabulary_weight.dtype),
+                        vocabulary_weight.to(device=steering_device),
+                    )
+                    first_step_logits_bias = step_logits_bias[:, 0, :]
+                    latent_logit_steering_bias_norm_total += float(
+                        step_logits_bias.detach().float().norm(dim=-1).mean().cpu().item()
+                    )
+                    latent_logit_steering_bias_norm_count += 1
+                    step_logits_bias_scale = float(
+                        alignment_context.get("stage2_latent_logit_steering_generation_scale", 1.0)
+                    )
             answer_prefix_embeds = _append_text_embeddings(
                 model=actor_model,
                 tokenizer=actor_tokenizer,
@@ -706,6 +729,8 @@ def _build_evaluation_callback(
                 max_new_tokens=max_new_tokens,
                 decoded_text_prefix=_ANSWER_DECODED_PREFIX,
                 stop_regex=_FINAL_ANSWER_STOP_REGEX,
+                step_logits_bias=step_logits_bias,
+                step_logits_bias_scale=step_logits_bias_scale,
             )
             decoded_text = str(decode_metrics["decoded_text"])
             answer_metrics = compute_answer_metrics_from_prefix_embeddings(
@@ -714,6 +739,8 @@ def _build_evaluation_callback(
                 prefix_embeds=answer_prefix_embeds,
                 answer_text=target_answer,
                 answer_variants=_answer_metric_variants(target_answer),
+                step_logits_bias=step_logits_bias,
+                step_logits_bias_scale=step_logits_bias_scale,
             )
             latent_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
                 model=actor_model,
@@ -721,6 +748,8 @@ def _build_evaluation_callback(
                 prefix_embeds=answer_prefix_embeds,
                 answer_text=target_answer,
                 answer_variants=_answer_metric_variants(target_answer),
+                first_step_logits_bias=first_step_logits_bias,
+                first_step_logits_bias_scale=step_logits_bias_scale,
             )
             if latent_first_token_metrics.get("first_token_rank") is not None:
                 latent_first_token_rank_count += 1
@@ -780,6 +809,7 @@ def _build_evaluation_callback(
                             f"probe_predicted={latent_probe_predicted_answer}",
                             f"latent_first_token_rank={latent_first_token_metrics.get('first_token_rank')}",
                             f"latent_first_token_predicted={latent_first_token_metrics.get('first_token_predicted_text')}",
+                            f"generated_first_token={decode_metrics.get('first_generated_token_text')}",
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
@@ -832,6 +862,14 @@ def _build_evaluation_callback(
             "heldout_latent_first_token_rank_mean": (
                 latent_first_token_rank_total / latent_first_token_rank_count
                 if latent_first_token_rank_count
+                else None
+            ),
+            "heldout_latent_logit_steering_enabled": (
+                latent_logit_steering_bias_norm_count > 0
+            ),
+            "heldout_latent_logit_steering_bias_norm_mean": (
+                latent_logit_steering_bias_norm_total / latent_logit_steering_bias_norm_count
+                if latent_logit_steering_bias_norm_count
                 else None
             ),
             "heldout_extraction_failure_count": float(extraction_failure_count),

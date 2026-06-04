@@ -20,7 +20,9 @@ from src.models.hidden_state import (
     HiddenStateProcessor,
     LatentAnswerProbe,
     LatentHandoffAdapter,
+    LatentLogitSteeringHead,
     LatentSoftPromptDecoder,
+    lm_vocabulary_weight,
 )
 from src.models.losses import (
     AdaptiveLossBalancer,
@@ -47,10 +49,12 @@ class CompressionTrainConfig:
     eps: float = 1e-8
     lambda_answer: float = 4.0
     lambda_answer_first_token: float = 0.0
+    lambda_logit_steering: float = 0.0
     answer_suffix_text: str = "\nFinal answer: "
     answer_max_length: int = 32
     answer_first_token_weight: float = 2.0
     answer_first_token_margin: float = 2.0
+    logit_steering_margin: float = 2.0
     evaluate_before_training: bool = False
     train_reasoner: bool = True
     wandb_enabled: bool = True
@@ -92,6 +96,16 @@ class CompressionTrainConfig:
     latent_soft_prompt_decoder_dropout: float = 0.0
     latent_soft_prompt_decoder_residual_scale: float = 1.0
     latent_soft_prompt_decoder_max_delta_norm: float = 0.0
+    latent_logit_steering_enabled: bool = False
+    latent_logit_steering_rank: int = 64
+    latent_logit_steering_vocabulary_mode: str = "tied"
+    latent_logit_steering_lr_multiplier: float = 1.0
+    latent_logit_steering_output_steps: int = 1
+    latent_logit_steering_dropout: float = 0.0
+    latent_logit_steering_scale: float = 1.0
+    latent_logit_steering_generation_scale: float = 1.0
+    latent_logit_steering_pooling: str = "attention"
+    latent_logit_steering_max_bias_norm: float = 0.0
     hidden_state_processor_enabled: bool = False
     hidden_state_processor_num_heads: int = 4
     hidden_state_processor_dropout: float = 0.0
@@ -106,6 +120,7 @@ class CompressionTrainConfig:
         handoff_adapter_cfg = getattr(t, "latent_handoff_adapter", None)
         answer_probe_cfg = getattr(t, "latent_answer_probe", None)
         soft_prompt_cfg = getattr(t, "latent_soft_prompt_decoder", None)
+        logit_steering_cfg = getattr(t, "latent_logit_steering", None)
         processor_cfg = getattr(t, "hidden_state_processor", None)
         return cls(
             compressed_steps=t.compressed_steps,
@@ -119,10 +134,12 @@ class CompressionTrainConfig:
             eps=t.eps,
             lambda_answer=float(getattr(t, "lambda_answer", 4.0)),
             lambda_answer_first_token=float(getattr(t, "lambda_answer_first_token", 0.0)),
+            lambda_logit_steering=float(getattr(t, "lambda_logit_steering", 0.0)),
             answer_suffix_text=str(getattr(t, "answer_suffix_text", "\nFinal answer: ")),
             answer_max_length=int(getattr(t, "answer_max_length", 32)),
             answer_first_token_weight=float(getattr(t, "answer_first_token_weight", 2.0)),
             answer_first_token_margin=float(getattr(t, "answer_first_token_margin", 2.0)),
+            logit_steering_margin=float(getattr(t, "logit_steering_margin", 2.0)),
             evaluate_before_training=bool(
                 getattr(getattr(t, "evaluation", None), "evaluate_before_training", False)
             ),
@@ -202,6 +219,36 @@ class CompressionTrainConfig:
             latent_soft_prompt_decoder_max_delta_norm=float(
                 getattr(soft_prompt_cfg, "max_delta_norm", 0.0)
             ) if soft_prompt_cfg else 0.0,
+            latent_logit_steering_enabled=bool(
+                getattr(logit_steering_cfg, "enabled", False)
+            ) if logit_steering_cfg else False,
+            latent_logit_steering_rank=int(
+                getattr(logit_steering_cfg, "rank", 64)
+            ) if logit_steering_cfg else 64,
+            latent_logit_steering_vocabulary_mode=str(
+                getattr(logit_steering_cfg, "vocabulary_mode", "tied")
+            ) if logit_steering_cfg else "tied",
+            latent_logit_steering_lr_multiplier=float(
+                getattr(logit_steering_cfg, "lr_multiplier", 1.0)
+            ) if logit_steering_cfg else 1.0,
+            latent_logit_steering_output_steps=int(
+                getattr(logit_steering_cfg, "output_steps", 1)
+            ) if logit_steering_cfg else 1,
+            latent_logit_steering_dropout=float(
+                getattr(logit_steering_cfg, "dropout", 0.0)
+            ) if logit_steering_cfg else 0.0,
+            latent_logit_steering_scale=float(
+                getattr(logit_steering_cfg, "scale", 1.0)
+            ) if logit_steering_cfg else 1.0,
+            latent_logit_steering_generation_scale=float(
+                getattr(logit_steering_cfg, "generation_scale", 1.0)
+            ) if logit_steering_cfg else 1.0,
+            latent_logit_steering_pooling=str(
+                getattr(logit_steering_cfg, "pooling", "attention")
+            ) if logit_steering_cfg else "attention",
+            latent_logit_steering_max_bias_norm=float(
+                getattr(logit_steering_cfg, "max_bias_norm", 0.0)
+            ) if logit_steering_cfg else 0.0,
             hidden_state_processor_enabled=bool(getattr(processor_cfg, "enabled", False)) if processor_cfg else False,
             hidden_state_processor_num_heads=int(getattr(processor_cfg, "num_heads", 4)) if processor_cfg else 4,
             hidden_state_processor_dropout=float(getattr(processor_cfg, "dropout", 0.0)) if processor_cfg else 0.0,
@@ -412,6 +459,31 @@ def _format_answer_continuation(answer: str | None, *, suffix_text: str) -> str 
     return f"{separator}{cleaned}"
 
 
+def _collect_answer_first_tokens(
+    *,
+    actor_tokenizer: Any,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+) -> tuple[list[int], list[int]]:
+    valid_indices: list[int] = []
+    first_token_ids: list[int] = []
+    for index, answer in enumerate(answers):
+        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
+        if continuation is None:
+            continue
+        token_ids = _encode_token_ids(
+            actor_tokenizer,
+            continuation,
+            max_length=max(1, int(max_answer_length)),
+        )
+        if not token_ids:
+            continue
+        valid_indices.append(index)
+        first_token_ids.append(int(token_ids[0]))
+    return valid_indices, first_token_ids
+
+
 def _compute_latent_answer_loss(
     *,
     actor_model: AutoModelForCausalLM,
@@ -424,6 +496,8 @@ def _compute_latent_answer_loss(
 ) -> tuple[torch.Tensor | None, int, float]:
     valid_indices: list[int] = []
     encoded_answers: list[list[int]] = []
+    encoded_steering_targets: list[list[int]] = []
+    eos_token_id = getattr(actor_tokenizer, "eos_token_id", None)
     for index, answer in enumerate(answers):
         continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
         if continuation is None:
@@ -540,21 +614,12 @@ def _compute_latent_first_token_loss(
     max_answer_length: int,
     margin: float,
 ) -> tuple[torch.Tensor | None, int, float, float, float]:
-    valid_indices: list[int] = []
-    first_token_ids: list[int] = []
-    for index, answer in enumerate(answers):
-        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
-        if continuation is None:
-            continue
-        token_ids = _encode_token_ids(
-            actor_tokenizer,
-            continuation,
-            max_length=max(1, int(max_answer_length)),
-        )
-        if not token_ids:
-            continue
-        valid_indices.append(index)
-        first_token_ids.append(int(token_ids[0]))
+    valid_indices, first_token_ids = _collect_answer_first_tokens(
+        actor_tokenizer=actor_tokenizer,
+        answers=answers,
+        suffix_text=suffix_text,
+        max_answer_length=max_answer_length,
+    )
     if not first_token_ids:
         return None, 0, 0.0, 0.0, 0.0
 
@@ -588,10 +653,9 @@ def _compute_latent_first_token_loss(
     targets = torch.tensor(first_token_ids, dtype=torch.long, device=actor_device)
     ce_loss = F.cross_entropy(logits, targets)
     target_logits = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
-    other_logits = logits.masked_fill(
-        F.one_hot(targets, num_classes=logits.shape[-1]).bool(),
-        float("-inf"),
-    ).max(dim=-1).values
+    target_mask = torch.zeros_like(logits, dtype=torch.bool)
+    target_mask.scatter_(1, targets.unsqueeze(1), True)
+    other_logits = logits.masked_fill(target_mask, float("-inf")).max(dim=-1).values
     margin_loss = F.relu(float(margin) - (target_logits - other_logits)).mean()
     first_token_loss = ce_loss + margin_loss
     predictions = logits.argmax(dim=-1)
@@ -600,6 +664,145 @@ def _compute_latent_first_token_loss(
     average_rank = float(ranks.mean().detach().cpu().item())
     average_margin = float((target_logits - other_logits).mean().detach().cpu().item())
     return first_token_loss, len(first_token_ids), accuracy, average_rank, average_margin
+
+
+def _compute_latent_logit_steering_loss(
+    *,
+    latent_logit_steering: LatentLogitSteeringHead | None,
+    actor_model: AutoModelForCausalLM,
+    actor_tokenizer: Any,
+    latent_prefix: torch.Tensor,
+    answers: Sequence[str | None],
+    suffix_text: str,
+    max_answer_length: int,
+    margin: float,
+) -> tuple[torch.Tensor | None, int, float, float, float, float]:
+    if latent_logit_steering is None:
+        return None, 0, 0.0, 0.0, 0.0, 0.0
+    valid_indices: list[int] = []
+    encoded_answers: list[list[int]] = []
+    encoded_steering_targets: list[list[int]] = []
+    eos_token_id = getattr(actor_tokenizer, "eos_token_id", None)
+    for index, answer in enumerate(answers):
+        continuation = _format_answer_continuation(answer, suffix_text=suffix_text)
+        if continuation is None:
+            continue
+        token_ids = _encode_token_ids(
+            actor_tokenizer,
+            continuation,
+            max_length=max(1, int(max_answer_length)),
+        )
+        if not token_ids:
+            continue
+        valid_indices.append(index)
+        encoded_answers.append(token_ids)
+        steering_targets = list(token_ids)
+        if eos_token_id is not None:
+            steering_targets.append(int(eos_token_id))
+        encoded_steering_targets.append(steering_targets)
+    if not encoded_answers:
+        return None, 0, 0.0, 0.0, 0.0, 0.0
+
+    actor_device = _model_device(actor_model)
+    steering_device = next(latent_logit_steering.parameters()).device
+    embedding = actor_model.get_input_embeddings()
+    row_index_tensor = torch.tensor(valid_indices, dtype=torch.long, device=latent_prefix.device)
+    selected_prefix = latent_prefix.index_select(0, row_index_tensor)
+    prefix_for_actor = selected_prefix.to(device=actor_device, dtype=embedding.weight.dtype)
+    suffix_ids = _encode_token_ids(actor_tokenizer, suffix_text)
+    suffix_width = len(suffix_ids)
+    answer_width = max(len(token_ids) for token_ids in encoded_answers)
+    pad_token_id = int(
+        getattr(
+            actor_tokenizer,
+            "pad_token_id",
+            getattr(actor_tokenizer, "eos_token_id", 0) or 0,
+        )
+        or 0
+    )
+    if suffix_width:
+        suffix_tensor = torch.tensor(
+            suffix_ids,
+            dtype=torch.long,
+            device=actor_device,
+        ).unsqueeze(0).expand(prefix_for_actor.shape[0], suffix_width)
+        suffix_embeds = embedding(suffix_tensor)
+    else:
+        suffix_embeds = prefix_for_actor[:, :0, :]
+    answer_tensor = torch.full(
+        (prefix_for_actor.shape[0], answer_width),
+        pad_token_id,
+        dtype=torch.long,
+        device=actor_device,
+    )
+    answer_mask = torch.zeros(
+        (prefix_for_actor.shape[0], answer_width),
+        dtype=torch.long,
+        device=actor_device,
+    )
+    for row_index, token_ids in enumerate(encoded_answers):
+        answer_tensor[row_index, : len(token_ids)] = torch.tensor(
+            token_ids,
+            dtype=torch.long,
+            device=actor_device,
+        )
+        answer_mask[row_index, : len(token_ids)] = 1
+    answer_embeds = embedding(answer_tensor)
+    inputs_embeds = torch.cat([prefix_for_actor, suffix_embeds, answer_embeds], dim=1)
+    attention_mask = torch.cat(
+        [
+            torch.ones(prefix_for_actor.shape[:2], dtype=torch.long, device=actor_device),
+            torch.ones((prefix_for_actor.shape[0], suffix_width), dtype=torch.long, device=actor_device),
+            answer_mask,
+        ],
+        dim=1,
+    )
+    with torch.no_grad():
+        base_logits = actor_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        ).logits.float()
+
+    vocab_weight = lm_vocabulary_weight(actor_model)
+    max_steering_steps = min(
+        max(len(token_ids) for token_ids in encoded_steering_targets),
+        int(getattr(latent_logit_steering, "output_steps", 1)),
+    )
+    logits_bias = latent_logit_steering.forward_sequence(
+        selected_prefix.to(device=steering_device, dtype=vocab_weight.dtype),
+        vocab_weight.to(device=steering_device),
+        output_steps=max_steering_steps,
+    ).to(device=actor_device, dtype=base_logits.dtype)
+    answer_start = prefix_for_actor.shape[1] + suffix_width
+    flat_logits: list[torch.Tensor] = []
+    flat_targets: list[torch.Tensor] = []
+    for row_index, token_ids in enumerate(encoded_steering_targets):
+        width = min(len(token_ids), max_steering_steps)
+        for offset in range(width):
+            flat_logits.append(
+                base_logits[row_index, answer_start + offset - 1, :] + logits_bias[row_index, offset, :]
+            )
+            flat_targets.append(torch.tensor(token_ids[offset], dtype=torch.long, device=actor_device))
+    if not flat_logits:
+        return None, 0, 0.0, 0.0, 0.0, 0.0
+    logits = torch.stack(flat_logits).float()
+    targets = torch.stack(flat_targets)
+    ce_loss = F.cross_entropy(logits, targets)
+    target_logits = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    target_mask = torch.zeros_like(logits, dtype=torch.bool)
+    target_mask.scatter_(1, targets.unsqueeze(1), True)
+    other_logits = logits.masked_fill(target_mask, float("-inf")).max(dim=-1).values
+    margin_loss = F.relu(float(margin) - (target_logits - other_logits)).mean()
+    steering_loss = ce_loss + margin_loss
+    predictions = logits.argmax(dim=-1)
+    accuracy = float((predictions == targets).float().mean().detach().cpu().item() * 100.0)
+    ranks = 1 + (logits > target_logits.unsqueeze(1)).sum(dim=-1).float()
+    average_rank = float(ranks.mean().detach().cpu().item())
+    average_margin = float((target_logits - other_logits).mean().detach().cpu().item())
+    bias_norm = float(logits_bias.detach().float().norm(dim=-1).mean().cpu().item())
+    return steering_loss, len(encoded_answers), accuracy, average_rank, average_margin, bias_norm
 
 
 def _candidate_target_indices(
@@ -1092,6 +1295,21 @@ def train_reasoner_stage2(
         if config.latent_soft_prompt_decoder_enabled
         else None
     )
+    latent_logit_steering = (
+        LatentLogitSteeringHead(
+            actor_hidden_size,
+            rank=config.latent_logit_steering_rank,
+            vocabulary_size=int(lm_vocabulary_weight(actor_model).shape[0]),
+            vocabulary_mode=config.latent_logit_steering_vocabulary_mode,
+            output_steps=config.latent_logit_steering_output_steps,
+            dropout=config.latent_logit_steering_dropout,
+            scale=config.latent_logit_steering_scale,
+            pooling=config.latent_logit_steering_pooling,
+            max_bias_norm=config.latent_logit_steering_max_bias_norm,
+        )
+        if config.latent_logit_steering_enabled
+        else None
+    )
     if hidden_state_processor is not None:
         hidden_state_processor.train()
     if latent_handoff_adapter is not None:
@@ -1103,14 +1321,37 @@ def train_reasoner_stage2(
     if latent_soft_prompt_decoder is not None:
         latent_soft_prompt_decoder.to(_model_device(reasoner_model))
         latent_soft_prompt_decoder.train()
+    if latent_logit_steering is not None:
+        latent_logit_steering.to(_model_device(actor_model))
+        latent_logit_steering.train()
+    base_trainable_parameters = (
+        list(p for p in reasoner_model.parameters() if p.requires_grad)
+        + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
+        + ([] if latent_answer_probe is None else list(latent_answer_probe.parameters()))
+        + ([] if latent_soft_prompt_decoder is None else list(latent_soft_prompt_decoder.parameters()))
+        + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
+    )
+    optimizer_param_groups: list[dict[str, Any]] = []
+    if base_trainable_parameters:
+        optimizer_param_groups.append(
+            {
+                "params": base_trainable_parameters,
+                "lr": config.learning_rate,
+            }
+        )
+    if latent_logit_steering is not None:
+        steering_parameters = list(latent_logit_steering.parameters())
+        if steering_parameters:
+            optimizer_param_groups.append(
+                {
+                    "params": steering_parameters,
+                    "lr": config.learning_rate * config.latent_logit_steering_lr_multiplier,
+                }
+            )
+    if not optimizer_param_groups:
+        raise ValueError("train_reasoner_stage2 received no trainable parameters")
     optimizer = torch.optim.AdamW(
-        (
-            list(p for p in reasoner_model.parameters() if p.requires_grad)
-            + ([] if latent_handoff_adapter is None else list(latent_handoff_adapter.parameters()))
-            + ([] if latent_answer_probe is None else list(latent_answer_probe.parameters()))
-            + ([] if latent_soft_prompt_decoder is None else list(latent_soft_prompt_decoder.parameters()))
-            + ([] if hidden_state_processor is None else list(hidden_state_processor.parameters()))
-        ),
+        optimizer_param_groups,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -1126,6 +1367,8 @@ def train_reasoner_stage2(
         latent_answer_probe.to(reasoner_device)
     if latent_soft_prompt_decoder is not None:
         latent_soft_prompt_decoder.to(reasoner_device)
+    if latent_logit_steering is not None:
+        latent_logit_steering.to(actor_device)
     curriculum_stages = _curriculum_schedule(config) if config.curriculum_enabled else (
         CurriculumStage(
             name="default",
@@ -1175,6 +1418,7 @@ def train_reasoner_stage2(
             "l_contrast": config.lambda_contrast,
             "l_answer": config.lambda_answer,
             "l_answer_first_token": config.lambda_answer_first_token,
+            "l_logit_steering": config.lambda_logit_steering,
             "l_answer_contrast": config.lambda_answer_contrast,
             "l_answer_probe": config.lambda_answer_probe,
         },
@@ -1205,6 +1449,11 @@ def train_reasoner_stage2(
             eval_context["stage2_latent_answer_candidates"] = latest_candidate_answers
         if latent_soft_prompt_decoder is not None:
             eval_context["stage2_latent_soft_prompt_decoder"] = latent_soft_prompt_decoder
+        if latent_logit_steering is not None:
+            eval_context["stage2_latent_logit_steering"] = latent_logit_steering
+            eval_context["stage2_latent_logit_steering_generation_scale"] = (
+                config.latent_logit_steering_generation_scale
+            )
         module_training_states = [
             (module, module.training)
             for module in (
@@ -1212,6 +1461,7 @@ def train_reasoner_stage2(
                 hidden_state_processor,
                 latent_answer_probe,
                 latent_soft_prompt_decoder,
+                latent_logit_steering,
             )
             if module is not None
         ]
@@ -1397,6 +1647,23 @@ def train_reasoner_stage2(
                 max_answer_length=config.answer_max_length,
                 margin=config.answer_first_token_margin,
             )
+            (
+                logit_steering_loss,
+                logit_steering_sample_count,
+                logit_steering_accuracy,
+                logit_steering_rank_mean,
+                logit_steering_margin_mean,
+                logit_steering_bias_norm,
+            ) = _compute_latent_logit_steering_loss(
+                latent_logit_steering=latent_logit_steering,
+                actor_model=actor_model,
+                actor_tokenizer=actor_tokenizer,
+                latent_prefix=actor_prefix_latents,
+                answers=answers,
+                suffix_text=config.answer_suffix_text,
+                max_answer_length=config.answer_max_length,
+                margin=config.logit_steering_margin,
+            )
             answer_contrast_loss, answer_contrast_sample_count, answer_contrast_accuracy = (
                 _compute_latent_candidate_contrast_loss(
                     actor_model=actor_model,
@@ -1428,6 +1695,8 @@ def train_reasoner_stage2(
                 loss_terms["l_answer"] = answer_loss.to(reasoner_device)
             if answer_first_token_loss is not None:
                 loss_terms["l_answer_first_token"] = answer_first_token_loss.to(reasoner_device)
+            if logit_steering_loss is not None:
+                loss_terms["l_logit_steering"] = logit_steering_loss.to(reasoner_device)
             if answer_contrast_loss is not None:
                 loss_terms["l_answer_contrast"] = answer_contrast_loss.to(reasoner_device)
             if answer_probe_loss is not None:
@@ -1438,11 +1707,13 @@ def train_reasoner_stage2(
             adapter_before = _snapshot_module_parameters(latent_handoff_adapter)
             answer_probe_before = _snapshot_module_parameters(latent_answer_probe)
             soft_prompt_decoder_before = _snapshot_module_parameters(latent_soft_prompt_decoder)
+            logit_steering_before = _snapshot_module_parameters(latent_logit_steering)
             total_loss.backward()
             reasoner_grad_norm = _gradient_norm(reasoner_model)
             handoff_adapter_grad_norm = _gradient_norm(latent_handoff_adapter)
             latent_answer_probe_grad_norm = _gradient_norm(latent_answer_probe)
             latent_soft_prompt_decoder_grad_norm = _gradient_norm(latent_soft_prompt_decoder)
+            latent_logit_steering_grad_norm = _gradient_norm(latent_logit_steering)
             hidden_processor_grad_norm = _gradient_norm(hidden_state_processor)
             nn.utils.clip_grad_norm_(reasoner_model.parameters(), config.max_grad_norm)
             if latent_handoff_adapter is not None:
@@ -1451,6 +1722,8 @@ def train_reasoner_stage2(
                 nn.utils.clip_grad_norm_(latent_answer_probe.parameters(), config.max_grad_norm)
             if latent_soft_prompt_decoder is not None:
                 nn.utils.clip_grad_norm_(latent_soft_prompt_decoder.parameters(), config.max_grad_norm)
+            if latent_logit_steering is not None:
+                nn.utils.clip_grad_norm_(latent_logit_steering.parameters(), config.max_grad_norm)
             if hidden_state_processor is not None:
                 nn.utils.clip_grad_norm_(hidden_state_processor.parameters(), config.max_grad_norm)
             optimizer.step()
@@ -1459,6 +1732,10 @@ def train_reasoner_stage2(
             latent_soft_prompt_decoder_update_norm = _module_update_norm(
                 soft_prompt_decoder_before,
                 latent_soft_prompt_decoder,
+            )
+            latent_logit_steering_update_norm = _module_update_norm(
+                logit_steering_before,
+                latent_logit_steering,
             )
 
             metrics = {
@@ -1474,6 +1751,9 @@ def train_reasoner_stage2(
                 "l_answer_first_token": 0.0
                 if answer_first_token_loss is None
                 else float(answer_first_token_loss.detach().cpu().item()),
+                "l_logit_steering": 0.0
+                if logit_steering_loss is None
+                else float(logit_steering_loss.detach().cpu().item()),
                 "l_answer_contrast": 0.0
                 if answer_contrast_loss is None
                 else float(answer_contrast_loss.detach().cpu().item()),
@@ -1486,6 +1766,11 @@ def train_reasoner_stage2(
                 "answer_first_token_accuracy": float(answer_first_token_accuracy),
                 "answer_first_token_rank_mean": float(answer_first_token_rank_mean),
                 "answer_first_token_margin_mean": float(answer_first_token_margin_mean),
+                "logit_steering_sample_count": float(logit_steering_sample_count),
+                "logit_steering_accuracy": float(logit_steering_accuracy),
+                "logit_steering_rank_mean": float(logit_steering_rank_mean),
+                "logit_steering_margin_mean": float(logit_steering_margin_mean),
+                "logit_steering_bias_norm": float(logit_steering_bias_norm),
                 "answer_contrast_sample_count": float(answer_contrast_sample_count),
                 "answer_contrast_accuracy": float(answer_contrast_accuracy),
                 "answer_probe_sample_count": float(answer_probe_sample_count),
@@ -1498,22 +1783,28 @@ def train_reasoner_stage2(
                 "effective_weight_contrast": effective_weights["l_contrast"],
                 "effective_weight_answer": effective_weights.get("l_answer", 0.0),
                 "effective_weight_answer_first_token": effective_weights.get("l_answer_first_token", 0.0),
+                "effective_weight_logit_steering": effective_weights.get("l_logit_steering", 0.0),
                 "effective_weight_answer_contrast": effective_weights.get("l_answer_contrast", 0.0),
                 "effective_weight_answer_probe": effective_weights.get("l_answer_probe", 0.0),
                 "reasoner_grad_norm": reasoner_grad_norm,
                 "handoff_adapter_grad_norm": handoff_adapter_grad_norm,
                 "latent_answer_probe_grad_norm": latent_answer_probe_grad_norm,
                 "latent_soft_prompt_decoder_grad_norm": latent_soft_prompt_decoder_grad_norm,
+                "latent_logit_steering_grad_norm": latent_logit_steering_grad_norm,
                 "hidden_processor_grad_norm": hidden_processor_grad_norm,
                 "handoff_adapter_update_norm": handoff_adapter_update_norm,
                 "latent_answer_probe_update_norm": latent_answer_probe_update_norm,
                 "latent_soft_prompt_decoder_update_norm": latent_soft_prompt_decoder_update_norm,
+                "latent_logit_steering_update_norm": latent_logit_steering_update_norm,
                 "latent_soft_prompt_decoder_delta_norm": soft_prompt_delta_norm,
                 "trainable_reasoner_parameter_count": float(_parameter_count(reasoner_model)),
                 "trainable_handoff_adapter_parameter_count": float(_parameter_count(latent_handoff_adapter)),
                 "trainable_latent_answer_probe_parameter_count": float(_parameter_count(latent_answer_probe)),
                 "trainable_latent_soft_prompt_decoder_parameter_count": float(
                     _parameter_count(latent_soft_prompt_decoder)
+                ),
+                "trainable_latent_logit_steering_parameter_count": float(
+                    _parameter_count(latent_logit_steering)
                 ),
                 "trainable_hidden_processor_parameter_count": float(_parameter_count(hidden_state_processor)),
                 "curriculum_stage": float(("identity", "orthogonal", "hybrid_affine").index(stage.alignment_strategy) if stage.alignment_strategy in {"identity", "orthogonal", "hybrid_affine"} else 0),
@@ -1562,6 +1853,7 @@ def train_reasoner_stage2(
                         "l_contrast": metrics["l_contrast"],
                         "l_answer": metrics["l_answer"],
                         "l_answer_first_token": metrics["l_answer_first_token"],
+                        "l_logit_steering": metrics["l_logit_steering"],
                         "l_answer_contrast": metrics["l_answer_contrast"],
                         "l_answer_probe": metrics["l_answer_probe"],
                         "answer_loss_sample_count": metrics["answer_loss_sample_count"],
@@ -1570,6 +1862,11 @@ def train_reasoner_stage2(
                         "answer_first_token_accuracy": metrics["answer_first_token_accuracy"],
                         "answer_first_token_rank_mean": metrics["answer_first_token_rank_mean"],
                         "answer_first_token_margin_mean": metrics["answer_first_token_margin_mean"],
+                        "logit_steering_sample_count": metrics["logit_steering_sample_count"],
+                        "logit_steering_accuracy": metrics["logit_steering_accuracy"],
+                        "logit_steering_rank_mean": metrics["logit_steering_rank_mean"],
+                        "logit_steering_margin_mean": metrics["logit_steering_margin_mean"],
+                        "logit_steering_bias_norm": metrics["logit_steering_bias_norm"],
                         "answer_contrast_sample_count": metrics["answer_contrast_sample_count"],
                         "answer_contrast_accuracy": metrics["answer_contrast_accuracy"],
                         "answer_probe_sample_count": metrics["answer_probe_sample_count"],
@@ -1584,6 +1881,9 @@ def train_reasoner_stage2(
                         "effective_weight_answer_first_token": metrics[
                             "effective_weight_answer_first_token"
                         ],
+                        "effective_weight_logit_steering": metrics[
+                            "effective_weight_logit_steering"
+                        ],
                         "effective_weight_answer_contrast": metrics["effective_weight_answer_contrast"],
                         "effective_weight_answer_probe": metrics["effective_weight_answer_probe"],
                         "reasoner_grad_norm": metrics["reasoner_grad_norm"],
@@ -1592,11 +1892,17 @@ def train_reasoner_stage2(
                         "latent_soft_prompt_decoder_grad_norm": metrics[
                             "latent_soft_prompt_decoder_grad_norm"
                         ],
+                        "latent_logit_steering_grad_norm": metrics[
+                            "latent_logit_steering_grad_norm"
+                        ],
                         "hidden_processor_grad_norm": metrics["hidden_processor_grad_norm"],
                         "handoff_adapter_update_norm": metrics["handoff_adapter_update_norm"],
                         "latent_answer_probe_update_norm": metrics["latent_answer_probe_update_norm"],
                         "latent_soft_prompt_decoder_update_norm": metrics[
                             "latent_soft_prompt_decoder_update_norm"
+                        ],
+                        "latent_logit_steering_update_norm": metrics[
+                            "latent_logit_steering_update_norm"
                         ],
                         "latent_soft_prompt_decoder_delta_norm": metrics[
                             "latent_soft_prompt_decoder_delta_norm"
@@ -1610,6 +1916,9 @@ def train_reasoner_stage2(
                         ],
                         "trainable_latent_soft_prompt_decoder_parameter_count": metrics[
                             "trainable_latent_soft_prompt_decoder_parameter_count"
+                        ],
+                        "trainable_latent_logit_steering_parameter_count": metrics[
+                            "trainable_latent_logit_steering_parameter_count"
                         ],
                         "trainable_hidden_processor_parameter_count": metrics[
                             "trainable_hidden_processor_parameter_count"
@@ -1650,6 +1959,9 @@ def train_reasoner_stage2(
                             "latent_soft_prompt_decoder_state_dict": None
                             if latent_soft_prompt_decoder is None
                             else latent_soft_prompt_decoder.state_dict(),
+                            "latent_logit_steering_state_dict": None
+                            if latent_logit_steering is None
+                            else latent_logit_steering.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "training_config": dataclasses.asdict(config),
                             "alignment_context": alignment_context,
@@ -1682,6 +1994,9 @@ def train_reasoner_stage2(
                     "latent_soft_prompt_decoder_state_dict": None
                     if latent_soft_prompt_decoder is None
                     else latent_soft_prompt_decoder.state_dict(),
+                    "latent_logit_steering_state_dict": None
+                    if latent_logit_steering is None
+                    else latent_logit_steering.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "training_config": dataclasses.asdict(config),
                     "alignment_context": latest_alignment_context,

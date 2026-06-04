@@ -341,6 +341,35 @@ def _truncate_decoded_text_at_stop(
     return decoded_text[: match.end()]
 
 
+def _broadcast_logits_bias(
+    logits: torch.Tensor,
+    logits_bias: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    bias = logits_bias.to(device=logits.device, dtype=logits.dtype)
+    if bias.dim() == 1:
+        bias = bias.unsqueeze(0)
+    if bias.dim() != 2:
+        raise ValueError(
+            "logits_bias must have shape [vocab_size] or [batch, vocab_size]; "
+            f"received {tuple(logits_bias.shape)}"
+        )
+    if bias.shape[-1] != logits.shape[-1]:
+        raise ValueError(
+            "logits_bias vocabulary dimension does not match logits: "
+            f"{bias.shape[-1]} != {logits.shape[-1]}"
+        )
+    if bias.shape[0] == 1 and logits.shape[0] != 1:
+        bias = bias.expand(logits.shape[0], -1)
+    if bias.shape[0] != logits.shape[0]:
+        raise ValueError(
+            "logits_bias batch dimension does not match logits: "
+            f"{bias.shape[0]} != {logits.shape[0]}"
+        )
+    return logits + (bias * float(scale))
+
+
 def generate_from_prefix_embeddings(
     *,
     model: AutoModelForCausalLM,
@@ -350,6 +379,10 @@ def generate_from_prefix_embeddings(
     attention_mask: Optional[torch.Tensor] = None,
     decoded_text_prefix: str = "",
     stop_regex: Optional[re.Pattern[str]] = None,
+    first_step_logits_bias: Optional[torch.Tensor] = None,
+    first_step_logits_bias_scale: float = 1.0,
+    step_logits_bias: Optional[torch.Tensor] = None,
+    step_logits_bias_scale: float = 1.0,
 ) -> dict[str, Any]:
     """Decode from a continuous prompt using the model's native generation path."""
     model_device = next(model.parameters()).device
@@ -373,15 +406,109 @@ def generate_from_prefix_embeddings(
     if pad_token_id is None:
         pad_token_id = eos_token_id
 
-    with torch.no_grad():
-        generated = model.generate(
-            inputs_embeds=prefix,
-            attention_mask=attention_mask,
-            max_new_tokens=max(1, int(max_new_tokens)),
-            do_sample=False,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
+    steering_bias = step_logits_bias
+    steering_scale = float(step_logits_bias_scale)
+    if steering_bias is None and first_step_logits_bias is not None:
+        steering_bias = first_step_logits_bias.unsqueeze(1) if first_step_logits_bias.dim() == 2 else first_step_logits_bias
+        steering_scale = float(first_step_logits_bias_scale)
+    if steering_bias is not None:
+        if steering_bias.dim() == 2:
+            steering_bias = steering_bias.unsqueeze(1)
+        if steering_bias.dim() != 3:
+            raise ValueError(
+                "step_logits_bias must have shape [batch, steps, vocab_size]; "
+                f"received {tuple(steering_bias.shape)}"
+            )
+        with torch.no_grad():
+            current_prefix = prefix
+            current_attention = attention_mask
+            generated_token_ids: list[int] = []
+            eos_token_ids: set[int] = set()
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, (list, tuple, set)):
+                    eos_token_ids = {int(token_id) for token_id in eos_token_id}
+                else:
+                    eos_token_ids = {int(eos_token_id)}
+            manual_steps = min(max(1, int(max_new_tokens)), int(steering_bias.shape[1]))
+            stopped = False
+            for step_index in range(manual_steps):
+                outputs = model(
+                    inputs_embeds=current_prefix,
+                    attention_mask=current_attention,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                step_logits = _broadcast_logits_bias(
+                    outputs.logits[:, -1, :].float(),
+                    steering_bias[:, step_index, :],
+                    scale=steering_scale,
+                )
+                next_tokens = step_logits.argmax(dim=-1)
+                next_token_id = int(next_tokens[0].detach().cpu().item())
+                if next_token_id in eos_token_ids:
+                    stopped = True
+                    break
+                generated_token_ids.append(next_token_id)
+                next_token_embeds = model.get_input_embeddings()(next_tokens.unsqueeze(1)).to(
+                    dtype=current_prefix.dtype,
+                )
+                current_prefix = torch.cat([current_prefix, next_token_embeds], dim=1)
+                current_attention = torch.cat(
+                    [
+                        current_attention,
+                        torch.ones(
+                            (current_attention.shape[0], 1),
+                            dtype=current_attention.dtype,
+                            device=current_attention.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+
+        first_token_id = generated_token_ids[0] if generated_token_ids else None
+        eos_token_ids: set[int] = set()
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, (list, tuple, set)):
+                eos_token_ids = {int(token_id) for token_id in eos_token_id}
+            else:
+                eos_token_ids = {int(eos_token_id)}
+        if len(generated_token_ids) < max_new_tokens and not stopped:
+            with torch.no_grad():
+                generated_tail = model.generate(
+                    inputs_embeds=current_prefix,
+                    attention_mask=current_attention,
+                    max_new_tokens=max(1, int(max_new_tokens) - len(generated_token_ids)),
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=eos_token_id,
+                )
+            generated_token_ids.extend(generated_tail[0].detach().cpu().tolist())
+        decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        decoded_text = _truncate_decoded_text_at_stop(
+            str(decoded_text_prefix) + decoded_suffix,
+            stop_regex,
         )
+        return {
+            "decoded_text": decoded_text,
+            "generated_tokens": len(generated_token_ids),
+            "generated_token_ids": generated_token_ids,
+            "first_generated_token_id": first_token_id,
+            "first_generated_token_text": None
+            if first_token_id is None
+            else tokenizer.decode([first_token_id], skip_special_tokens=True),
+        }
+
+    generation_kwargs: dict[str, Any] = {
+        "inputs_embeds": prefix,
+        "attention_mask": attention_mask,
+        "max_new_tokens": max(1, int(max_new_tokens)),
+        "do_sample": False,
+        "pad_token_id": pad_token_id,
+        "eos_token_id": eos_token_id,
+    }
+
+    with torch.no_grad():
+        generated = model.generate(**generation_kwargs)
     generated_token_ids = generated[0].detach().cpu().tolist()
     decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     decoded_text = _truncate_decoded_text_at_stop(
@@ -391,6 +518,11 @@ def generate_from_prefix_embeddings(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": len(generated_token_ids),
+        "generated_token_ids": generated_token_ids,
+        "first_generated_token_id": generated_token_ids[0] if generated_token_ids else None,
+        "first_generated_token_text": None
+        if not generated_token_ids
+        else tokenizer.decode([generated_token_ids[0]], skip_special_tokens=True),
     }
 
 
@@ -485,6 +617,10 @@ def compute_answer_metrics_from_prefix_embeddings(
     prefix_embeds: torch.Tensor,
     answer_text: Optional[str],
     answer_variants: Optional[Sequence[str]] = None,
+    first_step_logits_bias: Optional[torch.Tensor] = None,
+    first_step_logits_bias_scale: float = 1.0,
+    step_logits_bias: Optional[torch.Tensor] = None,
+    step_logits_bias_scale: float = 1.0,
 ) -> dict[str, Optional[float]]:
     candidates: list[str] = []
     if answer_text is not None and str(answer_text).strip():
@@ -509,6 +645,10 @@ def compute_answer_metrics_from_prefix_embeddings(
             tokenizer=tokenizer,
             prefix_embeds=prefix_embeds,
             answer_text=candidate,
+            first_step_logits_bias=first_step_logits_bias,
+            first_step_logits_bias_scale=first_step_logits_bias_scale,
+            step_logits_bias=step_logits_bias,
+            step_logits_bias_scale=step_logits_bias_scale,
         )
         if candidate_metrics["answer_nll"] is None:
             continue
@@ -530,6 +670,8 @@ def compute_first_token_metrics_from_prefix_embeddings(
     prefix_embeds: torch.Tensor,
     answer_text: Optional[str],
     answer_variants: Optional[Sequence[str]] = None,
+    first_step_logits_bias: Optional[torch.Tensor] = None,
+    first_step_logits_bias_scale: float = 1.0,
 ) -> dict[str, Optional[float | int | str | bool]]:
     candidates: list[str] = []
     if answer_text is not None and str(answer_text).strip():
@@ -567,6 +709,12 @@ def compute_first_token_metrics_from_prefix_embeddings(
             return_dict=True,
     )
     logits = outputs.logits[:, -1, :].float()
+    if first_step_logits_bias is not None:
+        logits = _broadcast_logits_bias(
+            logits,
+            first_step_logits_bias,
+            scale=first_step_logits_bias_scale,
+        )
     predicted_id = int(logits.argmax(dim=-1)[0].detach().cpu().item())
     predicted_text = (
         tokenizer.decode([predicted_id], skip_special_tokens=True)
@@ -669,6 +817,10 @@ def _compute_single_answer_metrics_from_prefix_embeddings(
     tokenizer: Any,
     prefix_embeds: torch.Tensor,
     answer_text: str,
+    first_step_logits_bias: Optional[torch.Tensor] = None,
+    first_step_logits_bias_scale: float = 1.0,
+    step_logits_bias: Optional[torch.Tensor] = None,
+    step_logits_bias_scale: float = 1.0,
 ) -> dict[str, Optional[float]]:
     answer_token_ids = tokenizer.encode(str(answer_text), add_special_tokens=False)
     if not answer_token_ids:
@@ -703,10 +855,23 @@ def _compute_single_answer_metrics_from_prefix_embeddings(
 
     answer_start = prefix.shape[1]
     per_token_nll: list[torch.Tensor] = []
+    steering_bias = step_logits_bias
+    steering_scale = float(step_logits_bias_scale)
+    if steering_bias is None and first_step_logits_bias is not None:
+        steering_bias = first_step_logits_bias.unsqueeze(1) if first_step_logits_bias.dim() == 2 else first_step_logits_bias
+        steering_scale = float(first_step_logits_bias_scale)
+    if steering_bias is not None and steering_bias.dim() == 2:
+        steering_bias = steering_bias.unsqueeze(1)
     for offset, token_id in enumerate(answer_token_ids):
         prediction_position = answer_start + offset - 1
         target = torch.tensor([token_id], dtype=torch.long, device=model_device)
         logits = outputs.logits[:, prediction_position, :].float()
+        if steering_bias is not None and offset < int(steering_bias.shape[1]):
+            logits = _broadcast_logits_bias(
+                logits,
+                steering_bias[:, offset, :],
+                scale=steering_scale,
+            )
         per_token_nll.append(F.cross_entropy(logits, target, reduction="mean"))
 
     mean_nll = float(torch.stack(per_token_nll).mean().detach().cpu().item())

@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from latent_pipeline import _build_alignment_cache_key
-from src.models.hidden_state import LatentAnswerProbe
+from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead
 from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
@@ -15,6 +15,7 @@ from train_compressor import (
     _compute_latent_answer_probe_loss,
     _compute_latent_candidate_contrast_loss,
     _compute_latent_first_token_loss,
+    _compute_latent_logit_steering_loss,
     _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
@@ -213,6 +214,78 @@ def test_latent_first_token_loss_backprops_to_prefix() -> None:
     assert torch.isfinite(latent_prefix.grad).all()
 
 
+def test_latent_logit_steering_head_is_token_tied_and_trainable() -> None:
+    steering = LatentLogitSteeringHead(16, rank=4, pooling="mean_last")
+    low_rank_steering = LatentLogitSteeringHead(
+        16,
+        rank=4,
+        vocabulary_size=32,
+        vocabulary_mode="low_rank",
+        pooling="mean",
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+    vocabulary_weight = torch.randn(32, 16)
+
+    logits_bias = steering(latent_prefix, vocabulary_weight)
+    low_rank_logits_bias = low_rank_steering(latent_prefix, vocabulary_weight)
+    loss = logits_bias[:, 3].sum()
+    loss.backward()
+
+    assert logits_bias.shape == (2, 32)
+    assert low_rank_logits_bias.shape == (2, 32)
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in steering.parameters()
+        if parameter.grad is not None
+    )
+    assert grad_norm > 0.0
+
+
+def test_latent_logit_steering_loss_backprops_to_head_and_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    steering = LatentLogitSteeringHead(
+        16,
+        rank=4,
+        vocabulary_size=128,
+        vocabulary_mode="low_rank",
+        pooling="mean",
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    steering_loss, sample_count, accuracy, rank_mean, margin_mean, bias_norm = (
+        _compute_latent_logit_steering_loss(
+            latent_logit_steering=steering,
+            actor_model=actor,
+            actor_tokenizer=_TinyTokenizer(),
+            latent_prefix=latent_prefix,
+            answers=["13", "42"],
+            suffix_text="\nFinal answer: ",
+            max_answer_length=8,
+            margin=2.0,
+        )
+    )
+
+    assert steering_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= accuracy <= 100.0
+    assert rank_mean >= 1.0
+    assert isinstance(margin_mean, float)
+    assert bias_norm >= 0.0
+    steering_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in steering.parameters()
+        if parameter.grad is not None
+    )
+    assert grad_norm > 0.0
+
+
 def test_latent_answer_probe_loss_backprops_to_probe_and_prefix() -> None:
     probe = LatentAnswerProbe(16, max_candidates=4, hidden_multiplier=1)
     latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
@@ -389,6 +462,7 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         weight_decay=0.0,
         num_epochs=1,
         lambda_answer=20.0,
+        lambda_logit_steering=20.0,
         lambda_answer_probe=20.0,
         lambda_task=0.1,
         lambda_pref=0.1,
@@ -399,6 +473,9 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         train_reasoner=False,
         latent_answer_probe_enabled=True,
         latent_answer_probe_max_candidates=8,
+        latent_logit_steering_enabled=True,
+        latent_logit_steering_rank=4,
+        latent_logit_steering_vocabulary_mode="low_rank",
         latent_soft_prompt_decoder_enabled=True,
         latent_soft_prompt_decoder_output_steps=4,
         wandb_enabled=False,
@@ -424,6 +501,8 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
     assert train_row["latent_answer_probe_grad_norm"] > 0.0
     assert train_row["trainable_latent_soft_prompt_decoder_parameter_count"] > 0.0
     assert train_row["latent_soft_prompt_decoder_grad_norm"] > 0.0
+    assert train_row["trainable_latent_logit_steering_parameter_count"] > 0.0
+    assert train_row["latent_logit_steering_grad_norm"] > 0.0
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:
