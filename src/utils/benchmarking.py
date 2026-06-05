@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 20
+REPORT_SCHEMA_VERSION = 21
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -44,6 +44,7 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "receiver_context_reason",
     "receiver_context_token_count",
     "receiver_context_latent_position",
+    "receiver_input_token_count",
     "decode_status",
     "prompt",
     "target_answer",
@@ -158,6 +159,9 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "total_latency_seconds",
     "average_latency_seconds",
     "total_generated_tokens",
+    "total_receiver_input_tokens",
+    "mean_receiver_input_token_count",
+    "max_receiver_input_token_count",
     "tokens_per_second",
     "total_answer_tokens",
     "mean_answer_nll",
@@ -394,6 +398,12 @@ def aggregate_standard_rows(
         ]
         total_latency_seconds = sum(float(row.get("latency_seconds", 0.0)) for row in group_rows)
         total_generated_tokens = sum(int(row.get("generated_tokens", 0) or 0) for row in group_rows)
+        receiver_input_token_counts = [
+            int(row.get("receiver_input_token_count", 0) or 0)
+            for row in group_rows
+            if row.get("receiver_input_token_count") not in (None, "")
+        ]
+        total_receiver_input_tokens = sum(receiver_input_token_counts)
         total_answer_tokens = sum(int(row.get("answer_token_count", 0) or 0) for row in group_rows)
         total_answer_nll = sum(
             float(row["answer_nll"]) * int(row.get("answer_token_count", 0) or 0)
@@ -518,6 +528,17 @@ def aggregate_standard_rows(
                 "total_latency_seconds": total_latency_seconds,
                 "average_latency_seconds": (total_latency_seconds / sample_count) if sample_count else 0.0,
                 "total_generated_tokens": total_generated_tokens,
+                "total_receiver_input_tokens": total_receiver_input_tokens,
+                "mean_receiver_input_token_count": (
+                    total_receiver_input_tokens / len(receiver_input_token_counts)
+                    if receiver_input_token_counts
+                    else None
+                ),
+                "max_receiver_input_token_count": (
+                    max(receiver_input_token_counts)
+                    if receiver_input_token_counts
+                    else None
+                ),
                 "tokens_per_second": (
                     total_generated_tokens / total_latency_seconds if total_latency_seconds > 0 else 0.0
                 ),
@@ -1130,6 +1151,9 @@ def build_transfer_comparison_report(
     baseline_perplexity = _safe_float(
         None if baseline_row is None else baseline_row.get("answer_perplexity")
     )
+    baseline_receiver_tokens = _safe_float(
+        None if baseline_row is None else baseline_row.get("mean_receiver_input_token_count")
+    )
 
     comparisons: list[dict[str, Any]] = []
     missing_requirements: list[str] = []
@@ -1143,6 +1167,7 @@ def build_transfer_comparison_report(
         latent_accuracy = _safe_float(latent_row.get("accuracy_percentage"))
         latent_latency = _safe_float(latent_row.get("average_latency_seconds"))
         latent_perplexity = _safe_float(latent_row.get("answer_perplexity"))
+        latent_receiver_tokens = _safe_float(latent_row.get("mean_receiver_input_token_count"))
         accuracy_delta = (
             None
             if latent_accuracy is None or baseline_accuracy is None
@@ -1150,6 +1175,7 @@ def build_transfer_comparison_report(
         )
         latency_ratio = _safe_ratio(latent_latency, baseline_latency)
         retention_ratio = _safe_ratio(latent_accuracy, baseline_accuracy)
+        receiver_token_ratio = _safe_ratio(latent_receiver_tokens, baseline_receiver_tokens)
         perplexity_delta = (
             None
             if latent_perplexity is None or baseline_perplexity is None
@@ -1166,6 +1192,14 @@ def build_transfer_comparison_report(
             "baseline_average_latency_seconds": baseline_latency,
             "latent_average_latency_seconds": latent_latency,
             "latency_ratio": latency_ratio,
+            "baseline_mean_receiver_input_token_count": baseline_receiver_tokens,
+            "latent_mean_receiver_input_token_count": latent_receiver_tokens,
+            "receiver_input_token_ratio": receiver_token_ratio,
+            "receiver_input_token_savings_percentage": (
+                None
+                if receiver_token_ratio is None
+                else 100.0 * (1.0 - receiver_token_ratio)
+            ),
             "baseline_answer_perplexity": baseline_perplexity,
             "latent_answer_perplexity": latent_perplexity,
             "answer_perplexity_delta": perplexity_delta,

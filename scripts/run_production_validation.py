@@ -16,9 +16,51 @@ DEFAULT_METHODS = (
 
 
 PROFILE_DEFAULTS = {
-    "local": {"eval_limit": 5, "train_limit": 32},
-    "gpu": {"eval_limit": 20, "train_limit": 128},
-    "scale": {"eval_limit": 64, "train_limit": 256},
+    "local": {
+        "dataset": "gsm8k",
+        "eval_limit": 5,
+        "train_limit": 32,
+        "max_new_tokens": None,
+        "reasoner_max_new_tokens": None,
+        "torch_dtype": None,
+        "device_map": None,
+    },
+    "mps": {
+        "dataset": "gsm8k",
+        "eval_limit": 5,
+        "train_limit": 32,
+        "max_new_tokens": 128,
+        "reasoner_max_new_tokens": 640,
+        "torch_dtype": "float32",
+        "device_map": "mps",
+    },
+    "long_context_mps": {
+        "dataset": "long_context_handoff",
+        "eval_limit": 3,
+        "train_limit": 8,
+        "max_new_tokens": 32,
+        "reasoner_max_new_tokens": 64,
+        "torch_dtype": "float32",
+        "device_map": "mps",
+    },
+    "gpu": {
+        "dataset": "gsm8k",
+        "eval_limit": 20,
+        "train_limit": 128,
+        "max_new_tokens": None,
+        "reasoner_max_new_tokens": None,
+        "torch_dtype": None,
+        "device_map": None,
+    },
+    "scale": {
+        "dataset": "gsm8k",
+        "eval_limit": 64,
+        "train_limit": 256,
+        "max_new_tokens": None,
+        "reasoner_max_new_tokens": None,
+        "torch_dtype": None,
+        "device_map": None,
+    },
 }
 
 
@@ -30,9 +72,20 @@ def _with_output_dir(args: argparse.Namespace, filename: str) -> str:
     return str(Path(args.output_dir) / filename)
 
 
+def _python_command(args: argparse.Namespace) -> list[str]:
+    flags = [
+        flag.strip()
+        for flag in str(getattr(args, "python_flags", "") or "").split()
+        if flag.strip()
+    ]
+    return [args.python, *flags]
+
+
 def _common_hetero_args(args: argparse.Namespace) -> list[str]:
-    return [
+    command = [
         "--hetero-smoke",
+        "--dataset",
+        args.dataset,
         "--sample-indices",
         _indices_csv(args.eval_limit),
         "--limit",
@@ -43,6 +96,15 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
         str(args.train_limit),
         "--enable-sender-revision",
     ]
+    if args.max_new_tokens is not None:
+        command.extend(["--max-new-tokens", str(args.max_new_tokens)])
+    if args.reasoner_max_new_tokens is not None:
+        command.extend(["--reasoner-max-new-tokens", str(args.reasoner_max_new_tokens)])
+    if args.torch_dtype is not None:
+        command.extend(["--torch-dtype", args.torch_dtype])
+    if args.device_map is not None:
+        command.extend(["--device-map", args.device_map])
+    return command
 
 
 def build_commands(args: argparse.Namespace) -> list[list[str]]:
@@ -53,12 +115,12 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
     )
     commands: list[list[str]] = []
     if args.include_tests:
-        commands.append([args.python, "-m", "pytest", "-q"])
+        commands.append([*_python_command(args), "-m", "pytest", "-q"])
 
     if args.prepare:
         commands.append(
             [
-                args.python,
+                *_python_command(args),
                 "benchmark_all.py",
                 *_common_hetero_args(args),
                 "--methods",
@@ -73,7 +135,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         )
         commands.append(
             [
-                args.python,
+                *_python_command(args),
                 "benchmark_all.py",
                 *_common_hetero_args(args),
                 "--methods",
@@ -89,7 +151,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
 
     commands.append(
         [
-            args.python,
+            *_python_command(args),
             "benchmark_all.py",
             *_common_hetero_args(args),
             "--methods",
@@ -108,12 +170,22 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
     if args.replay:
         commands.append(
             [
-                args.python,
+                *_python_command(args),
                 "benchmark_all.py",
                 "--eval-manifest",
                 manifest_path,
                 "--generated-trajectory-adapter-input-space",
                 args.generated_trajectory_adapter_input_space,
+                *(
+                    ["--torch-dtype", args.torch_dtype]
+                    if args.torch_dtype is not None
+                    else []
+                ),
+                *(
+                    ["--device-map", args.device_map]
+                    if args.device_map is not None
+                    else []
+                ),
                 "--enable-sender-revision",
                 "--generated-trajectory-adapter-no-train-on-missing",
                 "--report-output",
@@ -149,6 +221,12 @@ def _print_report_summary(report_path: Path) -> None:
     comparison = report.get("transfer_comparison_report") or {}
     hetero = report.get("heterogeneous_transfer_report") or {}
     manifest = report.get("eval_manifest") or {}
+    best_comparison = {}
+    best_latent_method = comparison.get("best_latent_method")
+    for row in comparison.get("comparisons") or []:
+        if row.get("method") == best_latent_method:
+            best_comparison = row
+            break
     print("\nProduction validation summary", flush=True)
     print(
         json.dumps(
@@ -157,6 +235,14 @@ def _print_report_summary(report_path: Path) -> None:
                 "method_accuracy_percentage": semantic.get("method_accuracy_percentage"),
                 "comparison_passed": comparison.get("passed"),
                 "best_latent_method": comparison.get("best_latent_method"),
+                "best_latent_accuracy_percentage": comparison.get("best_latent_accuracy_percentage"),
+                "best_latent_latency_ratio": best_comparison.get("latency_ratio"),
+                "best_latent_receiver_input_token_ratio": best_comparison.get(
+                    "receiver_input_token_ratio"
+                ),
+                "best_latent_receiver_input_token_savings_percentage": best_comparison.get(
+                    "receiver_input_token_savings_percentage"
+                ),
                 "heterogeneous_passed": hetero.get("passed"),
                 "heterogeneous_missing_requirements": hetero.get("missing_requirements"),
                 "sample_content_digest": manifest.get("sample_content_digest"),
@@ -178,10 +264,16 @@ def main() -> int:
         )
     )
     parser.add_argument("--python", default="venv/bin/python")
+    parser.add_argument("--python-flags", default="-B")
     parser.add_argument("--output-dir", default="outputs/production_validation")
     parser.add_argument("--profile", choices=tuple(PROFILE_DEFAULTS), default="local")
+    parser.add_argument("--dataset", choices=("gsm8k", "math", "long_context_handoff"), default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--reasoner-max-new-tokens", type=int, default=None)
+    parser.add_argument("--torch-dtype", choices=("float32", "float16", "bfloat16"), default=None)
+    parser.add_argument("--device-map", default=None)
     parser.add_argument(
         "--generated-trajectory-adapter-input-space",
         choices=("raw", "aligned"),
@@ -194,8 +286,23 @@ def main() -> int:
     args = parser.parse_args()
 
     defaults = PROFILE_DEFAULTS[args.profile]
+    args.dataset = str(args.dataset or defaults["dataset"])
     args.eval_limit = int(args.eval_limit or defaults["eval_limit"])
     args.train_limit = int(args.train_limit or defaults["train_limit"])
+    args.max_new_tokens = (
+        args.max_new_tokens
+        if args.max_new_tokens is not None
+        else defaults["max_new_tokens"]
+    )
+    args.reasoner_max_new_tokens = (
+        args.reasoner_max_new_tokens
+        if args.reasoner_max_new_tokens is not None
+        else defaults["reasoner_max_new_tokens"]
+    )
+    if args.torch_dtype is None:
+        args.torch_dtype = defaults["torch_dtype"]
+    if args.device_map is None:
+        args.device_map = defaults["device_map"]
     args.include_tests = not args.skip_tests
     args.prepare = not args.skip_prepare
 

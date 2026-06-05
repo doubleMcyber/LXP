@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from omegaconf import OmegaConf
 import pytest
@@ -42,6 +43,7 @@ from benchmark_all import (
     _predicted_answer,
     _sample_fingerprints,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
+    _require_requested_device_available,
     _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
@@ -94,6 +96,14 @@ def test_handoff_decode_prompt_respects_receiver_context_mode() -> None:
 
     cfg.handoff.receiver_context.mode = "none"
     assert _handoff_decode_prompt("question", cfg) is None
+
+
+def test_benchmark_guard_fails_fast_when_mps_unavailable() -> None:
+    cfg = OmegaConf.create({"device_map": "mps"})
+
+    with patch("benchmark_all.torch.backends.mps.is_available", return_value=False):
+        with pytest.raises(RuntimeError, match="MPS is not available"):
+            _require_requested_device_available(cfg)
 
 
 def test_build_standard_row_base_uses_cfg_metadata() -> None:
@@ -165,6 +175,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "predicted_answer": "1",
             "decoded_text": "1",
             "generated_tokens": 1,
+            "receiver_input_token_count": 120,
             "answer_token_count": 1,
             "answer_nll": 0.5,
             "answer_perplexity": 1.6487,
@@ -215,6 +226,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "predicted_answer": "0",
             "decoded_text": "0",
             "generated_tokens": 1,
+            "receiver_input_token_count": 180,
             "answer_token_count": 1,
             "answer_nll": 1.0,
             "answer_perplexity": 2.7183,
@@ -253,6 +265,9 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
     assert summary["accuracy_when_sender_correct_percentage"] == 50.0
     assert summary["average_latency_seconds"] == 2.0
     assert summary["tokens_per_second"] == 0.5
+    assert summary["total_receiver_input_tokens"] == 300
+    assert summary["mean_receiver_input_token_count"] == 150.0
+    assert summary["max_receiver_input_token_count"] == 180
     assert summary["cache_transfer_rate_percentage"] == 100.0
     assert summary["confidence_gate_trigger_rate_percentage"] == 50.0
     assert summary["mean_post_alignment_l2_distance"] == 0.30000000000000004
@@ -832,6 +847,7 @@ def test_transfer_comparison_report_tracks_accuracy_latency_and_retention() -> N
             "accuracy_percentage": 80.0,
             "average_latency_seconds": 2.0,
             "answer_perplexity": 1.5,
+            "mean_receiver_input_token_count": 1000.0,
         },
         {
             "method": "generated_context_latent_handoff",
@@ -839,6 +855,7 @@ def test_transfer_comparison_report_tracks_accuracy_latency_and_retention() -> N
             "accuracy_percentage": 72.0,
             "average_latency_seconds": 3.0,
             "answer_perplexity": 1.8,
+            "mean_receiver_input_token_count": 250.0,
             "cache_transfer_rate_percentage": None,
             "handoff_ok_rate_percentage": 100.0,
             "non_empty_decoded_rate_percentage": 100.0,
@@ -860,6 +877,8 @@ def test_transfer_comparison_report_tracks_accuracy_latency_and_retention() -> N
     assert comparison["accuracy_retention_ratio"] == 0.9
     assert comparison["latency_ratio"] == 1.5
     assert comparison["answer_perplexity_delta"] == pytest.approx(0.3)
+    assert comparison["receiver_input_token_ratio"] == 0.25
+    assert comparison["receiver_input_token_savings_percentage"] == 75.0
 
 
 def test_transfer_comparison_report_flags_retention_failures() -> None:

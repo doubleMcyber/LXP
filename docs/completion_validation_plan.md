@@ -28,6 +28,15 @@ What is now smoke-proven:
 - Unit suite passes: `158 passed, 1 skipped`.
 - Current unit suite passes after production validation reporting:
   `165 passed, 1 skipped`.
+- The benchmark report schema now records receiver-side input-token pressure and
+  transfer comparison token savings, so context-vs-latent runs can measure
+  compression directly.
+- The local `long_context_handoff` dataset provides deterministic frozen sender
+  traces for long-horizon handoff validation without depending on an external
+  dataset download.
+- The production validation runner has MPS and long-context MPS profiles. These
+  profiles use `python -B`, `torch_dtype=float32`, and explicit `device_map=mps`
+  guards so Apple Silicon runs fail before weight loading if MPS is unavailable.
 - The 3-sample locked hetero benchmark and replay both pass semantic,
   transfer-comparison, and heterogeneous-readiness gates with matching
   `sample_content_digest`.
@@ -43,10 +52,12 @@ Important interpretation:
 The recommended orchestrated path is now:
 
 ```bash
-venv/bin/python scripts/run_production_validation.py
-venv/bin/python scripts/run_production_validation.py --execute --profile local --replay
-venv/bin/python scripts/run_production_validation.py --execute --profile gpu --replay
-venv/bin/python scripts/run_production_validation.py --execute --profile scale --replay
+venv/bin/python -B scripts/run_production_validation.py
+venv/bin/python -B scripts/run_production_validation.py --execute --profile local --replay
+venv/bin/python -B scripts/run_production_validation.py --profile long_context_mps
+venv/bin/python -B scripts/run_production_validation.py --execute --profile long_context_mps --replay
+venv/bin/python -B scripts/run_production_validation.py --execute --profile gpu --replay
+venv/bin/python -B scripts/run_production_validation.py --execute --profile scale --replay
 ```
 
 The runner orders work as tests, generated sender-trace warm-up, generated
@@ -161,7 +172,36 @@ Pass condition:
 - `generated_context_latent_handoff` should be compared against those controls.
 - Latent failures should be categorized by provenance, not just counted as wrong.
 
-### 4. GPU Pilot
+### 4. Long-Context MPS Context-Vs-Latent Benchmark
+
+Use this when cloud GPUs are unavailable and local Apple Silicon MPS is
+available:
+
+```bash
+venv/bin/python -B scripts/run_production_validation.py \
+  --execute \
+  --profile long_context_mps \
+  --replay
+```
+
+Pass condition:
+
+- The locked manifest replay matches the original `sample_content_digest`.
+- Token-context controls receive the frozen long sender trace.
+- Latent methods retain interpretable accuracy while reducing
+  `mean_receiver_input_token_count` versus `token_context_handoff`.
+- The terminal summary reports latency ratio, receiver-token ratio, and
+  receiver-token savings for the best latent method.
+
+Interpretation:
+
+- This is the first local proof target for "latent handoff can be shorter than
+  pure token handoff on long horizons."
+- A passing three-row profile is still a smoke proof. Increase
+  `--eval-limit` and `--train-limit` one axis at a time before making a broad
+  performance claim.
+
+### 5. GPU Pilot
 
 When GPU access is available, use the bounded pilot:
 

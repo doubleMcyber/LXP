@@ -546,8 +546,38 @@ def _generate_agent_a_token_ids(
     return _trim_generated_ids_to_final_answer(tokenizer_a, generated_ids)
 
 
+def _frozen_sender_reasoning_text(state: Mapping[str, Any]) -> Optional[str]:
+    row = state.get("_current_sample_row")
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("sender_reasoning_text", "sender_reasoning", "reasoning_text"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
 def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) -> dict[str, Any]:
     tokenizer_a = state["tokenizer_a"]
+    frozen_reasoning_text = _frozen_sender_reasoning_text(state)
+    if frozen_reasoning_text is not None:
+        frozen_ids = tokenizer_a.encode(frozen_reasoning_text, add_special_tokens=False)
+        frozen_answer = _final_answer_marker_value(frozen_reasoning_text)
+        return {
+            "token_ids": [int(token_id) for token_id in frozen_ids],
+            "initial_token_ids": [int(token_id) for token_id in frozen_ids],
+            "initial_reasoning_text": frozen_reasoning_text,
+            "initial_predicted_answer": frozen_answer,
+            "revision_enabled": False,
+            "revision_applied": False,
+            "revision_token_ids": [],
+            "revision_reasoning_text": "",
+            "revision_predicted_answer": None,
+            "revision_decision_applied": False,
+            "revision_decision_token_ids": [],
+            "revision_decision_reasoning_text": "",
+            "revision_decision_predicted_answer": None,
+        }
     max_new_tokens = _reasoner_generation_max_new_tokens(cfg)
     cache = state.setdefault("_reasoner_token_ids_cache", {})
     cache_key = (
@@ -719,19 +749,19 @@ def _normalize_numeric_answer(answer: Optional[str]) -> Optional[str]:
 
 
 def _target_answer(dataset_name: str, row: Any) -> Optional[str]:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _extract_gsm8k_target_answer(pick_field(row, ("answer", "solution")))
     return extract_boxed_text(pick_field(row, ("solution", "answer")))
 
 
 def _predicted_answer(dataset_name: str, decoded_text: str) -> Optional[str]:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _extract_gsm8k_predicted_answer(decoded_text)
     return extract_boxed_text(decoded_text)
 
 
 def _answers_match(dataset_name: str, predicted_answer: Optional[str], target_answer: Optional[str]) -> bool:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _normalize_numeric_answer(predicted_answer) == _normalize_numeric_answer(target_answer)
     return normalize_answer(predicted_answer) == normalize_answer(target_answer)
 
@@ -859,7 +889,10 @@ def _alignment_variant_state(
     cache_key = (str(strategy), bool(prompt_calibration_enabled))
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached
+        cached_cfg, cached_state = cached
+        if "_current_sample_row" in state:
+            cached_state["_current_sample_row"] = state["_current_sample_row"]
+        return cached_cfg, cached_state
     variant_cfg = _alignment_variant_cfg(
         cfg,
         strategy=strategy,
@@ -871,6 +904,8 @@ def _alignment_variant_state(
         "_generated_sender_consensus_cache",
     ):
         variant_state[cache_name] = state.setdefault(cache_name, {})
+    if "_current_sample_row" in state:
+        variant_state["_current_sample_row"] = state["_current_sample_row"]
     cache[cache_key] = (variant_cfg, variant_state)
     return variant_cfg, variant_state
 
@@ -886,6 +921,22 @@ def _reasoner_metadata_for_text_hybrid(
     cfg: Any,
     state: dict[str, Any],
 ) -> dict[str, Any]:
+    frozen_reasoning_text = _frozen_sender_reasoning_text(state)
+    if frozen_reasoning_text is not None:
+        generation_metadata = _generate_reasoner_metadata(prompt, cfg, state)
+        generated_token_ids = [int(token_id) for token_id in generation_metadata["token_ids"]]
+        return {
+            "token_ids": generated_token_ids,
+            "reasoning_text": frozen_reasoning_text,
+            "trace_cache_hit": None,
+            "trace_cache_path": "",
+            "sender_revision_enabled": False,
+            "sender_revision_applied": False,
+            "sender_initial_predicted_answer": generation_metadata.get("initial_predicted_answer"),
+            "sender_revision_predicted_answer": None,
+            "sender_revision_decision_applied": False,
+            "sender_revision_decision_predicted_answer": None,
+        }
     trace_cache_path: Optional[Path] = None
     if _generated_trajectory_adapter_trace_cache_enabled(cfg):
         cache_key = _generated_trajectory_trace_cache_key(
@@ -1024,6 +1075,10 @@ def _build_eval_manifest(
     semantic_smoke: bool,
     mvp_smoke: bool,
     hetero_smoke: bool,
+    max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     sample_fingerprints: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     fingerprint_rows = [dict(row) for row in (sample_fingerprints or ())]
@@ -1038,6 +1093,12 @@ def _build_eval_manifest(
         "agent_a_model": str(agent_a_model),
         "agent_b_model": str(agent_b_model),
         "seed": int(seed),
+        "max_new_tokens": None if max_new_tokens is None else int(max_new_tokens),
+        "reasoner_max_new_tokens": (
+            None if reasoner_max_new_tokens is None else int(reasoner_max_new_tokens)
+        ),
+        "torch_dtype": None if torch_dtype is None else str(torch_dtype),
+        "device_map": None if device_map is None else str(device_map),
         "smoke_profile": {
             "semantic_smoke": bool(semantic_smoke),
             "mvp_smoke": bool(mvp_smoke),
@@ -1102,6 +1163,14 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
     args.agent_a_model = str(manifest["agent_a_model"])
     args.agent_b_model = str(manifest["agent_b_model"])
     args.seed = int(manifest["seed"])
+    if manifest.get("max_new_tokens") is not None:
+        args.max_new_tokens = int(manifest["max_new_tokens"])
+    if manifest.get("reasoner_max_new_tokens") is not None:
+        args.reasoner_max_new_tokens = int(manifest["reasoner_max_new_tokens"])
+    if manifest.get("torch_dtype") is not None:
+        args.torch_dtype = str(manifest["torch_dtype"])
+    if manifest.get("device_map") is not None:
+        args.device_map = str(manifest["device_map"])
     smoke_profile = manifest.get("smoke_profile") or {}
     args.semantic_smoke = bool(smoke_profile.get("semantic_smoke", False))
     args.mvp_smoke = bool(smoke_profile.get("mvp_smoke", False))
@@ -2310,6 +2379,7 @@ def _build_generated_trajectory_training_rows(
         prompt = pick_field(row, ("question", "problem"))
         if not str(prompt).strip():
             continue
+        state["_current_sample_row"] = dict(row)
         sender_state = _collect_sender_generated_consensus_state(
             prompt,
             state,
@@ -2684,6 +2754,7 @@ def _prepare_generated_trajectory_eval_traces(
             prompt = pick_field(row, ("question", "problem"))
             if not str(prompt).strip():
                 continue
+            variant_state["_current_sample_row"] = dict(row)
             sender_state = _collect_sender_generated_consensus_state(
                 prompt,
                 variant_state,
@@ -2932,6 +3003,7 @@ def _decode_handoff(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3068,6 +3140,7 @@ def run_pure_text_cot(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3130,6 +3203,7 @@ def run_text_text_hybrid(
         "decoded_text": decoded_text,
         "sender_reasoning_text": reasoning_text,
         "sender_reasoning_token_count": len(reasoning_token_ids),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "sender_reasoning_status": _sender_reasoning_status(
             reasoning_token_ids,
             reasoning_text,
@@ -3262,6 +3336,7 @@ def run_token_context_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3336,6 +3411,7 @@ def run_verified_token_context_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3407,6 +3483,7 @@ def run_sender_answer_text_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -4417,6 +4494,8 @@ def _configured_base_cfg(
     *,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -4461,6 +4540,10 @@ def _configured_base_cfg(
         agent_b_model=agent_b_model,
         hetero_smoke=hetero_smoke,
     )
+    if torch_dtype is not None:
+        base_cfg.torch_dtype = str(torch_dtype)
+    if device_map is not None:
+        base_cfg.device_map = str(device_map)
     if latent_pooling is not None:
         base_cfg.handoff.latent_pooling = str(latent_pooling)
     if receiver_context_mode is not None:
@@ -4614,6 +4697,12 @@ def _apply_model_profile_defaults(
         cfg.agent_b_model = str(agent_b_model)
 
 
+def _require_requested_device_available(cfg: Any) -> None:
+    device_map = str(getattr(cfg, "device_map", "auto")).strip().lower()
+    if device_map == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("device_map=mps requested, but torch MPS is not available")
+
+
 def run_benchmark(
     *,
     suite_name: str,
@@ -4630,6 +4719,8 @@ def run_benchmark(
     latent_steps_values: Optional[list[int]] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -4671,6 +4762,8 @@ def run_benchmark(
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
         agent_b_model=agent_b_model,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
         latent_pooling=latent_pooling,
         receiver_context_mode=receiver_context_mode,
         receiver_context_latent_position=receiver_context_latent_position,
@@ -4720,12 +4813,15 @@ def run_benchmark(
         hetero_smoke=hetero_smoke,
         answer_only_final=answer_only_final,
     )
+    if dataset_name == "long_context_handoff":
+        base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
     semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
     if sample_indices is None and semantic_smoke_cfg is not None:
         sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
     effective_split = dataset_split or _default_split_for_dataset(dataset_name)
     validation_size = _validation_size(base_cfg, dataset_name)
     suite_cfg = _suite_cfg(base_cfg, suite_name)
+    _require_requested_device_available(suite_cfg)
     latent_step_candidates = latent_steps_values or [int(getattr(suite_cfg, "latent_steps", 0))]
     methods = _methods_for_suite(suite_name, method_names)
     compatibility_cache: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4766,6 +4862,10 @@ def run_benchmark(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        max_new_tokens=int(getattr(suite_cfg, "max_new_tokens", 0)),
+        reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
+        torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
+        device_map=str(getattr(suite_cfg, "device_map", "")),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -4795,6 +4895,7 @@ def run_benchmark(
                     )
                     prompt = pick_field(row, ("question", "problem"))
                     target_answer = _target_answer(dataset_name, row)
+                    state["_current_sample_row"] = dict(row)
                     predicted_answer: Optional[str] = None
                     decoded_text = ""
                     result: dict[str, Any] = {}
@@ -4896,6 +4997,13 @@ def run_benchmark(
                         "text_baseline" if method_name in TEXT_BASELINE_METHODS else "latent_only",
                     )
                     receiver_context_token_count = int(row_result.get("receiver_context_token_count", 0) or 0)
+                    receiver_input_token_count = int(
+                        row_result.get(
+                            "receiver_input_token_count",
+                            receiver_context_token_count,
+                        )
+                        or 0
+                    )
                     receiver_context_latent_position = row_result.get(
                         "receiver_context_latent_position",
                         "not_applicable"
@@ -4919,6 +5027,7 @@ def run_benchmark(
                             "receiver_context_reason": receiver_context_reason,
                             "receiver_context_token_count": receiver_context_token_count,
                             "receiver_context_latent_position": receiver_context_latent_position,
+                            "receiver_input_token_count": receiver_input_token_count,
                             "decode_status": decode_status,
                             "prompt": prompt,
                             "target_answer": target_answer,
@@ -5448,6 +5557,8 @@ def prepare_generated_trajectory_adapter_cache(
     reasoner_max_new_tokens: Optional[int] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -5483,6 +5594,8 @@ def prepare_generated_trajectory_adapter_cache(
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
         agent_b_model=agent_b_model,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
         latent_pooling=latent_pooling,
         receiver_context_mode=receiver_context_mode,
         receiver_context_latent_position=receiver_context_latent_position,
@@ -5525,7 +5638,10 @@ def prepare_generated_trajectory_adapter_cache(
         hetero_smoke=hetero_smoke,
         answer_only_final=answer_only_final,
     )
+    if dataset_name == "long_context_handoff":
+        base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
     suite_cfg = _suite_cfg(base_cfg, suite_name)
+    _require_requested_device_available(suite_cfg)
     effective_split = dataset_split or _default_split_for_dataset(dataset_name)
     if sample_indices is None:
         semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
@@ -5561,6 +5677,10 @@ def prepare_generated_trajectory_adapter_cache(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        max_new_tokens=int(getattr(suite_cfg, "max_new_tokens", 0)),
+        reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
+        torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
+        device_map=str(getattr(suite_cfg, "device_map", "")),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -5711,7 +5831,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dataset",
-        choices=("gsm8k", "math"),
+        choices=("gsm8k", "math", "long_context_handoff"),
         default=DEFAULT_DATASET,
         help=f"Dataset to evaluate (default: {DEFAULT_DATASET}).",
     )
@@ -5803,6 +5923,17 @@ def main() -> None:
         "--agent-b-model",
         default=None,
         help="Optional override for Agent B model.",
+    )
+    parser.add_argument(
+        "--torch-dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default=None,
+        help="Optional override for cfg.torch_dtype.",
+    )
+    parser.add_argument(
+        "--device-map",
+        default=None,
+        help="Optional override for cfg.device_map, for example auto or none.",
     )
     parser.add_argument(
         "--latent-pooling",
@@ -6162,6 +6293,8 @@ def main() -> None:
             reasoner_max_new_tokens=args.reasoner_max_new_tokens,
             agent_a_model=args.agent_a_model,
             agent_b_model=args.agent_b_model,
+            torch_dtype=args.torch_dtype,
+            device_map=args.device_map,
             latent_pooling=args.latent_pooling,
             receiver_context_mode=args.receiver_context_mode,
             receiver_context_latent_position=args.receiver_context_latent_position,
@@ -6256,6 +6389,8 @@ def main() -> None:
         latent_steps_values=latent_steps_values,
         agent_a_model=args.agent_a_model,
         agent_b_model=args.agent_b_model,
+        torch_dtype=args.torch_dtype,
+        device_map=args.device_map,
         latent_pooling=args.latent_pooling,
         receiver_context_mode=args.receiver_context_mode,
         receiver_context_latent_position=args.receiver_context_latent_position,
