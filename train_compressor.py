@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import hydra
 import torch
@@ -57,6 +57,7 @@ class CompressionTrainConfig:
     answer_first_token_margin: float = 2.0
     logit_steering_margin: float = 2.0
     evaluate_before_training: bool = False
+    early_stop_raw_decode_ready: bool = False
     train_reasoner: bool = True
     wandb_enabled: bool = True
     wandb_project: str = "lxp-stage2"
@@ -107,6 +108,9 @@ class CompressionTrainConfig:
     latent_logit_steering_generation_scale: float = 1.0
     latent_logit_steering_pooling: str = "attention"
     latent_logit_steering_max_bias_norm: float = 0.0
+    latent_logit_steering_answer_token_weight: float = 1.0
+    latent_logit_steering_later_answer_token_weight: float = 1.0
+    latent_logit_steering_eos_weight: float = 1.0
     lambda_latent_token_decoder: float = 0.0
     latent_token_decoder_enabled: bool = False
     latent_token_decoder_rank: int = 64
@@ -159,6 +163,9 @@ class CompressionTrainConfig:
             logit_steering_margin=float(getattr(t, "logit_steering_margin", 2.0)),
             evaluate_before_training=bool(
                 getattr(getattr(t, "evaluation", None), "evaluate_before_training", False)
+            ),
+            early_stop_raw_decode_ready=bool(
+                getattr(getattr(t, "evaluation", None), "early_stop_raw_decode_ready", False)
             ),
             train_reasoner=bool(getattr(t, "train_reasoner", True)),
             wandb_enabled=bool(wandb_cfg.enabled) if wandb_cfg else False,
@@ -266,6 +273,15 @@ class CompressionTrainConfig:
             latent_logit_steering_max_bias_norm=float(
                 getattr(logit_steering_cfg, "max_bias_norm", 0.0)
             ) if logit_steering_cfg else 0.0,
+            latent_logit_steering_answer_token_weight=float(
+                getattr(logit_steering_cfg, "answer_token_weight", 1.0)
+            ) if logit_steering_cfg else 1.0,
+            latent_logit_steering_later_answer_token_weight=float(
+                getattr(logit_steering_cfg, "later_answer_token_weight", 1.0)
+            ) if logit_steering_cfg else 1.0,
+            latent_logit_steering_eos_weight=float(
+                getattr(logit_steering_cfg, "eos_weight", 1.0)
+            ) if logit_steering_cfg else 1.0,
             latent_token_decoder_enabled=bool(
                 getattr(token_decoder_cfg, "enabled", False)
             ) if token_decoder_cfg else False,
@@ -329,6 +345,24 @@ def _numeric_metrics(metrics: dict[str, Any]) -> dict[str, float]:
         for key, value in metrics.items()
         if isinstance(value, (int, float)) and not isinstance(value, bool)
     }
+
+
+def _raw_decode_ready_for_early_stop(metrics: Mapping[str, Any]) -> bool:
+    eval_samples = int(float(metrics.get("heldout_eval_samples", 0.0) or 0.0))
+    if eval_samples < 1:
+        return False
+    raw_accuracy = float(metrics.get("heldout_raw_decode_exact_match_accuracy", 0.0) or 0.0)
+    raw_extraction_rate = float(
+        metrics.get("heldout_raw_decode_answer_extraction_rate_percentage", 0.0) or 0.0
+    )
+    unique_count = int(
+        float(metrics.get("heldout_raw_decode_unique_predicted_answer_count", 0.0) or 0.0)
+    )
+    return (
+        raw_accuracy >= 100.0
+        and raw_extraction_rate >= 100.0
+        and (eval_samples <= 1 or unique_count > 1)
+    )
 
 
 def _parameter_count(module: Optional[nn.Module]) -> int:
@@ -732,6 +766,9 @@ def _compute_latent_logit_steering_loss(
     suffix_text: str,
     max_answer_length: int,
     margin: float,
+    answer_token_weight: float = 1.0,
+    later_answer_token_weight: float = 1.0,
+    eos_weight: float = 1.0,
 ) -> tuple[torch.Tensor | None, int, float, float, float, float]:
     if latent_logit_steering is None:
         return None, 0, 0.0, 0.0, 0.0, 0.0
@@ -834,23 +871,38 @@ def _compute_latent_logit_steering_loss(
     answer_start = prefix_for_actor.shape[1] + suffix_width
     flat_logits: list[torch.Tensor] = []
     flat_targets: list[torch.Tensor] = []
+    flat_weights: list[torch.Tensor] = []
     for row_index, token_ids in enumerate(encoded_steering_targets):
         width = min(len(token_ids), max_steering_steps)
         for offset in range(width):
             flat_logits.append(
                 base_logits[row_index, answer_start + offset - 1, :] + logits_bias[row_index, offset, :]
             )
-            flat_targets.append(torch.tensor(token_ids[offset], dtype=torch.long, device=actor_device))
+            target_id = int(token_ids[offset])
+            flat_targets.append(torch.tensor(target_id, dtype=torch.long, device=actor_device))
+            is_eos_target = eos_token_id is not None and target_id == int(eos_token_id)
+            if is_eos_target:
+                target_weight = float(eos_weight)
+            elif offset > 0:
+                target_weight = float(later_answer_token_weight)
+            else:
+                target_weight = float(answer_token_weight)
+            flat_weights.append(
+                torch.tensor(max(0.0, target_weight), dtype=torch.float32, device=actor_device)
+            )
     if not flat_logits:
         return None, 0, 0.0, 0.0, 0.0, 0.0
     logits = torch.stack(flat_logits).float()
     targets = torch.stack(flat_targets)
-    ce_loss = F.cross_entropy(logits, targets)
+    weights = torch.stack(flat_weights).clamp_min(1.0e-6)
+    token_losses = F.cross_entropy(logits, targets, reduction="none")
+    ce_loss = (token_losses * weights).sum() / weights.sum().clamp_min(1.0)
     target_logits = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
     target_mask = torch.zeros_like(logits, dtype=torch.bool)
     target_mask.scatter_(1, targets.unsqueeze(1), True)
     other_logits = logits.masked_fill(target_mask, float("-inf")).max(dim=-1).values
-    margin_loss = F.relu(float(margin) - (target_logits - other_logits)).mean()
+    margin_values = F.relu(float(margin) - (target_logits - other_logits))
+    margin_loss = (margin_values * weights).sum() / weights.sum().clamp_min(1.0)
     steering_loss = ce_loss + margin_loss
     predictions = logits.argmax(dim=-1)
     accuracy = float((predictions == targets).float().mean().detach().cpu().item() * 100.0)
@@ -1709,10 +1761,10 @@ def train_reasoner_stage2(
     latest_candidate_answers: tuple[str, ...] = ()
     total_training_steps = max(1, int(config.num_epochs) * max(1, len(train_dataloader)))
 
-    def record_evaluation(event: str, epoch: float) -> None:
+    def record_evaluation(event: str, epoch: float) -> dict[str, Any] | None:
         nonlocal global_step
         if evaluation_fn is None:
-            return
+            return None
         eval_context = dict(latest_alignment_context)
         if latent_handoff_adapter is not None:
             eval_context["stage2_latent_handoff_adapter"] = latent_handoff_adapter
@@ -1771,6 +1823,7 @@ def train_reasoner_stage2(
         history.append(eval_history_entry)
         if config.wandb_enabled:
             wandb.log(_numeric_metrics(evaluation_metrics), step=global_step)
+        return eval_history_entry
 
     if config.checkpoint_enabled:
         ckpt_dir = Path(config.checkpoint_dir)
@@ -1986,6 +2039,11 @@ def train_reasoner_stage2(
                     suffix_text=config.answer_suffix_text,
                     max_answer_length=config.answer_max_length,
                     margin=config.logit_steering_margin,
+                    answer_token_weight=config.latent_logit_steering_answer_token_weight,
+                    later_answer_token_weight=(
+                        config.latent_logit_steering_later_answer_token_weight
+                    ),
+                    eos_weight=config.latent_logit_steering_eos_weight,
                 )
             else:
                 (
@@ -2389,7 +2447,16 @@ def train_reasoner_stage2(
 
             global_step += 1
 
-        record_evaluation("epoch_eval", float(epoch))
+        eval_history_entry = record_evaluation("epoch_eval", float(epoch))
+        if (
+            config.early_stop_raw_decode_ready
+            and eval_history_entry is not None
+            and _raw_decode_ready_for_early_stop(eval_history_entry)
+        ):
+            eval_history_entry["early_stop_triggered"] = True
+            eval_history_entry["early_stop_reason"] = "raw_actor_free_decode_ready"
+            print("Early stopping: raw actor free decode reached readiness gate.")
+            break
 
         if config.checkpoint_enabled:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"

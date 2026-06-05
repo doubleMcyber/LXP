@@ -204,6 +204,9 @@ training:
     generation_scale: 1.0
     pooling: attention
     max_bias_norm: 0.0
+    answer_token_weight: 1.0
+    later_answer_token_weight: 1.0
+    eos_weight: 1.0
   latent_token_decoder:
     enabled: false
     rank: 64
@@ -235,11 +238,16 @@ training:
     baseline_accuracy_percentage: null
     seed_count: 1
     evaluate_before_training: true
+    early_stop_raw_decode_ready: false
     baseline_few_shot_examples: 6
     smoke_eval_set: heldout
     semantic_readout_only: false
     semantic_bridge_actor_decode: false
     semantic_bridge_selected_answer_bias: 100.0
+    require_raw_decode_ready: false
+    raw_decode_stop_after_steering: true
+    raw_decode_stop_by_semantic_readout_length: false
+    smoke_max_loss: 1000.0
   checkpointing:
     enabled: true
     dir: "checkpoints"

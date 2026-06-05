@@ -18,6 +18,7 @@ from train_compressor import (
     _compute_latent_logit_steering_loss,
     _compute_latent_token_decoder_loss,
     _numeric_metrics,
+    _raw_decode_ready_for_early_stop,
     _tokenize_text_batch,
     resolve_training_alignment_context,
     train_reasoner_stage2,
@@ -138,6 +139,23 @@ def test_training_history_preserves_diagnostic_metrics() -> None:
     assert _coerce_history_value(torch.tensor(2.5)) == 2.5
     assert _coerce_history_value(torch.tensor([1.0, 2.0])) == "[1.0, 2.0]"
     assert _numeric_metrics({"loss": 1.0, "diagnostics": "x", "flag": True}) == {"loss": 1.0}
+
+
+def test_raw_decode_early_stop_requires_exact_extracted_non_degenerate_answers() -> None:
+    ready_metrics = {
+        "heldout_eval_samples": 3.0,
+        "heldout_raw_decode_exact_match_accuracy": 100.0,
+        "heldout_raw_decode_answer_extraction_rate_percentage": 100.0,
+        "heldout_raw_decode_unique_predicted_answer_count": 3.0,
+    }
+
+    assert _raw_decode_ready_for_early_stop(ready_metrics) is True
+    assert _raw_decode_ready_for_early_stop(
+        {**ready_metrics, "heldout_raw_decode_exact_match_accuracy": 66.667}
+    ) is False
+    assert _raw_decode_ready_for_early_stop(
+        {**ready_metrics, "heldout_raw_decode_unique_predicted_answer_count": 1.0}
+    ) is False
 
 
 def test_latent_answer_loss_backprops_to_prefix() -> None:

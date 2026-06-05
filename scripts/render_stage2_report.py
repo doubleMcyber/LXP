@@ -149,6 +149,10 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     actor_bridge_class, actor_bridge_label = _status_label(bool(smoke.get("actor_semantic_bridge_decoder_ready")) if "actor_semantic_bridge_decoder_ready" in smoke else None)
     token_decoder_class, token_decoder_label = _status_label(bool(smoke.get("latent_token_decoder_ready")) if "latent_token_decoder_ready" in smoke else None)
     decode_class, decode_label = _status_label(bool(smoke.get("latent_training_ready")) if "latent_training_ready" in smoke else None)
+    raw_decode_ready = bool(smoke.get("raw_actor_free_decoder_ready"))
+    raw_decode_class, raw_decode_label = _status_label(
+        raw_decode_ready if "raw_actor_free_decoder_ready" in smoke else None
+    )
     phase_class, phase_label = _status_label(bool(report.get("passed")) if "passed" in report else None)
     loss_values = _metric_series(history, "loss")
     probe_values = _metric_series(history, "answer_probe_accuracy")
@@ -157,6 +161,26 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     adapter_updates = _metric_series(history, "handoff_adapter_update_norm")
     probe_updates = _metric_series(history, "latent_answer_probe_update_norm")
     token_decoder_updates = _metric_series(history, "latent_token_decoder_update_norm")
+    if raw_decode_ready:
+        recommendation_primary = (
+            "Present the current result as a raw latent-to-actor decode smoke: the "
+            "compressed latent prefix, learned handoff adapter, and latent stop control "
+            "produce exact actor text without the semantic bridge."
+        )
+        recommendation_next = (
+            "The next production step is to scale this raw path beyond the three-sample "
+            "overfit smoke, then compare it against the bridge/readout and token-context baselines."
+        )
+    else:
+        recommendation_primary = (
+            "Present the current result as a latent-readout workbench: the actor bridge, "
+            "token decoder, and probe verify that the compressed latent prefix carries "
+            "answer information, while pure raw actor generation remains a separate interface metric."
+        )
+        recommendation_next = (
+            "The next production step is to scale this bridge/probe path beyond the smoke set, "
+            "then reintroduce unconstrained actor decode after the direct latent token decoder is stable."
+        )
 
     html_text = f"""<!doctype html>
 <html lang="en">
@@ -265,8 +289,8 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_exact_match_accuracy"))}</div>
         <div class="subhead">Chosen latent decode path after handoff.</div>
       </div>
-      <div class="panel">
-        <h3>Raw Actor Decode</h3>
+      <div class="panel {raw_decode_class}">
+        <div class="status-row"><h3>Raw Actor Decode</h3><span class="badge">{raw_decode_label}</span></div>
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_raw_decode_exact_match_accuracy"))}</div>
         <div class="subhead">Open-ended actor generation after latent handoff.</div>
       </div>
@@ -317,12 +341,8 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       </div>
       <div class="panel">
         <h2>Recommendation</h2>
-        <p>
-          Present the current result as a latent-readout workbench: the actor bridge, token decoder, and probe verify that the compressed latent prefix carries answer information, while pure raw actor generation remains a separate interface metric.
-        </p>
-        <p>
-          The next production step is to scale this bridge/probe path beyond the smoke set, then reintroduce unconstrained actor decode after the direct latent token decoder is stable.
-        </p>
+        <p>{html.escape(recommendation_primary)}</p>
+        <p>{html.escape(recommendation_next)}</p>
       </div>
     </section>
 

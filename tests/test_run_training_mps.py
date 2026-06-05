@@ -178,3 +178,56 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
     assert "training.latent_token_decoder.margin=4.0" in command
     assert "training.latent_soft_prompt_decoder.enabled=false" in command
     assert "training.latent_soft_prompt_decoder.output_steps=0" in command
+
+
+def test_mac_mps_stage2_smoke_full_decode_trains_raw_actor_steering() -> None:
+    args = argparse.Namespace(
+        python="venv/bin/python",
+        output_dir="outputs/mac_mps",
+        agent_a_model="Qwen/Qwen3.5-0.8B",
+        agent_b_model="Qwen/Qwen3.5-0.8B",
+        batch_size=3,
+        smoke_samples=3,
+        max_length=64,
+        compressed_steps=8,
+        epochs=20,
+        baseline_few_shot_examples=4,
+        eval_on_train=True,
+        full_decode_eval=True,
+        raw_decode_output_steps=2,
+        raw_answer_loss_weight=12.0,
+        raw_answer_first_token_loss_weight=4.0,
+        raw_logit_steering_weight=160.0,
+        raw_logit_steering_lr_multiplier=20.0,
+        raw_logit_steering_generation_scale=1.0,
+        raw_logit_steering_answer_token_weight=1.0,
+        raw_logit_steering_later_answer_token_weight=1.0,
+        raw_logit_steering_eos_weight=1.0,
+        raw_smoke_max_loss=5000.0,
+        allow_cpu_fallback=False,
+    )
+
+    command = build_command(args)
+
+    assert "training.evaluation.semantic_readout_only=false" in command
+    assert "training.evaluation.semantic_bridge_actor_decode=false" in command
+    assert "training.evaluation.require_raw_decode_ready=true" in command
+    assert "training.evaluation.raw_decode_stop_after_steering=true" in command
+    assert "training.evaluation.raw_decode_stop_by_semantic_readout_length=true" in command
+    assert "training.evaluation.early_stop_raw_decode_ready=true" in command
+    assert "training.evaluation.smoke_max_loss=5000.0" in command
+    assert "training.max_grad_norm=10.0" in command
+    assert "training.lambda_answer=12.0" in command
+    assert "training.lambda_answer_first_token=4.0" in command
+    assert "training.lambda_logit_steering=160.0" in command
+    assert "training.lambda_latent_token_decoder=0.0" in command
+    assert "training.latent_logit_steering.enabled=true" in command
+    assert "training.latent_logit_steering.vocabulary_mode=low_rank" in command
+    assert "training.latent_logit_steering.lr_multiplier=20.0" in command
+    assert "training.latent_logit_steering.output_steps=2" in command
+    assert "training.latent_logit_steering.generation_scale=1.0" in command
+    assert "training.latent_logit_steering.answer_token_weight=1.0" in command
+    assert "training.latent_logit_steering.later_answer_token_weight=1.0" in command
+    assert "training.latent_logit_steering.eos_weight=1.0" in command
+    assert "training.latent_logit_steering.pooling=mean_last" in command
+    assert "training.latent_token_decoder.enabled=false" in command

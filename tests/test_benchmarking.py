@@ -1585,6 +1585,31 @@ def test_build_training_smoke_report_gates_enabled_actor_bridge_decoder() -> Non
     assert any("Actor semantic bridge decode" in item for item in report["missing_requirements"])
 
 
+def test_build_training_smoke_report_gates_required_raw_actor_decode() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 66.667,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 2.0,
+                "heldout_raw_decode_require_ready": True,
+                "heldout_raw_decode_exact_match_accuracy": 66.667,
+                "heldout_raw_decode_answer_extraction_rate_percentage": 100.0,
+                "heldout_raw_decode_unique_predicted_answer_count": 2.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["raw_actor_free_decoder_ready"] is False
+    assert any("Raw actor free decode" in item for item in report["missing_requirements"])
+
+
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     phase1_methods = [name for name, _ in _methods_for_suite("phase1_homogeneous")]
     standard_methods = [name for name, _ in _methods_for_suite("standard")]

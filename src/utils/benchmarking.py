@@ -1608,6 +1608,19 @@ def build_training_smoke_report(
     latent_token_decode_require_ready = bool(
         final_eval.get("heldout_latent_token_decode_require_ready", False)
     )
+    raw_decode_accuracy_raw = final_eval.get("heldout_raw_decode_exact_match_accuracy")
+    raw_decode_accuracy = (
+        None if raw_decode_accuracy_raw is None else float(raw_decode_accuracy_raw)
+    )
+    raw_decode_rate_raw = final_eval.get("heldout_raw_decode_answer_extraction_rate_percentage")
+    raw_decode_rate = None if raw_decode_rate_raw is None else float(raw_decode_rate_raw)
+    raw_decode_unique_raw = final_eval.get("heldout_raw_decode_unique_predicted_answer_count")
+    raw_decode_unique_count = (
+        None if raw_decode_unique_raw is None else int(float(raw_decode_unique_raw))
+    )
+    raw_decode_require_ready = bool(
+        final_eval.get("heldout_raw_decode_require_ready", False)
+    )
 
     missing_requirements: list[str] = []
     if not loss_entries:
@@ -1700,6 +1713,24 @@ def build_training_smoke_report(
                 "Latent token decoder predictions are degenerate: fewer than two unique "
                 f"answers were decoded across {eval_samples} samples."
             )
+    if raw_decode_require_ready:
+        if raw_decode_rate is None or raw_decode_rate < 100.0:
+            missing_requirements.append(
+                "Raw actor free decode is required but did not extract an answer for every "
+                f"sample ({0.0 if raw_decode_rate is None else raw_decode_rate:.2f}%)."
+            )
+        if raw_decode_accuracy is None or raw_decode_accuracy < 100.0:
+            missing_requirements.append(
+                "Raw actor free decode is required but exact-match accuracy is below 100% "
+                f"({0.0 if raw_decode_accuracy is None else raw_decode_accuracy:.2f}%)."
+            )
+        if eval_samples > 1 and (
+            raw_decode_unique_count is None or raw_decode_unique_count <= 1
+        ):
+            missing_requirements.append(
+                "Raw actor free decode predictions are degenerate: fewer than two unique "
+                f"answers were decoded across {eval_samples} samples."
+            )
 
     return {
         "phase": "training_smoke",
@@ -1722,6 +1753,7 @@ def build_training_smoke_report(
         "final_heldout_raw_decode_exact_match_accuracy": final_eval.get(
             "heldout_raw_decode_exact_match_accuracy"
         ),
+        "final_heldout_raw_decode_require_ready": raw_decode_require_ready,
         "final_heldout_raw_decode_answer_extraction_rate_percentage": final_eval.get(
             "heldout_raw_decode_answer_extraction_rate_percentage"
         ),
@@ -1750,6 +1782,20 @@ def build_training_smoke_report(
                 or (
                     actor_bridge_unique_count is not None
                     and actor_bridge_unique_count > 1
+                )
+            )
+        ),
+        "raw_actor_free_decoder_ready": (
+            raw_decode_require_ready
+            and raw_decode_accuracy is not None
+            and raw_decode_accuracy >= 100.0
+            and raw_decode_rate is not None
+            and raw_decode_rate >= 100.0
+            and (
+                eval_samples <= 1
+                or (
+                    raw_decode_unique_count is not None
+                    and raw_decode_unique_count > 1
                 )
             )
         ),

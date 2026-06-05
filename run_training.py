@@ -591,6 +591,9 @@ def _build_evaluation_callback(
     semantic_readout_only: bool = False,
     semantic_bridge_actor_decode: bool = False,
     semantic_bridge_selected_answer_bias: float = 100.0,
+    raw_decode_require_ready: bool = False,
+    raw_decode_stop_after_steering: bool = True,
+    raw_decode_stop_by_semantic_readout_length: bool = False,
 ) -> Any:
     candidate_answers = _unique_candidate_answers(eval_examples) if dataset_name == "smoke" else ()
 
@@ -898,15 +901,37 @@ def _build_evaluation_callback(
                     prefix_embeds=aligned_latents,
                     suffix_text=_ANSWER_SUFFIX_TEXT,
                 )
+                raw_decode_max_new_tokens = max_new_tokens
+                if (
+                    raw_decode_stop_by_semantic_readout_length
+                    and latent_semantic_readout_predicted_answer is not None
+                    and str(latent_semantic_readout_predicted_answer).strip()
+                ):
+                    semantic_answer_token_ids = actor_tokenizer.encode(
+                        str(latent_semantic_readout_predicted_answer).strip(),
+                        add_special_tokens=False,
+                    )
+                    if semantic_answer_token_ids:
+                        raw_decode_max_new_tokens = max(
+                            1,
+                            min(
+                                int(max_new_tokens),
+                                len(semantic_answer_token_ids),
+                            ),
+                        )
                 decode_metrics = generate_from_prefix_embeddings(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
                     prefix_embeds=answer_prefix_embeds,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=raw_decode_max_new_tokens,
                     decoded_text_prefix=_ANSWER_DECODED_PREFIX,
                     stop_regex=_FINAL_ANSWER_STOP_REGEX,
                     step_logits_bias=step_logits_bias,
                     step_logits_bias_scale=step_logits_bias_scale,
+                    stop_after_steering=(
+                        bool(raw_decode_stop_after_steering)
+                        and step_logits_bias is not None
+                    ),
                 )
                 decoded_text = str(decode_metrics["decoded_text"])
                 answer_metrics = compute_answer_metrics_from_prefix_embeddings(
@@ -1048,6 +1073,7 @@ def _build_evaluation_callback(
             "heldout_raw_decode_exact_match_accuracy": (
                 100.0 * raw_decode_correct_count / len(eval_examples)
             ),
+            "heldout_raw_decode_require_ready": bool(raw_decode_require_ready),
             "heldout_raw_decode_answer_extraction_rate_percentage": (
                 100.0 * raw_decode_extracted_answer_count / len(eval_examples)
             ),
@@ -1264,6 +1290,19 @@ def main() -> None:
             100.0,
         )
     )
+    raw_decode_require_ready = bool(
+        getattr(getattr(cfg.training, "evaluation", None), "require_raw_decode_ready", False)
+    )
+    raw_decode_stop_after_steering = bool(
+        getattr(getattr(cfg.training, "evaluation", None), "raw_decode_stop_after_steering", True)
+    )
+    raw_decode_stop_by_semantic_readout_length = bool(
+        getattr(
+            getattr(cfg.training, "evaluation", None),
+            "raw_decode_stop_by_semantic_readout_length",
+            False,
+        )
+    )
     evaluation_fn = _build_evaluation_callback(
         eval_examples=eval_examples,
         baseline_examples=baseline_examples,
@@ -1275,6 +1314,11 @@ def main() -> None:
         semantic_readout_only=semantic_readout_only,
         semantic_bridge_actor_decode=semantic_bridge_actor_decode,
         semantic_bridge_selected_answer_bias=semantic_bridge_selected_answer_bias,
+        raw_decode_require_ready=raw_decode_require_ready,
+        raw_decode_stop_after_steering=raw_decode_stop_after_steering,
+        raw_decode_stop_by_semantic_readout_length=(
+            raw_decode_stop_by_semantic_readout_length
+        ),
     )
     alignment_context = resolve_training_alignment_context(
         reasoner_model=reasoner,
@@ -1307,7 +1351,13 @@ def main() -> None:
         "mps_available": torch.backends.mps.is_available(),
         "mps_fallback_env": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
     }
-    training_smoke_report = build_training_smoke_report(history)
+    training_smoke_max_loss = float(
+        getattr(getattr(cfg.training, "evaluation", None), "smoke_max_loss", 1000.0)
+    )
+    training_smoke_report = build_training_smoke_report(
+        history,
+        max_loss=training_smoke_max_loss,
+    )
     training_report = build_training_phase2_report(
         history=history,
         cfg=cfg,

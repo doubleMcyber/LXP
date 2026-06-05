@@ -383,6 +383,7 @@ def generate_from_prefix_embeddings(
     first_step_logits_bias_scale: float = 1.0,
     step_logits_bias: Optional[torch.Tensor] = None,
     step_logits_bias_scale: float = 1.0,
+    stop_after_steering: bool = False,
 ) -> dict[str, Any]:
     """Decode from a continuous prompt using the model's native generation path."""
     model_device = next(model.parameters()).device
@@ -431,6 +432,8 @@ def generate_from_prefix_embeddings(
                     eos_token_ids = {int(eos_token_id)}
             manual_steps = min(max(1, int(max_new_tokens)), int(steering_bias.shape[1]))
             stopped = False
+            stopped_by_regex = False
+            tail_generation_used = False
             for step_index in range(manual_steps):
                 outputs = model(
                     inputs_embeds=current_prefix,
@@ -449,6 +452,17 @@ def generate_from_prefix_embeddings(
                     stopped = True
                     break
                 generated_token_ids.append(next_token_id)
+                if stop_regex is not None:
+                    partial_suffix = tokenizer.decode(
+                        generated_token_ids,
+                        skip_special_tokens=True,
+                    )
+                    partial_text = str(decoded_text_prefix) + partial_suffix
+                    stop_match = stop_regex.search(partial_text)
+                    if stop_match is not None and stop_match.end() < len(partial_text):
+                        stopped = True
+                        stopped_by_regex = True
+                        break
                 next_token_embeds = model.get_input_embeddings()(next_tokens.unsqueeze(1)).to(
                     dtype=current_prefix.dtype,
                 )
@@ -472,7 +486,7 @@ def generate_from_prefix_embeddings(
                 eos_token_ids = {int(token_id) for token_id in eos_token_id}
             else:
                 eos_token_ids = {int(eos_token_id)}
-        if len(generated_token_ids) < max_new_tokens and not stopped:
+        if len(generated_token_ids) < max_new_tokens and not stopped and not stop_after_steering:
             with torch.no_grad():
                 generated_tail = model.generate(
                     inputs_embeds=current_prefix,
@@ -483,6 +497,7 @@ def generate_from_prefix_embeddings(
                     eos_token_id=eos_token_id,
                 )
             generated_token_ids.extend(generated_tail[0].detach().cpu().tolist())
+            tail_generation_used = True
         decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
         decoded_text = _truncate_decoded_text_at_stop(
             str(decoded_text_prefix) + decoded_suffix,
@@ -496,6 +511,10 @@ def generate_from_prefix_embeddings(
             "first_generated_token_text": None
             if first_token_id is None
             else tokenizer.decode([first_token_id], skip_special_tokens=True),
+            "steering_manual_steps": len(generated_token_ids),
+            "steering_stopped_by_regex": stopped_by_regex,
+            "steering_tail_generation_used": tail_generation_used,
+            "steering_stop_after_steering": bool(stop_after_steering),
         }
 
     generation_kwargs: dict[str, Any] = {

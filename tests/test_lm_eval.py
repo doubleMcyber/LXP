@@ -209,3 +209,32 @@ def test_embedding_generation_and_first_token_metrics_apply_first_step_bias() ->
     assert first_token_metrics["first_token_top1"] is True
     assert first_token_metrics["first_token_predicted_id"] == 1
     assert answer_metrics["answer_nll"] < 1e-3
+
+
+def test_embedding_generation_can_stop_after_steered_decode_without_tail() -> None:
+    model = _EmbeddingLogitModel()
+    tokenizer = _EmbeddingTokenizer()
+    logits_bias = torch.tensor([[[0.0, 30.0, 0.0, 0.0]]])
+
+    steered_only = generate_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        max_new_tokens=2,
+        step_logits_bias=logits_bias,
+        stop_after_steering=True,
+    )
+    steered_then_tail = generate_from_prefix_embeddings(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_embeds=torch.zeros(1, 1, 3),
+        max_new_tokens=2,
+        step_logits_bias=logits_bias,
+        stop_after_steering=False,
+    )
+
+    assert steered_only["decoded_text"] == "1"
+    assert steered_only["generated_token_ids"] == [1]
+    assert steered_only["steering_tail_generation_used"] is False
+    assert steered_then_tail["generated_token_ids"] == [1, 2]
+    assert steered_then_tail["steering_tail_generation_used"] is True
