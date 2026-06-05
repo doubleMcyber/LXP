@@ -1421,6 +1421,39 @@ def build_training_phase2_report(
         "baseline_accuracy_percentage": baseline_accuracy_percentage,
         "final_heldout_exact_match_accuracy": final_heldout_accuracy,
         "final_heldout_answer_perplexity": final_heldout_answer_perplexity,
+        "final_heldout_answer_perplexity_surface": final_heldout_entry.get(
+            "heldout_answer_perplexity_surface"
+        ),
+        "final_heldout_raw_decode_exact_match_accuracy": final_heldout_entry.get(
+            "heldout_raw_decode_exact_match_accuracy"
+        ),
+        "final_heldout_latent_token_decode_accuracy": final_heldout_entry.get(
+            "heldout_latent_token_decode_accuracy"
+        ),
+        "final_heldout_latent_token_decode_enabled": final_heldout_entry.get(
+            "heldout_latent_token_decode_enabled"
+        ),
+        "final_heldout_latent_token_decode_require_ready": final_heldout_entry.get(
+            "heldout_latent_token_decode_require_ready"
+        ),
+        "final_heldout_latent_token_decode_surface_rate_percentage": final_heldout_entry.get(
+            "heldout_latent_token_decode_surface_rate_percentage"
+        ),
+        "final_heldout_latent_token_decode_answer_extraction_rate_percentage": final_heldout_entry.get(
+            "heldout_latent_token_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_latent_token_decode_unique_predicted_answer_count": final_heldout_entry.get(
+            "heldout_latent_token_decode_unique_predicted_answer_count"
+        ),
+        "final_heldout_latent_semantic_readout_accuracy": final_heldout_entry.get(
+            "heldout_latent_semantic_readout_accuracy"
+        ),
+        "final_heldout_latent_semantic_readout_rate_percentage": final_heldout_entry.get(
+            "heldout_latent_semantic_readout_rate_percentage"
+        ),
+        "final_heldout_latent_semantic_readout_unique_predicted_answer_count": final_heldout_entry.get(
+            "heldout_latent_semantic_readout_unique_predicted_answer_count"
+        ),
         "final_heldout_latent_candidate_accuracy": final_heldout_entry.get(
             "heldout_latent_candidate_accuracy"
         ),
@@ -1432,6 +1465,9 @@ def build_training_phase2_report(
         ),
         "final_heldout_latent_first_token_rank_mean": final_heldout_entry.get(
             "heldout_latent_first_token_rank_mean"
+        ),
+        "final_heldout_actor_text_baseline_evaluated": final_heldout_entry.get(
+            "heldout_actor_text_baseline_evaluated"
         ),
         "accuracy_retention_ratio": accuracy_retention_ratio,
         "alignment_mode": alignment_context.get("alignment_mode"),
@@ -1491,6 +1527,7 @@ def build_training_smoke_report(
     final_eval = heldout_entries[-1] if heldout_entries else {}
     losses = [float(entry["loss"]) for entry in loss_entries if entry.get("loss") is not None]
     finite_losses = [value for value in losses if math.isfinite(value)]
+    final_loss = finite_losses[-1] if finite_losses else None
     final_perplexity_raw = final_eval.get("heldout_answer_perplexity")
     final_perplexity = (
         None if final_perplexity_raw is None else float(final_perplexity_raw)
@@ -1510,6 +1547,7 @@ def build_training_smoke_report(
     actor_baseline_accuracy = (
         None if actor_baseline_accuracy_raw is None else float(actor_baseline_accuracy_raw)
     )
+    actor_baseline_evaluated = bool(final_eval.get("heldout_actor_text_baseline_evaluated", True))
     actor_baseline_unique_raw = final_eval.get(
         "heldout_actor_text_baseline_unique_predicted_answer_count"
     )
@@ -1524,15 +1562,35 @@ def build_training_smoke_report(
     latent_probe_unique_count = (
         None if latent_probe_unique_raw is None else int(float(latent_probe_unique_raw))
     )
+    latent_token_decode_accuracy_raw = final_eval.get("heldout_latent_token_decode_accuracy")
+    latent_token_decode_accuracy = (
+        None if latent_token_decode_accuracy_raw is None else float(latent_token_decode_accuracy_raw)
+    )
+    latent_token_decode_rate_raw = final_eval.get(
+        "heldout_latent_token_decode_answer_extraction_rate_percentage"
+    )
+    latent_token_decode_rate = (
+        None if latent_token_decode_rate_raw is None else float(latent_token_decode_rate_raw)
+    )
+    latent_token_decode_unique_raw = final_eval.get(
+        "heldout_latent_token_decode_unique_predicted_answer_count"
+    )
+    latent_token_decode_unique_count = (
+        None if latent_token_decode_unique_raw is None else int(float(latent_token_decode_unique_raw))
+    )
+    latent_token_decode_enabled = bool(final_eval.get("heldout_latent_token_decode_enabled", False))
+    latent_token_decode_require_ready = bool(
+        final_eval.get("heldout_latent_token_decode_require_ready", False)
+    )
 
     missing_requirements: list[str] = []
     if not loss_entries:
         missing_requirements.append("No training loss entries were logged.")
     if len(finite_losses) != len(losses):
         missing_requirements.append("At least one logged training loss is non-finite.")
-    if finite_losses and max(finite_losses) > max_loss:
+    if final_loss is not None and final_loss > max_loss:
         missing_requirements.append(
-            f"Maximum training loss {max(finite_losses):.4f} exceeds smoke limit {max_loss:.4f}."
+            f"Final training loss {final_loss:.4f} exceeds smoke limit {max_loss:.4f}."
         )
     if not heldout_entries:
         missing_requirements.append("No heldout evaluation entry was logged.")
@@ -1567,7 +1625,8 @@ def build_training_smoke_report(
             f"across {eval_samples} samples while exact-match accuracy was {final_accuracy:.2f}%."
         )
     actor_text_baseline_degenerate = (
-        eval_samples > 1
+        actor_baseline_evaluated
+        and eval_samples > 1
         and actor_baseline_unique_count is not None
         and actor_baseline_unique_count <= 1
         and actor_baseline_accuracy is not None
@@ -1579,12 +1638,31 @@ def build_training_smoke_report(
             f"across {eval_samples} samples while baseline accuracy was "
             f"{actor_baseline_accuracy:.2f}%."
         )
+    if latent_token_decode_enabled and latent_token_decode_require_ready:
+        if latent_token_decode_rate is None or latent_token_decode_rate < 100.0:
+            missing_requirements.append(
+                "Latent token decoder is enabled but did not extract an answer for every "
+                f"sample ({0.0 if latent_token_decode_rate is None else latent_token_decode_rate:.2f}%)."
+            )
+        if latent_token_decode_accuracy is None or latent_token_decode_accuracy < 100.0:
+            missing_requirements.append(
+                "Latent token decoder is enabled but exact-match accuracy is below 100% "
+                f"({0.0 if latent_token_decode_accuracy is None else latent_token_decode_accuracy:.2f}%)."
+            )
+        if eval_samples > 1 and (
+            latent_token_decode_unique_count is None or latent_token_decode_unique_count <= 1
+        ):
+            missing_requirements.append(
+                "Latent token decoder predictions are degenerate: fewer than two unique "
+                f"answers were decoded across {eval_samples} samples."
+            )
 
     return {
         "phase": "training_smoke",
         "passed": not missing_requirements,
         "loss_entry_count": len(loss_entries),
         "max_loss": None if not finite_losses else max(finite_losses),
+        "final_loss": final_loss,
         "initial_heldout_exact_match_accuracy": initial_eval.get(
             "heldout_exact_match_accuracy"
         ),
@@ -1596,6 +1674,50 @@ def build_training_smoke_report(
         "final_heldout_answer_extraction_rate_percentage": final_extraction_rate,
         "final_heldout_decode_answer_extraction_rate_percentage": final_eval.get(
             "heldout_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_raw_decode_exact_match_accuracy": final_eval.get(
+            "heldout_raw_decode_exact_match_accuracy"
+        ),
+        "final_heldout_raw_decode_answer_extraction_rate_percentage": final_eval.get(
+            "heldout_raw_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_raw_decode_unique_predicted_answer_count": final_eval.get(
+            "heldout_raw_decode_unique_predicted_answer_count"
+        ),
+        "final_heldout_latent_token_decode_accuracy": latent_token_decode_accuracy,
+        "final_heldout_latent_token_decode_enabled": latent_token_decode_enabled,
+        "final_heldout_latent_token_decode_require_ready": latent_token_decode_require_ready,
+        "final_heldout_latent_token_decode_surface_rate_percentage": final_eval.get(
+            "heldout_latent_token_decode_surface_rate_percentage"
+        ),
+        "final_heldout_latent_token_decode_answer_extraction_rate_percentage": (
+            latent_token_decode_rate
+        ),
+        "final_heldout_latent_token_decode_unique_predicted_answer_count": (
+            latent_token_decode_unique_count
+        ),
+        "latent_token_decoder_ready": (
+            latent_token_decode_enabled
+            and latent_token_decode_accuracy is not None
+            and latent_token_decode_accuracy >= 100.0
+            and latent_token_decode_rate is not None
+            and latent_token_decode_rate >= 100.0
+            and (
+                eval_samples <= 1
+                or (
+                    latent_token_decode_unique_count is not None
+                    and latent_token_decode_unique_count > 1
+                )
+            )
+        ),
+        "final_heldout_latent_semantic_readout_accuracy": final_eval.get(
+            "heldout_latent_semantic_readout_accuracy"
+        ),
+        "final_heldout_latent_semantic_readout_rate_percentage": final_eval.get(
+            "heldout_latent_semantic_readout_rate_percentage"
+        ),
+        "final_heldout_latent_semantic_readout_unique_predicted_answer_count": final_eval.get(
+            "heldout_latent_semantic_readout_unique_predicted_answer_count"
         ),
         "final_heldout_candidate_fallback_rate_percentage": final_eval.get(
             "heldout_candidate_fallback_rate_percentage"
@@ -1626,6 +1748,7 @@ def build_training_smoke_report(
         "final_heldout_unique_predicted_answer_count": unique_prediction_count,
         "final_heldout_degenerate_prediction": degenerate_prediction,
         "final_heldout_actor_text_baseline_accuracy": actor_baseline_accuracy,
+        "final_heldout_actor_text_baseline_evaluated": actor_baseline_evaluated,
         "final_heldout_actor_text_baseline_answer_extraction_rate_percentage": final_eval.get(
             "heldout_actor_text_baseline_answer_extraction_rate_percentage"
         ),
@@ -1639,6 +1762,9 @@ def build_training_smoke_report(
         ),
         "latent_training_ready": not missing_requirements,
         "final_heldout_answer_perplexity": final_perplexity,
+        "final_heldout_answer_perplexity_surface": final_eval.get(
+            "heldout_answer_perplexity_surface"
+        ),
         "heldout_eval_diagnostics": final_eval.get("heldout_eval_diagnostics"),
         "heldout_eval_samples": eval_samples,
         "missing_requirements": missing_requirements,

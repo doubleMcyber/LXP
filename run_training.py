@@ -31,6 +31,8 @@ from src.utils.metrics import extract_boxed_text, normalize_answer
 from src.models.hidden_state import lm_vocabulary_weight
 from train_compressor import (
     CompressionTrainConfig,
+    _latent_token_decoder_allowed_token_ids,
+    _mask_logits_to_allowed_token_ids,
     compress_latent_trajectory,
     resolve_training_alignment_context,
     train_reasoner_stage2,
@@ -400,6 +402,35 @@ def _unique_normalized_answer_count(answers: Iterable[str | None]) -> int:
     return len(normalized_answers)
 
 
+def _is_candidate_answer(answer: str | None, candidates: Iterable[str]) -> bool:
+    normalized_answer = normalize_answer(answer)
+    if not normalized_answer:
+        return False
+    return normalized_answer in {
+        normalized
+        for normalized in (normalize_answer(candidate) for candidate in candidates)
+        if normalized
+    }
+
+
+def _decode_latent_token_ids(tokenizer: Any, token_ids: Iterable[int]) -> str:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    decoded_ids: list[int] = []
+    for token_id in token_ids:
+        current_id = int(token_id)
+        if eos_token_id is not None and current_id == int(eos_token_id):
+            break
+        if pad_token_id is not None and current_id == int(pad_token_id):
+            continue
+        decoded_ids.append(current_id)
+    if not decoded_ids:
+        return ""
+    if hasattr(tokenizer, "decode"):
+        return str(tokenizer.decode(decoded_ids, skip_special_tokens=True)).strip()
+    return " ".join(str(token_id) for token_id in decoded_ids).strip()
+
+
 def _format_actor_answer_prompt(
     prompt: str,
     *,
@@ -540,6 +571,7 @@ def _build_evaluation_callback(
     actor_tokenizer: Any,
     config: CompressionTrainConfig,
     max_new_tokens: int,
+    semantic_readout_only: bool = False,
 ) -> Any:
     candidate_answers = _unique_candidate_answers(eval_examples) if dataset_name == "smoke" else ()
 
@@ -564,9 +596,16 @@ def _build_evaluation_callback(
         extraction_failure_count = 0
         latent_candidate_correct_count = 0
         latent_probe_correct_count = 0
+        latent_semantic_readout_correct_count = 0
+        latent_semantic_readout_count = 0
+        latent_token_decode_correct_count = 0
+        latent_token_decode_count = 0
+        latent_token_decode_surface_count = 0
         latent_first_token_correct_count = 0
         latent_first_token_rank_total = 0.0
         latent_first_token_rank_count = 0
+        raw_decode_correct_count = 0
+        raw_decode_extracted_answer_count = 0
         latent_logit_steering_bias_norm_total = 0.0
         latent_logit_steering_bias_norm_count = 0
         baseline_correct_count = 0
@@ -580,6 +619,9 @@ def _build_evaluation_callback(
         predicted_answers: list[str | None] = []
         latent_candidate_predicted_answers: list[str | None] = []
         latent_probe_predicted_answers: list[str | None] = []
+        latent_semantic_readout_predicted_answers: list[str | None] = []
+        latent_token_decode_predicted_answers: list[str | None] = []
+        raw_decode_predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
         baseline_candidate_predicted_answers: list[str | None] = []
         diagnostic_rows: list[str] = []
@@ -594,55 +636,58 @@ def _build_evaluation_callback(
                 )
                 + _ANSWER_SUFFIX_TEXT
             )
-            baseline_decode_metrics = generate_from_text_prefix(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_text=actor_answer_prefix_text,
-                max_new_tokens=max_new_tokens,
-                decoded_text_prefix=_ANSWER_DECODED_PREFIX,
-                stop_regex=_FINAL_ANSWER_STOP_REGEX,
-            )
-            baseline_decoded_text = str(baseline_decode_metrics["decoded_text"])
-            baseline_predicted_answer = _predicted_answer_for_target(
-                dataset_name,
-                baseline_decoded_text,
-                target_answer,
-            )
-            baseline_predicted_answers.append(baseline_predicted_answer)
-            if baseline_predicted_answer is not None and str(baseline_predicted_answer).strip():
-                baseline_extracted_answer_count += 1
-            if _answers_match(dataset_name, baseline_predicted_answer, target_answer):
-                baseline_correct_count += 1
+            baseline_decoded_text = ""
+            baseline_predicted_answer = None
             baseline_candidate_predicted_answer = None
-            if candidate_answers:
-                actor_text_prefix_embeds = _text_prefix_embeddings(
+            if not semantic_readout_only:
+                baseline_decode_metrics = generate_from_text_prefix(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
                     prefix_text=actor_answer_prefix_text,
+                    max_new_tokens=max_new_tokens,
+                    decoded_text_prefix=_ANSWER_DECODED_PREFIX,
+                    stop_regex=_FINAL_ANSWER_STOP_REGEX,
                 )
-                baseline_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
-                    model=actor_model,
-                    tokenizer=actor_tokenizer,
-                    prefix_embeds=actor_text_prefix_embeds,
-                    answer_text=target_answer,
-                    answer_variants=_answer_metric_variants(target_answer),
+                baseline_decoded_text = str(baseline_decode_metrics["decoded_text"])
+                baseline_predicted_answer = _predicted_answer_for_target(
+                    dataset_name,
+                    baseline_decoded_text,
+                    target_answer,
                 )
-                if baseline_first_token_metrics.get("first_token_rank") is not None:
-                    baseline_first_token_rank_count += 1
-                    baseline_first_token_rank_total += float(
-                        baseline_first_token_metrics["first_token_rank"] or 0.0
+                baseline_predicted_answers.append(baseline_predicted_answer)
+                if baseline_predicted_answer is not None and str(baseline_predicted_answer).strip():
+                    baseline_extracted_answer_count += 1
+                if _answers_match(dataset_name, baseline_predicted_answer, target_answer):
+                    baseline_correct_count += 1
+                if candidate_answers:
+                    actor_text_prefix_embeds = _text_prefix_embeddings(
+                        model=actor_model,
+                        tokenizer=actor_tokenizer,
+                        prefix_text=actor_answer_prefix_text,
                     )
-                if bool(baseline_first_token_metrics.get("first_token_top1")):
-                    baseline_first_token_correct_count += 1
-                baseline_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
-                    model=actor_model,
-                    tokenizer=actor_tokenizer,
-                    prefix_embeds=actor_text_prefix_embeds,
-                    candidate_answers=candidate_answers,
-                )
-                baseline_candidate_predicted_answers.append(baseline_candidate_predicted_answer)
-                if _answers_match(dataset_name, baseline_candidate_predicted_answer, target_answer):
-                    baseline_candidate_correct_count += 1
+                    baseline_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
+                        model=actor_model,
+                        tokenizer=actor_tokenizer,
+                        prefix_embeds=actor_text_prefix_embeds,
+                        answer_text=target_answer,
+                        answer_variants=_answer_metric_variants(target_answer),
+                    )
+                    if baseline_first_token_metrics.get("first_token_rank") is not None:
+                        baseline_first_token_rank_count += 1
+                        baseline_first_token_rank_total += float(
+                            baseline_first_token_metrics["first_token_rank"] or 0.0
+                        )
+                    if bool(baseline_first_token_metrics.get("first_token_top1")):
+                        baseline_first_token_correct_count += 1
+                    baseline_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
+                        model=actor_model,
+                        tokenizer=actor_tokenizer,
+                        prefix_embeds=actor_text_prefix_embeds,
+                        candidate_answers=candidate_answers,
+                    )
+                    baseline_candidate_predicted_answers.append(baseline_candidate_predicted_answer)
+                    if _answers_match(dataset_name, baseline_candidate_predicted_answer, target_answer):
+                        baseline_candidate_correct_count += 1
 
             input_ids, attention_mask = _tokenize_prompt(
                 reasoner_tokenizer,
@@ -689,6 +734,60 @@ def _build_evaluation_callback(
                     latent_probe_predicted_answers.append(latent_probe_predicted_answer)
                     if _answers_match(dataset_name, latent_probe_predicted_answer, target_answer):
                         latent_probe_correct_count += 1
+            latent_semantic_readout_predicted_answer = latent_probe_predicted_answer
+            if latent_semantic_readout_predicted_answer is not None:
+                latent_semantic_readout_count += 1
+                latent_semantic_readout_predicted_answers.append(
+                    latent_semantic_readout_predicted_answer
+                )
+                if _answers_match(
+                    dataset_name,
+                    latent_semantic_readout_predicted_answer,
+                    target_answer,
+                ):
+                    latent_semantic_readout_correct_count += 1
+            latent_token_decode_predicted_answer = None
+            latent_token_decode_text = ""
+            latent_token_decoder = alignment_context.get("stage2_latent_token_decoder")
+            if latent_token_decoder is not None:
+                latent_token_decode_surface_count += 1
+                with torch.no_grad():
+                    decoder_device = next(latent_token_decoder.parameters()).device
+                    vocabulary_weight = lm_vocabulary_weight(actor_model)
+                    token_logits = latent_token_decoder.forward_sequence(
+                        aligned_latents.to(device=decoder_device, dtype=vocabulary_weight.dtype),
+                        vocabulary_weight.to(device=decoder_device),
+                    )
+                    if bool(alignment_context.get("stage2_latent_token_decoder_candidate_token_mask", False)):
+                        token_logits = _mask_logits_to_allowed_token_ids(
+                            token_logits,
+                            _latent_token_decoder_allowed_token_ids(
+                                actor_tokenizer=actor_tokenizer,
+                                answers=(),
+                                candidate_answers=latent_probe_candidates,
+                                max_answer_length=config.answer_max_length,
+                                output_steps=int(getattr(latent_token_decoder, "output_steps", 1)),
+                            ),
+                        )
+                    token_ids = token_logits.argmax(dim=-1)[0].detach().cpu().tolist()
+                latent_token_decode_text = _decode_latent_token_ids(actor_tokenizer, token_ids)
+                latent_token_decode_predicted_answer = _predicted_answer_for_target(
+                    dataset_name,
+                    latent_token_decode_text,
+                    target_answer,
+                )
+                latent_token_decode_predicted_answers.append(latent_token_decode_predicted_answer)
+                if (
+                    latent_token_decode_predicted_answer is not None
+                    and str(latent_token_decode_predicted_answer).strip()
+                ):
+                    latent_token_decode_count += 1
+                if _answers_match(
+                    dataset_name,
+                    latent_token_decode_predicted_answer,
+                    target_answer,
+                ):
+                    latent_token_decode_correct_count += 1
             latent_soft_prompt_decoder = alignment_context.get("stage2_latent_soft_prompt_decoder")
             if latent_soft_prompt_decoder is not None:
                 with torch.no_grad():
@@ -716,70 +815,100 @@ def _build_evaluation_callback(
                     step_logits_bias_scale = float(
                         alignment_context.get("stage2_latent_logit_steering_generation_scale", 1.0)
                     )
-            answer_prefix_embeds = _append_text_embeddings(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_embeds=aligned_latents,
-                suffix_text=_ANSWER_SUFFIX_TEXT,
-            )
-            decode_metrics = generate_from_prefix_embeddings(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_embeds=answer_prefix_embeds,
-                max_new_tokens=max_new_tokens,
-                decoded_text_prefix=_ANSWER_DECODED_PREFIX,
-                stop_regex=_FINAL_ANSWER_STOP_REGEX,
-                step_logits_bias=step_logits_bias,
-                step_logits_bias_scale=step_logits_bias_scale,
-            )
-            decoded_text = str(decode_metrics["decoded_text"])
-            answer_metrics = compute_answer_metrics_from_prefix_embeddings(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_embeds=answer_prefix_embeds,
-                answer_text=target_answer,
-                answer_variants=_answer_metric_variants(target_answer),
-                step_logits_bias=step_logits_bias,
-                step_logits_bias_scale=step_logits_bias_scale,
-            )
-            latent_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
-                model=actor_model,
-                tokenizer=actor_tokenizer,
-                prefix_embeds=answer_prefix_embeds,
-                answer_text=target_answer,
-                answer_variants=_answer_metric_variants(target_answer),
-                first_step_logits_bias=first_step_logits_bias,
-                first_step_logits_bias_scale=step_logits_bias_scale,
-            )
-            if latent_first_token_metrics.get("first_token_rank") is not None:
-                latent_first_token_rank_count += 1
-                latent_first_token_rank_total += float(
-                    latent_first_token_metrics["first_token_rank"] or 0.0
-                )
-            if bool(latent_first_token_metrics.get("first_token_top1")):
-                latent_first_token_correct_count += 1
-            if answer_metrics["answer_nll"] is not None:
-                token_count = int(answer_metrics["answer_token_count"] or 0)
-                total_answer_tokens += token_count
-                total_answer_nll += float(answer_metrics["answer_nll"]) * token_count
-            predicted_answer = _predicted_answer_for_target(
-                dataset_name,
-                decoded_text,
-                target_answer,
-            )
+            decoded_text = ""
+            decode_metrics: dict[str, Any] = {}
+            latent_first_token_metrics: dict[str, Any] = {}
+            raw_decode_predicted_answer = None
             latent_candidate_predicted_answer = None
-            if candidate_answers:
-                latent_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
+            if not semantic_readout_only:
+                answer_prefix_embeds = _append_text_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_embeds=aligned_latents,
+                    suffix_text=_ANSWER_SUFFIX_TEXT,
+                )
+                decode_metrics = generate_from_prefix_embeddings(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
                     prefix_embeds=answer_prefix_embeds,
-                    candidate_answers=candidate_answers,
+                    max_new_tokens=max_new_tokens,
+                    decoded_text_prefix=_ANSWER_DECODED_PREFIX,
+                    stop_regex=_FINAL_ANSWER_STOP_REGEX,
+                    step_logits_bias=step_logits_bias,
+                    step_logits_bias_scale=step_logits_bias_scale,
                 )
-                latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
-                if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
-                    latent_candidate_correct_count += 1
+                decoded_text = str(decode_metrics["decoded_text"])
+                answer_metrics = compute_answer_metrics_from_prefix_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_embeds=answer_prefix_embeds,
+                    answer_text=target_answer,
+                    answer_variants=_answer_metric_variants(target_answer),
+                    step_logits_bias=step_logits_bias,
+                    step_logits_bias_scale=step_logits_bias_scale,
+                )
+                latent_first_token_metrics = compute_first_token_metrics_from_prefix_embeddings(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_embeds=answer_prefix_embeds,
+                    answer_text=target_answer,
+                    answer_variants=_answer_metric_variants(target_answer),
+                    first_step_logits_bias=first_step_logits_bias,
+                    first_step_logits_bias_scale=step_logits_bias_scale,
+                )
+                if latent_first_token_metrics.get("first_token_rank") is not None:
+                    latent_first_token_rank_count += 1
+                    latent_first_token_rank_total += float(
+                        latent_first_token_metrics["first_token_rank"] or 0.0
+                    )
+                if bool(latent_first_token_metrics.get("first_token_top1")):
+                    latent_first_token_correct_count += 1
+                if answer_metrics["answer_nll"] is not None:
+                    token_count = int(answer_metrics["answer_token_count"] or 0)
+                    total_answer_tokens += token_count
+                    total_answer_nll += float(answer_metrics["answer_nll"]) * token_count
+                raw_decode_predicted_answer = _predicted_answer_for_target(
+                    dataset_name,
+                    decoded_text,
+                    target_answer,
+                )
+                raw_decode_predicted_answers.append(raw_decode_predicted_answer)
+                if raw_decode_predicted_answer is not None and str(raw_decode_predicted_answer).strip():
+                    raw_decode_extracted_answer_count += 1
+                if _answers_match(dataset_name, raw_decode_predicted_answer, target_answer):
+                    raw_decode_correct_count += 1
+                if candidate_answers:
+                    latent_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
+                        model=actor_model,
+                        tokenizer=actor_tokenizer,
+                        prefix_embeds=answer_prefix_embeds,
+                        candidate_answers=candidate_answers,
+                    )
+                    latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
+                    if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
+                        latent_candidate_correct_count += 1
             extraction_source = "decode"
-            if predicted_answer is not None and str(predicted_answer).strip():
+            predicted_answer = raw_decode_predicted_answer
+            token_decode_usable = (
+                latent_token_decode_predicted_answer is not None
+                and str(latent_token_decode_predicted_answer).strip()
+                and (
+                    not latent_probe_candidates
+                    or _is_candidate_answer(
+                        latent_token_decode_predicted_answer,
+                        latent_probe_candidates,
+                    )
+                )
+            )
+            if token_decode_usable:
+                predicted_answer = latent_token_decode_predicted_answer
+                extraction_source = "latent_token_decode"
+                extracted_answer_count += 1
+            elif latent_semantic_readout_predicted_answer is not None:
+                predicted_answer = latent_semantic_readout_predicted_answer
+                extraction_source = "latent_semantic_readout"
+                extracted_answer_count += 1
+            elif raw_decode_predicted_answer is not None and str(raw_decode_predicted_answer).strip():
                 decode_extracted_answer_count += 1
                 extracted_answer_count += 1
             elif candidate_answers:
@@ -805,6 +934,9 @@ def _build_evaluation_callback(
                         (
                             f"target={target_answer}",
                             f"predicted={predicted_answer}",
+                            f"latent_token_decode_predicted={latent_token_decode_predicted_answer}",
+                            f"raw_decode_predicted={raw_decode_predicted_answer}",
+                            f"semantic_readout_predicted={latent_semantic_readout_predicted_answer}",
                             f"candidate_predicted={latent_candidate_predicted_answer}",
                             f"probe_predicted={latent_probe_predicted_answer}",
                             f"latent_first_token_rank={latent_first_token_metrics.get('first_token_rank')}",
@@ -813,6 +945,7 @@ def _build_evaluation_callback(
                             f"source={extraction_source}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
+                            f"latent_token_decoded={latent_token_decode_text}",
                             f"decoded={decoded_preview}",
                             f"baseline_decoded={baseline_preview}",
                         )
@@ -829,10 +962,48 @@ def _build_evaluation_callback(
                 100.0 * extracted_answer_count / len(eval_examples)
             ),
             "heldout_decode_answer_extraction_rate_percentage": (
-                100.0 * decode_extracted_answer_count / len(eval_examples)
+                100.0 * raw_decode_extracted_answer_count / len(eval_examples)
+            ),
+            "heldout_raw_decode_exact_match_accuracy": (
+                100.0 * raw_decode_correct_count / len(eval_examples)
+            ),
+            "heldout_raw_decode_answer_extraction_rate_percentage": (
+                100.0 * raw_decode_extracted_answer_count / len(eval_examples)
+            ),
+            "heldout_raw_decode_unique_predicted_answer_count": float(
+                _unique_normalized_answer_count(raw_decode_predicted_answers)
+            ),
+            "heldout_latent_token_decode_accuracy": (
+                100.0 * latent_token_decode_correct_count / len(eval_examples)
+            ),
+            "heldout_latent_token_decode_enabled": latent_token_decode_surface_count > 0,
+            "heldout_latent_token_decode_require_ready": bool(
+                alignment_context.get("stage2_latent_token_decoder_require_ready", False)
+            ),
+            "heldout_latent_token_decode_surface_rate_percentage": (
+                100.0 * latent_token_decode_surface_count / len(eval_examples)
+            ),
+            "heldout_latent_token_decode_answer_extraction_rate_percentage": (
+                100.0 * latent_token_decode_count / len(eval_examples)
+            ),
+            "heldout_latent_token_decode_unique_predicted_answer_count": float(
+                _unique_normalized_answer_count(latent_token_decode_predicted_answers)
             ),
             "heldout_candidate_fallback_rate_percentage": (
                 100.0 * candidate_fallback_count / len(eval_examples)
+            ),
+            "heldout_latent_semantic_readout_accuracy": (
+                100.0 * latent_semantic_readout_correct_count / latent_semantic_readout_count
+                if latent_semantic_readout_count
+                else None
+            ),
+            "heldout_latent_semantic_readout_rate_percentage": (
+                100.0 * latent_semantic_readout_count / len(eval_examples)
+            ),
+            "heldout_latent_semantic_readout_unique_predicted_answer_count": (
+                float(_unique_normalized_answer_count(latent_semantic_readout_predicted_answers))
+                if latent_semantic_readout_count
+                else None
             ),
             "heldout_latent_candidate_accuracy": (
                 100.0 * latent_candidate_correct_count / len(eval_examples)
@@ -879,6 +1050,7 @@ def _build_evaluation_callback(
             "heldout_actor_text_baseline_accuracy": (
                 100.0 * baseline_correct_count / len(eval_examples)
             ),
+            "heldout_actor_text_baseline_evaluated": not semantic_readout_only,
             "heldout_actor_text_baseline_answer_extraction_rate_percentage": (
                 100.0 * baseline_extracted_answer_count / len(eval_examples)
             ),
@@ -908,6 +1080,11 @@ def _build_evaluation_callback(
             "heldout_correct_count": float(correct_count),
             "heldout_answer_nll": heldout_answer_nll,
             "heldout_answer_perplexity": float(torch.exp(torch.tensor(heldout_answer_nll)).item()),
+            "heldout_answer_perplexity_surface": (
+                "skipped_semantic_readout_only"
+                if semantic_readout_only and total_answer_tokens == 0
+                else "actor_answer_nll"
+            ),
             "heldout_eval_diagnostics": "\n".join(diagnostic_rows),
         }
 
@@ -980,6 +1157,9 @@ def main() -> None:
     print("Building text-first dataloaders...")
     train_loader, eval_examples, baseline_examples, dataset_name = _build_training_payloads(cfg)
     evaluation_max_new_tokens = int(getattr(getattr(cfg.training, "evaluation", None), "max_new_tokens", 16))
+    semantic_readout_only = bool(
+        getattr(getattr(cfg.training, "evaluation", None), "semantic_readout_only", False)
+    )
     evaluation_fn = _build_evaluation_callback(
         eval_examples=eval_examples,
         baseline_examples=baseline_examples,
@@ -988,6 +1168,7 @@ def main() -> None:
         actor_tokenizer=actor_tokenizer,
         config=config,
         max_new_tokens=evaluation_max_new_tokens,
+        semantic_readout_only=semantic_readout_only,
     )
     alignment_context = resolve_training_alignment_context(
         reasoner_model=reasoner,
@@ -1056,6 +1237,8 @@ def main() -> None:
                 f"l_answer={entry.get('l_answer', 0.0):.4f} "
                 f"first_token_acc={entry.get('answer_first_token_accuracy', 0.0):.2f} "
                 f"first_token_rank={entry.get('answer_first_token_rank_mean', 0.0):.2f} "
+                f"l_token_decode={entry.get('l_latent_token_decoder', 0.0):.4f} "
+                f"token_decode_seq_acc={entry.get('latent_token_decoder_sequence_accuracy', 0.0):.2f} "
                 f"l_answer_contrast={entry.get('l_answer_contrast', 0.0):.4f} "
                 f"answer_contrast_accuracy={entry.get('answer_contrast_accuracy', 0.0):.2f} "
                 f"l_answer_probe={entry.get('l_answer_probe', 0.0):.4f} "
@@ -1066,6 +1249,8 @@ def main() -> None:
                 f"probe_update={entry.get('latent_answer_probe_update_norm', 0.0):.6f} "
                 f"soft_prompt_grad={entry.get('latent_soft_prompt_decoder_grad_norm', 0.0):.4f} "
                 f"soft_prompt_update={entry.get('latent_soft_prompt_decoder_update_norm', 0.0):.6f} "
+                f"token_decoder_grad={entry.get('latent_token_decoder_grad_norm', 0.0):.4f} "
+                f"token_decoder_update={entry.get('latent_token_decoder_update_norm', 0.0):.6f} "
             )
             continue
         print(
@@ -1075,6 +1260,9 @@ def main() -> None:
             f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f} "
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
             f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
+            f"token_decode_accuracy={entry.get('heldout_latent_token_decode_accuracy', 0.0):.2f} "
+            f"raw_decode_accuracy={entry.get('heldout_raw_decode_exact_match_accuracy', 0.0):.2f} "
+            f"semantic_readout_accuracy={entry.get('heldout_latent_semantic_readout_accuracy', 0.0) or 0.0:.2f} "
             f"latent_probe_accuracy={entry.get('heldout_latent_probe_accuracy', 0.0) or 0.0:.2f} "
             f"latent_first_token_accuracy={entry.get('heldout_latent_first_token_accuracy', 0.0) or 0.0:.2f} "
             f"unique_predictions={entry.get('heldout_unique_predicted_answer_count', 0.0):.0f} "

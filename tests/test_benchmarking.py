@@ -1534,6 +1534,32 @@ def test_build_training_smoke_report_flags_degenerate_actor_text_baseline() -> N
     assert any("Actor text baseline is degenerate" in item for item in report["missing_requirements"])
 
 
+def test_build_training_smoke_report_gates_enabled_token_decoder() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 66.667,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 2.0,
+                "heldout_latent_token_decode_enabled": True,
+                "heldout_latent_token_decode_require_ready": True,
+                "heldout_latent_token_decode_accuracy": 66.667,
+                "heldout_latent_token_decode_answer_extraction_rate_percentage": 100.0,
+                "heldout_latent_token_decode_unique_predicted_answer_count": 2.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["latent_token_decoder_ready"] is False
+    assert any("Latent token decoder" in item for item in report["missing_requirements"])
+
+
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:
     phase1_methods = [name for name, _ in _methods_for_suite("phase1_homogeneous")]
     standard_methods = [name for name, _ in _methods_for_suite("standard")]

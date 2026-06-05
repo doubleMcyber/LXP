@@ -150,6 +150,7 @@ training:
   lambda_answer: 4.0
   lambda_answer_first_token: 0.0
   lambda_logit_steering: 0.0
+  lambda_latent_token_decoder: 0.0
   lambda_answer_contrast: 0.0
   lambda_answer_probe: 0.0
   answer_contrast_temperature: 1.0
@@ -203,6 +204,20 @@ training:
     generation_scale: 1.0
     pooling: attention
     max_bias_norm: 0.0
+  latent_token_decoder:
+    enabled: false
+    rank: 64
+    vocabulary_mode: low_rank
+    lr_multiplier: 1.0
+    output_steps: 8
+    dropout: 0.0
+    scale: 1.0
+    pooling: attention
+    max_bias_norm: 0.0
+    candidate_token_mask: false
+    require_ready: false
+    eos_weight: 1.0
+    margin: 0.0
   hidden_state_processor:
     enabled: false
     num_heads: 4
@@ -222,6 +237,7 @@ training:
     evaluate_before_training: true
     baseline_few_shot_examples: 6
     smoke_eval_set: heldout
+    semantic_readout_only: false
   checkpointing:
     enabled: true
     dir: "checkpoints"

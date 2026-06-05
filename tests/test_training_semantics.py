@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from latent_pipeline import _build_alignment_cache_key
-from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead
+from src.models.hidden_state import LatentAnswerProbe, LatentLogitSteeringHead, LatentTokenDecoderHead
 from train_compressor import (
     CompressionTrainConfig,
     _coerce_history_value,
@@ -16,6 +16,7 @@ from train_compressor import (
     _compute_latent_candidate_contrast_loss,
     _compute_latent_first_token_loss,
     _compute_latent_logit_steering_loss,
+    _compute_latent_token_decoder_loss,
     _numeric_metrics,
     _tokenize_text_batch,
     resolve_training_alignment_context,
@@ -286,6 +287,51 @@ def test_latent_logit_steering_loss_backprops_to_head_and_prefix() -> None:
     assert grad_norm > 0.0
 
 
+def test_latent_token_decoder_loss_backprops_to_head_and_prefix() -> None:
+    _, actor = _make_tiny_models()
+    for parameter in actor.parameters():
+        parameter.requires_grad = False
+    decoder = LatentTokenDecoderHead(
+        16,
+        rank=4,
+        vocabulary_size=128,
+        vocabulary_mode="low_rank",
+        output_steps=4,
+        pooling="mean",
+    )
+    latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
+
+    decoder_loss, sample_count, token_accuracy, sequence_accuracy, average_tokens = (
+        _compute_latent_token_decoder_loss(
+            latent_token_decoder=decoder,
+            actor_model=actor,
+            actor_tokenizer=_TinyTokenizer(),
+            latent_prefix=latent_prefix,
+            answers=["13", "42"],
+            candidate_answers=("13", "42"),
+            max_answer_length=4,
+            candidate_token_mask=False,
+            eos_weight=2.0,
+            margin=1.0,
+        )
+    )
+
+    assert decoder_loss is not None
+    assert sample_count == 2
+    assert 0.0 <= token_accuracy <= 100.0
+    assert 0.0 <= sequence_accuracy <= 100.0
+    assert average_tokens > 0.0
+    decoder_loss.backward()
+    assert latent_prefix.grad is not None
+    assert torch.isfinite(latent_prefix.grad).all()
+    grad_norm = sum(
+        float(parameter.grad.detach().abs().sum())
+        for parameter in decoder.parameters()
+        if parameter.grad is not None
+    )
+    assert grad_norm > 0.0
+
+
 def test_latent_answer_probe_loss_backprops_to_probe_and_prefix() -> None:
     probe = LatentAnswerProbe(16, max_candidates=4, hidden_multiplier=1)
     latent_prefix = torch.randn(2, 4, 16, requires_grad=True)
@@ -464,6 +510,7 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         lambda_answer=20.0,
         lambda_logit_steering=20.0,
         lambda_answer_probe=20.0,
+        lambda_latent_token_decoder=20.0,
         lambda_task=0.1,
         lambda_pref=0.1,
         lambda_geom=0.1,
@@ -476,6 +523,10 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
         latent_logit_steering_enabled=True,
         latent_logit_steering_rank=4,
         latent_logit_steering_vocabulary_mode="low_rank",
+        latent_token_decoder_enabled=True,
+        latent_token_decoder_rank=4,
+        latent_token_decoder_vocabulary_mode="low_rank",
+        latent_token_decoder_output_steps=4,
         latent_soft_prompt_decoder_enabled=True,
         latent_soft_prompt_decoder_output_steps=4,
         wandb_enabled=False,
@@ -503,6 +554,9 @@ def test_train_reasoner_stage2_can_train_handoff_adapter_only() -> None:
     assert train_row["latent_soft_prompt_decoder_grad_norm"] > 0.0
     assert train_row["trainable_latent_logit_steering_parameter_count"] > 0.0
     assert train_row["latent_logit_steering_grad_norm"] > 0.0
+    assert train_row["trainable_latent_token_decoder_parameter_count"] > 0.0
+    assert train_row["latent_token_decoder_grad_norm"] > 0.0
+    assert train_row["latent_token_decoder_update_norm"] > 0.0
 
 
 def test_resolve_training_alignment_context_uses_shared_pipeline_cache_key() -> None:

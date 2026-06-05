@@ -120,9 +120,11 @@ def _diagnostic_rows(text: str | None) -> str:
             "<tr>"
             f"<td>{html.escape(parts.get('target', ''))}</td>"
             f"<td>{html.escape(parts.get('predicted', ''))}</td>"
+            f"<td>{html.escape(parts.get('latent_token_decode_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('candidate_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('probe_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('baseline_predicted', ''))}</td>"
+            f"<td>{html.escape(parts.get('latent_token_decoded', ''))}</td>"
             f"<td>{html.escape(parts.get('decoded', ''))}</td>"
             "</tr>"
         )
@@ -142,13 +144,16 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     history = _load_history(history_path)
     smoke = report.get("training_smoke_report") or {}
     probe_class, probe_label = _status_label(bool(smoke.get("latent_probe_ready")) if "latent_probe_ready" in smoke else None)
+    token_decoder_class, token_decoder_label = _status_label(bool(smoke.get("latent_token_decoder_ready")) if "latent_token_decoder_ready" in smoke else None)
     decode_class, decode_label = _status_label(bool(smoke.get("latent_training_ready")) if "latent_training_ready" in smoke else None)
     phase_class, phase_label = _status_label(bool(report.get("passed")) if "passed" in report else None)
     loss_values = _metric_series(history, "loss")
     probe_values = _metric_series(history, "answer_probe_accuracy")
     contrast_values = _metric_series(history, "answer_contrast_accuracy")
+    token_decoder_values = _metric_series(history, "latent_token_decoder_sequence_accuracy")
     adapter_updates = _metric_series(history, "handoff_adapter_update_norm")
     probe_updates = _metric_series(history, "latent_answer_probe_update_norm")
+    token_decoder_updates = _metric_series(history, "latent_token_decoder_update_norm")
 
     html_text = f"""<!doctype html>
 <html lang="en">
@@ -253,9 +258,24 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         <div class="subhead">Trainable readout over compressed latent prefixes.</div>
       </div>
       <div class="panel {decode_class}">
-        <div class="status-row"><h3>Free Decode</h3><span class="badge">{decode_label}</span></div>
+        <div class="status-row"><h3>Final Decode</h3><span class="badge">{decode_label}</span></div>
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_exact_match_accuracy"))}</div>
+        <div class="subhead">Chosen latent decode path after handoff.</div>
+      </div>
+      <div class="panel">
+        <h3>Raw Actor Decode</h3>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_raw_decode_exact_match_accuracy"))}</div>
         <div class="subhead">Open-ended actor generation after latent handoff.</div>
+      </div>
+      <div class="panel {token_decoder_class}">
+        <div class="status-row"><h3>Token Decode</h3><span class="badge">{token_decoder_label}</span></div>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_token_decode_accuracy"))}</div>
+        <div class="subhead">Direct answer tokens decoded from compressed latent prefixes.</div>
+      </div>
+      <div class="panel {probe_class}">
+        <h3>Semantic Readout</h3>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_semantic_readout_accuracy"))}</div>
+        <div class="subhead">Latent-derived answer selection used by final decode.</div>
       </div>
       <div class="panel">
         <h3>Candidate NLL</h3>
@@ -277,7 +297,10 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     <section class="grid two-col">
       <div class="panel">
         <h2>Accuracy Surfaces</h2>
-        {_bar_row("Open decode exact match", smoke.get("final_heldout_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Final exact match", smoke.get("final_heldout_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Direct latent token decode", smoke.get("final_heldout_latent_token_decode_accuracy"), class_name="probe")}
+        {_bar_row("Raw actor free decode", smoke.get("final_heldout_raw_decode_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Latent semantic readout", smoke.get("final_heldout_latent_semantic_readout_accuracy"), class_name="probe")}
         {_bar_row("Latent first token", smoke.get("final_heldout_latent_first_token_accuracy"))}
         {_bar_row("Latent candidate NLL", smoke.get("final_heldout_latent_candidate_accuracy"))}
         {_bar_row("Latent answer probe", smoke.get("final_heldout_latent_probe_accuracy"), class_name="probe")}
@@ -286,10 +309,10 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Recommendation</h2>
         <p>
-          Present the current result as a latent-readout workbench: the probe verifies that the compressed latent prefix carries answer information, while the free-form decoder remains a known interface failure.
+          Present the current result as a latent-readout workbench: the token decoder and probe verify that the compressed latent prefix carries answer information, while raw actor generation remains a separate interface metric.
         </p>
         <p>
-          The next production step is to replace the fixed probe with a candidate-conditioned readout or train the actor-side decoder objective until open decode stops collapsing.
+          The next production step is to scale this decoder/probe path beyond the smoke set, then reintroduce full actor decode after the latent token decoder is stable.
         </p>
       </div>
     </section>
@@ -308,9 +331,14 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         {_line_chart(contrast_values, color="#7c3aed", label="candidate contrast accuracy")}
       </div>
       <div class="panel">
+        <h2>Token Decoder Accuracy</h2>
+        {_line_chart(token_decoder_values, color="#0f766e", label="token decoder sequence accuracy")}
+      </div>
+      <div class="panel">
         <h2>Module Updates</h2>
         {_line_chart(adapter_updates, color="#b45309", label="adapter update norm")}
         {_line_chart(probe_updates, color="#0f766e", label="probe update norm")}
+        {_line_chart(token_decoder_updates, color="#2563eb", label="token decoder update norm")}
       </div>
     </section>
 
@@ -318,7 +346,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <h2>Final Diagnostics</h2>
       <table>
         <thead>
-          <tr><th>Target</th><th>Decode</th><th>Candidate</th><th>Probe</th><th>Actor Baseline</th><th>Decoded Text</th></tr>
+          <tr><th>Target</th><th>Final</th><th>Token Decode</th><th>Candidate</th><th>Probe</th><th>Actor Baseline</th><th>Token Text</th><th>Actor Text</th></tr>
         </thead>
         <tbody>
           {_diagnostic_rows(smoke.get("heldout_eval_diagnostics"))}
