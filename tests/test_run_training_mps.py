@@ -149,6 +149,8 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
 
     assert "training.evaluation.smoke_eval_set=train_overfit" in command
     assert "training.evaluation.semantic_readout_only=true" in command
+    assert "training.evaluation.semantic_bridge_actor_decode=true" in command
+    assert "training.evaluation.semantic_bridge_selected_answer_bias=100.0" in command
     assert "training.evaluation.baseline_few_shot_examples=4" in command
     assert "training.train_reasoner=false" in command
     assert "training.learning_rate=3.0e-4" in command

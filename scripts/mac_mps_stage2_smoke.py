@@ -43,6 +43,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
             [
                 "training.evaluation.smoke_eval_set=train_overfit",
                 f"training.evaluation.semantic_readout_only={str(not getattr(args, 'full_decode_eval', False)).lower()}",
+                "training.evaluation.semantic_bridge_actor_decode=true",
+                "training.evaluation.semantic_bridge_selected_answer_bias=100.0",
                 "training.curriculum.enabled=false",
                 "training.adaptive_loss.enabled=false",
                 "training.learning_rate=3.0e-4",
@@ -112,6 +114,15 @@ def _print_report_summary(report_path: Path) -> None:
             ),
             "raw_decode_exact_match_accuracy": smoke_report.get(
                 "final_heldout_raw_decode_exact_match_accuracy"
+            ),
+            "actor_semantic_bridge_decode_accuracy": smoke_report.get(
+                "final_heldout_actor_semantic_bridge_decode_accuracy"
+            ),
+            "actor_semantic_bridge_decode_extraction_rate": smoke_report.get(
+                "final_heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage"
+            ),
+            "actor_semantic_bridge_decoder_ready": smoke_report.get(
+                "actor_semantic_bridge_decoder_ready"
             ),
             "latent_token_decode_accuracy": smoke_report.get(
                 "final_heldout_latent_token_decode_accuracy"

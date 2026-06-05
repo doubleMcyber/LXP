@@ -1427,6 +1427,15 @@ def build_training_phase2_report(
         "final_heldout_raw_decode_exact_match_accuracy": final_heldout_entry.get(
             "heldout_raw_decode_exact_match_accuracy"
         ),
+        "final_heldout_actor_semantic_bridge_decode_accuracy": final_heldout_entry.get(
+            "heldout_actor_semantic_bridge_decode_accuracy"
+        ),
+        "final_heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage": final_heldout_entry.get(
+            "heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage"
+        ),
+        "final_heldout_actor_semantic_bridge_decode_unique_predicted_answer_count": final_heldout_entry.get(
+            "heldout_actor_semantic_bridge_decode_unique_predicted_answer_count"
+        ),
         "final_heldout_latent_token_decode_accuracy": final_heldout_entry.get(
             "heldout_latent_token_decode_accuracy"
         ),
@@ -1554,6 +1563,23 @@ def build_training_smoke_report(
     actor_baseline_unique_count = (
         None if actor_baseline_unique_raw is None else int(float(actor_baseline_unique_raw))
     )
+    actor_bridge_accuracy_raw = final_eval.get("heldout_actor_semantic_bridge_decode_accuracy")
+    actor_bridge_accuracy = (
+        None if actor_bridge_accuracy_raw is None else float(actor_bridge_accuracy_raw)
+    )
+    actor_bridge_enabled = bool(
+        final_eval.get("heldout_actor_semantic_bridge_decode_enabled", False)
+    )
+    actor_bridge_rate_raw = final_eval.get(
+        "heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage"
+    )
+    actor_bridge_rate = None if actor_bridge_rate_raw is None else float(actor_bridge_rate_raw)
+    actor_bridge_unique_raw = final_eval.get(
+        "heldout_actor_semantic_bridge_decode_unique_predicted_answer_count"
+    )
+    actor_bridge_unique_count = (
+        None if actor_bridge_unique_raw is None else int(float(actor_bridge_unique_raw))
+    )
     latent_probe_accuracy_raw = final_eval.get("heldout_latent_probe_accuracy")
     latent_probe_accuracy = (
         None if latent_probe_accuracy_raw is None else float(latent_probe_accuracy_raw)
@@ -1638,6 +1664,24 @@ def build_training_smoke_report(
             f"across {eval_samples} samples while baseline accuracy was "
             f"{actor_baseline_accuracy:.2f}%."
         )
+    if actor_bridge_enabled:
+        if actor_bridge_rate is None or actor_bridge_rate < 100.0:
+            missing_requirements.append(
+                "Actor semantic bridge decode is enabled but did not extract an answer "
+                f"for every sample ({0.0 if actor_bridge_rate is None else actor_bridge_rate:.2f}%)."
+            )
+        if actor_bridge_accuracy is None or actor_bridge_accuracy < 100.0:
+            missing_requirements.append(
+                "Actor semantic bridge decode is enabled but exact-match accuracy is below "
+                f"100% ({0.0 if actor_bridge_accuracy is None else actor_bridge_accuracy:.2f}%)."
+            )
+        if eval_samples > 1 and (
+            actor_bridge_unique_count is None or actor_bridge_unique_count <= 1
+        ):
+            missing_requirements.append(
+                "Actor semantic bridge decode predictions are degenerate: fewer than two "
+                f"unique answers were decoded across {eval_samples} samples."
+            )
     if latent_token_decode_enabled and latent_token_decode_require_ready:
         if latent_token_decode_rate is None or latent_token_decode_rate < 100.0:
             missing_requirements.append(
@@ -1683,6 +1727,31 @@ def build_training_smoke_report(
         ),
         "final_heldout_raw_decode_unique_predicted_answer_count": final_eval.get(
             "heldout_raw_decode_unique_predicted_answer_count"
+        ),
+        "final_heldout_actor_semantic_bridge_decode_accuracy": actor_bridge_accuracy,
+        "final_heldout_actor_semantic_bridge_decode_enabled": actor_bridge_enabled,
+        "final_heldout_actor_semantic_bridge_decode_surface_rate_percentage": final_eval.get(
+            "heldout_actor_semantic_bridge_decode_surface_rate_percentage"
+        ),
+        "final_heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage": (
+            actor_bridge_rate
+        ),
+        "final_heldout_actor_semantic_bridge_decode_unique_predicted_answer_count": (
+            actor_bridge_unique_count
+        ),
+        "actor_semantic_bridge_decoder_ready": (
+            actor_bridge_enabled
+            and actor_bridge_accuracy is not None
+            and actor_bridge_accuracy >= 100.0
+            and actor_bridge_rate is not None
+            and actor_bridge_rate >= 100.0
+            and (
+                eval_samples <= 1
+                or (
+                    actor_bridge_unique_count is not None
+                    and actor_bridge_unique_count > 1
+                )
+            )
         ),
         "final_heldout_latent_token_decode_accuracy": latent_token_decode_accuracy,
         "final_heldout_latent_token_decode_enabled": latent_token_decode_enabled,

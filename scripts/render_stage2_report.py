@@ -120,10 +120,12 @@ def _diagnostic_rows(text: str | None) -> str:
             "<tr>"
             f"<td>{html.escape(parts.get('target', ''))}</td>"
             f"<td>{html.escape(parts.get('predicted', ''))}</td>"
+            f"<td>{html.escape(parts.get('actor_bridge_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('latent_token_decode_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('candidate_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('probe_predicted', ''))}</td>"
             f"<td>{html.escape(parts.get('baseline_predicted', ''))}</td>"
+            f"<td>{html.escape(parts.get('actor_bridge_decoded', ''))}</td>"
             f"<td>{html.escape(parts.get('latent_token_decoded', ''))}</td>"
             f"<td>{html.escape(parts.get('decoded', ''))}</td>"
             "</tr>"
@@ -144,6 +146,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     history = _load_history(history_path)
     smoke = report.get("training_smoke_report") or {}
     probe_class, probe_label = _status_label(bool(smoke.get("latent_probe_ready")) if "latent_probe_ready" in smoke else None)
+    actor_bridge_class, actor_bridge_label = _status_label(bool(smoke.get("actor_semantic_bridge_decoder_ready")) if "actor_semantic_bridge_decoder_ready" in smoke else None)
     token_decoder_class, token_decoder_label = _status_label(bool(smoke.get("latent_token_decoder_ready")) if "latent_token_decoder_ready" in smoke else None)
     decode_class, decode_label = _status_label(bool(smoke.get("latent_training_ready")) if "latent_training_ready" in smoke else None)
     phase_class, phase_label = _status_label(bool(report.get("passed")) if "passed" in report else None)
@@ -267,6 +270,11 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_raw_decode_exact_match_accuracy"))}</div>
         <div class="subhead">Open-ended actor generation after latent handoff.</div>
       </div>
+      <div class="panel {actor_bridge_class}">
+        <div class="status-row"><h3>Actor Bridge Decode</h3><span class="badge">{actor_bridge_label}</span></div>
+        <div class="card-value">{_fmt_percent(smoke.get("final_heldout_actor_semantic_bridge_decode_accuracy"))}</div>
+        <div class="subhead">Actor generation constrained by the latent semantic readout.</div>
+      </div>
       <div class="panel {token_decoder_class}">
         <div class="status-row"><h3>Token Decode</h3><span class="badge">{token_decoder_label}</span></div>
         <div class="card-value">{_fmt_percent(smoke.get("final_heldout_latent_token_decode_accuracy"))}</div>
@@ -298,6 +306,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Accuracy Surfaces</h2>
         {_bar_row("Final exact match", smoke.get("final_heldout_exact_match_accuracy"), class_name="decode")}
+        {_bar_row("Actor semantic bridge decode", smoke.get("final_heldout_actor_semantic_bridge_decode_accuracy"), class_name="probe")}
         {_bar_row("Direct latent token decode", smoke.get("final_heldout_latent_token_decode_accuracy"), class_name="probe")}
         {_bar_row("Raw actor free decode", smoke.get("final_heldout_raw_decode_exact_match_accuracy"), class_name="decode")}
         {_bar_row("Latent semantic readout", smoke.get("final_heldout_latent_semantic_readout_accuracy"), class_name="probe")}
@@ -309,10 +318,10 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <div class="panel">
         <h2>Recommendation</h2>
         <p>
-          Present the current result as a latent-readout workbench: the token decoder and probe verify that the compressed latent prefix carries answer information, while raw actor generation remains a separate interface metric.
+          Present the current result as a latent-readout workbench: the actor bridge, token decoder, and probe verify that the compressed latent prefix carries answer information, while pure raw actor generation remains a separate interface metric.
         </p>
         <p>
-          The next production step is to scale this decoder/probe path beyond the smoke set, then reintroduce full actor decode after the latent token decoder is stable.
+          The next production step is to scale this bridge/probe path beyond the smoke set, then reintroduce unconstrained actor decode after the direct latent token decoder is stable.
         </p>
       </div>
     </section>
@@ -346,7 +355,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
       <h2>Final Diagnostics</h2>
       <table>
         <thead>
-          <tr><th>Target</th><th>Final</th><th>Token Decode</th><th>Candidate</th><th>Probe</th><th>Actor Baseline</th><th>Token Text</th><th>Actor Text</th></tr>
+          <tr><th>Target</th><th>Final</th><th>Actor Bridge</th><th>Token Decode</th><th>Candidate</th><th>Probe</th><th>Actor Baseline</th><th>Bridge Text</th><th>Token Text</th><th>Raw Actor Text</th></tr>
         </thead>
         <tbody>
           {_diagnostic_rows(smoke.get("heldout_eval_diagnostics"))}

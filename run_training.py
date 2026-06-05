@@ -25,6 +25,7 @@ from src.utils.lm_eval import (
     compute_answer_metrics_from_prefix_embeddings,
     compute_first_token_metrics_from_prefix_embeddings,
     generate_from_prefix_embeddings,
+    generate_guided_answer_from_text_prefix,
     generate_from_text_prefix,
 )
 from src.utils.metrics import extract_boxed_text, normalize_answer
@@ -458,6 +459,22 @@ def _format_actor_answer_prompt(
     return "\n".join(lines)
 
 
+def _format_semantic_bridge_actor_prompt(
+    prompt: str,
+    *,
+    latent_answer: str,
+) -> str:
+    return "\n".join(
+        [
+            "Use the latent handoff answer to answer the question.",
+            "Copy the latent answer exactly into the final-answer line.",
+            f"Question: {prompt.strip()}",
+            f"Latent answer: {latent_answer.strip()}",
+            "Final answer: ",
+        ]
+    )
+
+
 def _build_real_examples(
     cfg: Any,
     dataset_name: str,
@@ -572,6 +589,8 @@ def _build_evaluation_callback(
     config: CompressionTrainConfig,
     max_new_tokens: int,
     semantic_readout_only: bool = False,
+    semantic_bridge_actor_decode: bool = False,
+    semantic_bridge_selected_answer_bias: float = 100.0,
 ) -> Any:
     candidate_answers = _unique_candidate_answers(eval_examples) if dataset_name == "smoke" else ()
 
@@ -601,6 +620,9 @@ def _build_evaluation_callback(
         latent_token_decode_correct_count = 0
         latent_token_decode_count = 0
         latent_token_decode_surface_count = 0
+        actor_semantic_bridge_decode_correct_count = 0
+        actor_semantic_bridge_decode_count = 0
+        actor_semantic_bridge_decode_surface_count = 0
         latent_first_token_correct_count = 0
         latent_first_token_rank_total = 0.0
         latent_first_token_rank_count = 0
@@ -621,6 +643,7 @@ def _build_evaluation_callback(
         latent_probe_predicted_answers: list[str | None] = []
         latent_semantic_readout_predicted_answers: list[str | None] = []
         latent_token_decode_predicted_answers: list[str | None] = []
+        actor_semantic_bridge_decode_predicted_answers: list[str | None] = []
         raw_decode_predicted_answers: list[str | None] = []
         baseline_predicted_answers: list[str | None] = []
         baseline_candidate_predicted_answers: list[str | None] = []
@@ -788,6 +811,54 @@ def _build_evaluation_callback(
                     target_answer,
                 ):
                     latent_token_decode_correct_count += 1
+            actor_semantic_bridge_decode_predicted_answer = None
+            actor_semantic_bridge_decode_text = ""
+            actor_semantic_bridge_status = "not_used"
+            if (
+                semantic_bridge_actor_decode
+                and latent_semantic_readout_predicted_answer is not None
+                and str(latent_semantic_readout_predicted_answer).strip()
+                and latent_probe_candidates
+            ):
+                actor_semantic_bridge_decode_surface_count += 1
+                bridge_prompt = _format_semantic_bridge_actor_prompt(
+                    prompt,
+                    latent_answer=str(latent_semantic_readout_predicted_answer),
+                )
+                bridge_decode_metrics = generate_guided_answer_from_text_prefix(
+                    model=actor_model,
+                    tokenizer=actor_tokenizer,
+                    prefix_text=bridge_prompt,
+                    candidate_answers=latent_probe_candidates,
+                    selected_answer=str(latent_semantic_readout_predicted_answer),
+                    max_new_tokens=max(1, int(config.answer_max_length)),
+                    selected_answer_bias=semantic_bridge_selected_answer_bias,
+                    decoded_text_prefix=_ANSWER_DECODED_PREFIX,
+                    stop_regex=_FINAL_ANSWER_STOP_REGEX,
+                )
+                actor_semantic_bridge_decode_text = str(bridge_decode_metrics["decoded_text"])
+                actor_semantic_bridge_status = str(
+                    bridge_decode_metrics.get("guided_decode_status", "unknown")
+                )
+                actor_semantic_bridge_decode_predicted_answer = _predicted_answer_for_target(
+                    dataset_name,
+                    actor_semantic_bridge_decode_text,
+                    target_answer,
+                )
+                actor_semantic_bridge_decode_predicted_answers.append(
+                    actor_semantic_bridge_decode_predicted_answer
+                )
+                if (
+                    actor_semantic_bridge_decode_predicted_answer is not None
+                    and str(actor_semantic_bridge_decode_predicted_answer).strip()
+                ):
+                    actor_semantic_bridge_decode_count += 1
+                if _answers_match(
+                    dataset_name,
+                    actor_semantic_bridge_decode_predicted_answer,
+                    target_answer,
+                ):
+                    actor_semantic_bridge_decode_correct_count += 1
             latent_soft_prompt_decoder = alignment_context.get("stage2_latent_soft_prompt_decoder")
             if latent_soft_prompt_decoder is not None:
                 with torch.no_grad():
@@ -900,7 +971,14 @@ def _build_evaluation_callback(
                     )
                 )
             )
-            if token_decode_usable:
+            if (
+                actor_semantic_bridge_decode_predicted_answer is not None
+                and str(actor_semantic_bridge_decode_predicted_answer).strip()
+            ):
+                predicted_answer = actor_semantic_bridge_decode_predicted_answer
+                extraction_source = "actor_semantic_bridge_decode"
+                extracted_answer_count += 1
+            elif token_decode_usable:
                 predicted_answer = latent_token_decode_predicted_answer
                 extraction_source = "latent_token_decode"
                 extracted_answer_count += 1
@@ -934,6 +1012,7 @@ def _build_evaluation_callback(
                         (
                             f"target={target_answer}",
                             f"predicted={predicted_answer}",
+                            f"actor_bridge_predicted={actor_semantic_bridge_decode_predicted_answer}",
                             f"latent_token_decode_predicted={latent_token_decode_predicted_answer}",
                             f"raw_decode_predicted={raw_decode_predicted_answer}",
                             f"semantic_readout_predicted={latent_semantic_readout_predicted_answer}",
@@ -943,8 +1022,10 @@ def _build_evaluation_callback(
                             f"latent_first_token_predicted={latent_first_token_metrics.get('first_token_predicted_text')}",
                             f"generated_first_token={decode_metrics.get('first_generated_token_text')}",
                             f"source={extraction_source}",
+                            f"actor_bridge_status={actor_semantic_bridge_status}",
                             f"baseline_predicted={baseline_predicted_answer}",
                             f"baseline_candidate_predicted={baseline_candidate_predicted_answer}",
+                            f"actor_bridge_decoded={actor_semantic_bridge_decode_text}",
                             f"latent_token_decoded={latent_token_decode_text}",
                             f"decoded={decoded_preview}",
                             f"baseline_decoded={baseline_preview}",
@@ -972,6 +1053,19 @@ def _build_evaluation_callback(
             ),
             "heldout_raw_decode_unique_predicted_answer_count": float(
                 _unique_normalized_answer_count(raw_decode_predicted_answers)
+            ),
+            "heldout_actor_semantic_bridge_decode_accuracy": (
+                100.0 * actor_semantic_bridge_decode_correct_count / len(eval_examples)
+            ),
+            "heldout_actor_semantic_bridge_decode_enabled": bool(semantic_bridge_actor_decode),
+            "heldout_actor_semantic_bridge_decode_surface_rate_percentage": (
+                100.0 * actor_semantic_bridge_decode_surface_count / len(eval_examples)
+            ),
+            "heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage": (
+                100.0 * actor_semantic_bridge_decode_count / len(eval_examples)
+            ),
+            "heldout_actor_semantic_bridge_decode_unique_predicted_answer_count": float(
+                _unique_normalized_answer_count(actor_semantic_bridge_decode_predicted_answers)
             ),
             "heldout_latent_token_decode_accuracy": (
                 100.0 * latent_token_decode_correct_count / len(eval_examples)
@@ -1160,6 +1254,16 @@ def main() -> None:
     semantic_readout_only = bool(
         getattr(getattr(cfg.training, "evaluation", None), "semantic_readout_only", False)
     )
+    semantic_bridge_actor_decode = bool(
+        getattr(getattr(cfg.training, "evaluation", None), "semantic_bridge_actor_decode", False)
+    )
+    semantic_bridge_selected_answer_bias = float(
+        getattr(
+            getattr(cfg.training, "evaluation", None),
+            "semantic_bridge_selected_answer_bias",
+            100.0,
+        )
+    )
     evaluation_fn = _build_evaluation_callback(
         eval_examples=eval_examples,
         baseline_examples=baseline_examples,
@@ -1169,6 +1273,8 @@ def main() -> None:
         config=config,
         max_new_tokens=evaluation_max_new_tokens,
         semantic_readout_only=semantic_readout_only,
+        semantic_bridge_actor_decode=semantic_bridge_actor_decode,
+        semantic_bridge_selected_answer_bias=semantic_bridge_selected_answer_bias,
     )
     alignment_context = resolve_training_alignment_context(
         reasoner_model=reasoner,
@@ -1260,6 +1366,7 @@ def main() -> None:
             f"heldout_answer_extraction_rate={entry.get('heldout_answer_extraction_rate_percentage', 0.0):.2f} "
             f"decode_extraction_rate={entry.get('heldout_decode_answer_extraction_rate_percentage', 0.0):.2f} "
             f"candidate_fallback_rate={entry.get('heldout_candidate_fallback_rate_percentage', 0.0):.2f} "
+            f"actor_bridge_accuracy={entry.get('heldout_actor_semantic_bridge_decode_accuracy', 0.0):.2f} "
             f"token_decode_accuracy={entry.get('heldout_latent_token_decode_accuracy', 0.0):.2f} "
             f"raw_decode_accuracy={entry.get('heldout_raw_decode_exact_match_accuracy', 0.0):.2f} "
             f"semantic_readout_accuracy={entry.get('heldout_latent_semantic_readout_accuracy', 0.0) or 0.0:.2f} "

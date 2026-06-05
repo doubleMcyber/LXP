@@ -238,6 +238,8 @@ training:
     baseline_few_shot_examples: 6
     smoke_eval_set: heldout
     semantic_readout_only: false
+    semantic_bridge_actor_decode: false
+    semantic_bridge_selected_answer_bias: 100.0
   checkpointing:
     enabled: true
     dir: "checkpoints"

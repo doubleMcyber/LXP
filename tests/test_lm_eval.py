@@ -10,6 +10,7 @@ from src.utils.lm_eval import (
     compute_answer_metrics_from_prefix_embeddings,
     compute_first_token_metrics_from_prefix_embeddings,
     generate_from_prefix_embeddings,
+    generate_guided_answer_from_text_prefix,
     generate_from_text_prefix,
 )
 
@@ -156,6 +157,25 @@ def test_native_generate_helpers_decode_text_and_embedding_prefixes() -> None:
 
     assert text_metrics["decoded_text"] == "Final answer: 1"
     assert embedding_metrics["decoded_text"] == "Final answer: 1"
+
+
+def test_guided_answer_decode_prefers_selected_candidate() -> None:
+    model = _EmbeddingLogitModel()
+    tokenizer = _EmbeddingTokenizer()
+
+    metrics = generate_guided_answer_from_text_prefix(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_text="1",
+        candidate_answers=("1", "Final answer: 1"),
+        selected_answer="1",
+        max_new_tokens=1,
+        selected_answer_bias=100.0,
+    )
+
+    assert metrics["decoded_text"] == "1"
+    assert metrics["generated_token_ids"] == [1]
+    assert metrics["guided_decode_status"] == "decoded"
 
 
 def test_embedding_generation_and_first_token_metrics_apply_first_step_bias() -> None:
