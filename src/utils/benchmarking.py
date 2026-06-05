@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 19
+REPORT_SCHEMA_VERSION = 20
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -1065,6 +1065,281 @@ def build_semantic_smoke_report(
             _semantic_row_diagnostic(row) for row in wrong_answer_rows[:diagnostic_limit]
         ],
         "wrong_answer_count": len(wrong_answer_rows),
+        "missing_requirements": missing_requirements,
+    }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator == 0.0:
+        return None
+    return numerator / denominator
+
+
+def _summary_row_by_method(
+    rows: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    by_method: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        method = str(row.get("method") or "")
+        if method:
+            by_method[method] = row
+    return by_method
+
+
+def build_transfer_comparison_report(
+    summary_rows: Sequence[dict[str, Any]],
+    *,
+    baseline_methods: Sequence[str],
+    latent_methods: Sequence[str],
+    primary_baseline_method: Optional[str] = None,
+    min_accuracy_retention_ratio: Optional[float] = None,
+    max_latency_ratio: Optional[float] = None,
+    require_latent_accuracy_gain: bool = False,
+) -> dict[str, Any]:
+    """Compare latent transfer rows against token/text handoff baselines."""
+    by_method = _summary_row_by_method(summary_rows)
+    available_baselines = [
+        method for method in baseline_methods if method in by_method
+    ]
+    available_latents = [
+        method for method in latent_methods if method in by_method
+    ]
+    selected_baseline = (
+        primary_baseline_method
+        if primary_baseline_method in by_method
+        else available_baselines[0]
+        if available_baselines
+        else None
+    )
+    baseline_row = by_method.get(selected_baseline or "")
+    baseline_accuracy = _safe_float(
+        None if baseline_row is None else baseline_row.get("accuracy_percentage")
+    )
+    baseline_latency = _safe_float(
+        None if baseline_row is None else baseline_row.get("average_latency_seconds")
+    )
+    baseline_perplexity = _safe_float(
+        None if baseline_row is None else baseline_row.get("answer_perplexity")
+    )
+
+    comparisons: list[dict[str, Any]] = []
+    missing_requirements: list[str] = []
+    if not available_baselines:
+        missing_requirements.append("No configured baseline methods were present in summary rows.")
+    if not available_latents:
+        missing_requirements.append("No configured latent methods were present in summary rows.")
+
+    for method in available_latents:
+        latent_row = by_method[method]
+        latent_accuracy = _safe_float(latent_row.get("accuracy_percentage"))
+        latent_latency = _safe_float(latent_row.get("average_latency_seconds"))
+        latent_perplexity = _safe_float(latent_row.get("answer_perplexity"))
+        accuracy_delta = (
+            None
+            if latent_accuracy is None or baseline_accuracy is None
+            else latent_accuracy - baseline_accuracy
+        )
+        latency_ratio = _safe_ratio(latent_latency, baseline_latency)
+        retention_ratio = _safe_ratio(latent_accuracy, baseline_accuracy)
+        perplexity_delta = (
+            None
+            if latent_perplexity is None or baseline_perplexity is None
+            else latent_perplexity - baseline_perplexity
+        )
+        comparison = {
+            "method": method,
+            "baseline_method": selected_baseline,
+            "sample_count": latent_row.get("sample_count"),
+            "baseline_accuracy_percentage": baseline_accuracy,
+            "latent_accuracy_percentage": latent_accuracy,
+            "accuracy_delta_percentage": accuracy_delta,
+            "accuracy_retention_ratio": retention_ratio,
+            "baseline_average_latency_seconds": baseline_latency,
+            "latent_average_latency_seconds": latent_latency,
+            "latency_ratio": latency_ratio,
+            "baseline_answer_perplexity": baseline_perplexity,
+            "latent_answer_perplexity": latent_perplexity,
+            "answer_perplexity_delta": perplexity_delta,
+            "latent_cache_transfer_rate_percentage": latent_row.get(
+                "cache_transfer_rate_percentage"
+            ),
+            "latent_handoff_ok_rate_percentage": latent_row.get(
+                "handoff_ok_rate_percentage"
+            ),
+            "latent_non_empty_decoded_rate_percentage": latent_row.get(
+                "non_empty_decoded_rate_percentage"
+            ),
+        }
+        comparisons.append(comparison)
+
+        if min_accuracy_retention_ratio is not None:
+            if retention_ratio is None:
+                missing_requirements.append(
+                    f"Method {method} did not provide enough accuracy data for retention."
+                )
+            elif retention_ratio < float(min_accuracy_retention_ratio):
+                missing_requirements.append(
+                    f"Method {method} retained {retention_ratio:.4f} of baseline accuracy, "
+                    f"below required {float(min_accuracy_retention_ratio):.4f}."
+                )
+        if max_latency_ratio is not None:
+            if latency_ratio is None:
+                missing_requirements.append(
+                    f"Method {method} did not provide enough latency data for comparison."
+                )
+            elif latency_ratio > float(max_latency_ratio):
+                missing_requirements.append(
+                    f"Method {method} latency ratio {latency_ratio:.4f} exceeds allowed "
+                    f"{float(max_latency_ratio):.4f}."
+                )
+        if require_latent_accuracy_gain and accuracy_delta is not None and accuracy_delta <= 0.0:
+            missing_requirements.append(
+                f"Method {method} did not beat baseline accuracy "
+                f"({accuracy_delta:.2f} percentage point delta)."
+            )
+
+    best_latent = None
+    if comparisons:
+        best_latent = max(
+            comparisons,
+            key=lambda row: (
+                -1.0
+                if row["latent_accuracy_percentage"] is None
+                else float(row["latent_accuracy_percentage"]),
+                -float(row["latency_ratio"])
+                if row["latency_ratio"] is not None
+                else float("-inf"),
+            ),
+        )
+
+    return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "phase": "transfer_comparison",
+        "passed": not missing_requirements,
+        "baseline_methods": list(baseline_methods),
+        "latent_methods": list(latent_methods),
+        "available_baseline_methods": available_baselines,
+        "available_latent_methods": available_latents,
+        "primary_baseline_method": selected_baseline,
+        "min_accuracy_retention_ratio": min_accuracy_retention_ratio,
+        "max_latency_ratio": max_latency_ratio,
+        "require_latent_accuracy_gain": bool(require_latent_accuracy_gain),
+        "comparisons": comparisons,
+        "best_latent_method": None if best_latent is None else best_latent["method"],
+        "best_latent_accuracy_percentage": (
+            None if best_latent is None else best_latent["latent_accuracy_percentage"]
+        ),
+        "missing_requirements": missing_requirements,
+    }
+
+
+def build_heterogeneous_transfer_report(
+    rows: Sequence[dict[str, Any]],
+    *,
+    latent_methods: Sequence[str],
+    model_pair_compatibility: Optional[dict[str, Any]] = None,
+    generated_methods: Sequence[str] = (),
+    context_generated_methods: Sequence[str] = (),
+    require_generated_adapter_for_incompatible_pair: bool = True,
+    require_context_for_context_methods: bool = True,
+) -> dict[str, Any]:
+    """Gate cross-family latent rows on robust, non-KV transfer surfaces."""
+    compatibility = model_pair_compatibility or {}
+    pair_kv_compatible = bool(compatibility.get("kv_cache_compatible", False))
+    latent_method_set = set(latent_methods)
+    generated_method_set = set(generated_methods)
+    context_method_set = set(context_generated_methods)
+    latent_rows = [row for row in rows if row.get("method") in latent_method_set]
+    generated_rows = [row for row in latent_rows if row.get("method") in generated_method_set]
+    context_rows = [row for row in latent_rows if row.get("method") in context_method_set]
+
+    direct_cache_statuses = {
+        "transferred",
+        "unsupported",
+        "unsupported_architecture_mismatch",
+        "layer_count_mismatch",
+    }
+    direct_cache_attempt_rows = [
+        row
+        for row in latent_rows
+        if str(row.get("kv_cache_status") or "") in direct_cache_statuses
+        or _optional_bool_value(row.get("kv_cache_transferred")) is True
+    ]
+    generated_adapter_rows = [
+        row
+        for row in generated_rows
+        if "generated_trajectory_" in str(row.get("handoff_adapter_status") or "")
+    ]
+    generated_adapter_applied_rows = [
+        row
+        for row in generated_adapter_rows
+        if _optional_bool_value(row.get("handoff_adapter_applied")) is True
+    ]
+    missing_generated_adapter_rows = [
+        row
+        for row in generated_rows
+        if "generated_trajectory_missing" in str(row.get("handoff_adapter_status") or "")
+        or "generated_trajectory_disabled" in str(row.get("handoff_adapter_status") or "")
+        or "generated_trajectory_" not in str(row.get("handoff_adapter_status") or "")
+    ]
+    context_used_rows = [
+        row
+        for row in context_rows
+        if str(row.get("receiver_context_status") or "").startswith("used_")
+        or str(row.get("active_kv_cache_source") or "") == "receiver_context"
+    ]
+
+    missing_requirements: list[str] = []
+    if not latent_rows:
+        missing_requirements.append("No latent rows were available for heterogeneous reporting.")
+    if not pair_kv_compatible and direct_cache_attempt_rows:
+        missing_requirements.append(
+            "Incompatible model pair produced rows on direct KV-cache transfer surfaces; "
+            "use generated trajectory/context handoff for production hetero evaluation."
+        )
+    if (
+        require_generated_adapter_for_incompatible_pair
+        and not pair_kv_compatible
+        and generated_rows
+        and len(generated_adapter_applied_rows) < len(generated_rows)
+    ):
+        missing_requirements.append(
+            "At least one generated latent row did not apply a generated-trajectory adapter "
+            "on an incompatible model pair."
+        )
+    if (
+        require_context_for_context_methods
+        and context_rows
+        and len(context_used_rows) < len(context_rows)
+    ):
+        missing_requirements.append(
+            "At least one generated context latent row did not use receiver prompt context."
+        )
+
+    return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "phase": "heterogeneous_transfer",
+        "passed": not missing_requirements,
+        "model_pair_kv_cache_compatible": pair_kv_compatible,
+        "model_pair_compatibility_status": compatibility.get("status"),
+        "model_pair_compatibility_reason": compatibility.get("reason"),
+        "latent_row_count": len(latent_rows),
+        "generated_latent_row_count": len(generated_rows),
+        "direct_cache_attempt_row_count": len(direct_cache_attempt_rows),
+        "generated_adapter_row_count": len(generated_adapter_rows),
+        "generated_adapter_applied_row_count": len(generated_adapter_applied_rows),
+        "missing_generated_adapter_row_count": len(missing_generated_adapter_rows),
+        "receiver_context_row_count": len(context_rows),
+        "receiver_context_used_row_count": len(context_used_rows),
         "missing_requirements": missing_requirements,
     }
 

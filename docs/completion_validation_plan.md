@@ -13,6 +13,10 @@ Validated local reports:
   `/private/tmp/lxp_fix_semantic_candidate_token_e10/mac_mps_training_report.json`
 - Raw free-decode smoke:
   `/private/tmp/lxp_fix_raw_isolated_e30/mac_mps_training_report.json`
+- Locked heterogeneous context-vs-latent smoke:
+  `/private/tmp/lxp_prod_validation_3_report.json`
+- Locked heterogeneous context-vs-latent replay:
+  `/private/tmp/lxp_prod_validation_3_replay_report.json`
 
 What is now smoke-proven:
 
@@ -22,6 +26,11 @@ What is now smoke-proven:
   `latent_candidate_fallback_ready` report field.
 - Raw actor free decode reaches `100%` when trained in the raw-isolated preset.
 - Unit suite passes: `158 passed, 1 skipped`.
+- Current unit suite passes after production validation reporting:
+  `165 passed, 1 skipped`.
+- The 3-sample locked hetero benchmark and replay both pass semantic,
+  transfer-comparison, and heterogeneous-readiness gates with matching
+  `sample_content_digest`.
 
 Important interpretation:
 
@@ -30,6 +39,20 @@ Important interpretation:
   intentionally separated because training them together regressed raw decode.
 
 ## Bigger Dataset Validation Ladder
+
+The recommended orchestrated path is now:
+
+```bash
+venv/bin/python scripts/run_production_validation.py
+venv/bin/python scripts/run_production_validation.py --execute --profile local --replay
+venv/bin/python scripts/run_production_validation.py --execute --profile gpu --replay
+venv/bin/python scripts/run_production_validation.py --execute --profile scale --replay
+```
+
+The runner orders work as tests, generated sender-trace warm-up, generated
+trajectory adapter preparation, locked token-context-vs-latent benchmark, and
+optional manifest replay. It writes reports under
+`outputs/production_validation` by default.
 
 ### 1. Local Sanity Gates
 

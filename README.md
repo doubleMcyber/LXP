@@ -41,14 +41,34 @@ venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --lim
 ```
 
 Benchmark reports include an `eval_manifest` with resolved dataset, split, sample
-indices, method list, model pair, seed, smoke profile, and a stable digest. Write
-the same lock file separately with `--write-eval-manifest`, then replay it with
-`--eval-manifest` before any paid GPU run:
+indices, method list, model pair, seed, smoke profile, hashed sample
+fingerprints, a sample-content digest, and a stable manifest digest. Reports
+also include a `transfer_comparison_report` and
+`heterogeneous_transfer_report`, so token-context controls and cross-family
+adapter/context readiness are tracked in the JSON report instead of inferred
+manually from CSV files. Transfer retention, latency, and hetero-readiness
+thresholds can be hardened in `configs/main.yaml` under
+`reporting.transfer_comparison` and `reporting.heterogeneous_transfer`. Write
+the same lock file separately with
+`--write-eval-manifest`, then replay it with `--eval-manifest` before any paid
+GPU run:
 
 ```bash
 venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --methods token_context_handoff,verified_token_context_handoff,sender_answer_text_handoff,generated_context_latent_handoff --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing --write-eval-manifest outputs/locked_eval_manifest_5.json
 venv/bin/python benchmark_all.py --eval-manifest outputs/locked_eval_manifest_5.json --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing
 ```
+
+The staged production validation runner assembles the same workflow in the
+recommended order:
+
+```bash
+venv/bin/python scripts/run_production_validation.py
+venv/bin/python scripts/run_production_validation.py --execute --profile local --replay
+```
+
+Use `--profile gpu` or `--profile scale` only after the local profile passes and
+the report's semantic, comparison, and heterogeneous transfer sections are
+interpretable.
 
 For a bounded DigitalOcean pilot, inspect the planned commands locally first:
 

@@ -5,7 +5,10 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
+import sys
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -53,11 +56,13 @@ from src.utils.benchmarking import (
     STANDARD_SUMMARY_FIELDS,
     aggregate_standard_rows,
     build_ode_scaling_report,
+    build_heterogeneous_transfer_report,
     build_phase1_gate_report,
     build_phase3_gate_report,
     build_runtime_smoke_report,
     build_semantic_smoke_report,
     build_standard_row_base,
+    build_transfer_comparison_report,
     write_csv,
     write_json,
 )
@@ -971,6 +976,40 @@ def _resolved_sample_indices(limit: int, sample_indices: Optional[Sequence[int]]
     return [int(index) for index in list(sample_indices)[: max(0, int(limit))]]
 
 
+def _sample_fingerprint(
+    row: Mapping[str, Any],
+    *,
+    sample_index: int,
+) -> dict[str, Any]:
+    prompt = pick_field(dict(row), ("question", "problem"))
+    target = pick_field(dict(row), ("answer", "solution", "target"))
+    return {
+        "sample_index": int(sample_index),
+        "prompt_sha256": _stable_json_digest(prompt),
+        "target_sha256": _stable_json_digest(target),
+        "prompt_char_count": len(prompt),
+        "target_char_count": len(target),
+    }
+
+
+def _sample_fingerprints(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+    sample_indices: Optional[Sequence[int]],
+) -> list[dict[str, Any]]:
+    resolved_indices = _resolved_sample_indices(limit, sample_indices)
+    fingerprints: list[dict[str, Any]] = []
+    for row_index, row in enumerate(list(samples)[: max(0, int(limit))]):
+        sample_index = (
+            int(resolved_indices[row_index])
+            if row_index < len(resolved_indices)
+            else int(row_index)
+        )
+        fingerprints.append(_sample_fingerprint(row, sample_index=sample_index))
+    return fingerprints
+
+
 def _build_eval_manifest(
     *,
     suite_name: str,
@@ -985,7 +1024,9 @@ def _build_eval_manifest(
     semantic_smoke: bool,
     mvp_smoke: bool,
     hetero_smoke: bool,
+    sample_fingerprints: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
+    fingerprint_rows = [dict(row) for row in (sample_fingerprints or ())]
     manifest = {
         "manifest_schema_version": EVAL_MANIFEST_SCHEMA_VERSION,
         "suite": str(suite_name),
@@ -1002,6 +1043,8 @@ def _build_eval_manifest(
             "mvp_smoke": bool(mvp_smoke),
             "hetero_smoke": bool(hetero_smoke),
         },
+        "sample_fingerprints": fingerprint_rows,
+        "sample_content_digest": _stable_json_digest(fingerprint_rows),
     }
     manifest["manifest_digest"] = _manifest_digest(manifest)
     return manifest
@@ -1031,6 +1074,24 @@ def _load_eval_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _validate_eval_manifest_sample_lock(
+    resolved_manifest: Mapping[str, Any],
+    locked_manifest: Optional[Mapping[str, Any]],
+) -> None:
+    if locked_manifest is None:
+        return
+    expected_digest = locked_manifest.get("sample_content_digest")
+    if expected_digest and resolved_manifest.get("sample_content_digest") != expected_digest:
+        raise ValueError(
+            "Eval manifest sample content digest mismatch: "
+            f"expected {expected_digest}, "
+            f"computed {resolved_manifest.get('sample_content_digest')}"
+        )
+    expected_fingerprints = locked_manifest.get("sample_fingerprints")
+    if expected_fingerprints and resolved_manifest.get("sample_fingerprints") != expected_fingerprints:
+        raise ValueError("Eval manifest sample fingerprints do not match resolved samples")
+
+
 def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str, Any]) -> None:
     args.suite = str(manifest["suite"])
     args.dataset = str(manifest["dataset"])
@@ -1057,6 +1118,7 @@ def _build_artifact_manifest(
     latent_provenance_report: Optional[Mapping[str, Any]] = None,
     prepared_adapters: Sequence[Mapping[str, Any]] = (),
     prepared_eval_traces: Optional[Mapping[str, Any]] = None,
+    run_metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     cache_paths = {
         "sender_trace": [],
@@ -1097,8 +1159,39 @@ def _build_artifact_manifest(
         "eval_manifest_digest": (
             None if eval_manifest is None else eval_manifest.get("manifest_digest")
         ),
+        "run_metadata": dict(run_metadata or {}),
         "cache_paths": deduped_cache_paths,
         "do_not_commit_cache_artifacts": True,
+    }
+
+
+def _git_metadata() -> dict[str, Any]:
+    def _run_git(args: Sequence[str]) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        return result.stdout.strip()
+
+    status = _run_git(["status", "--short"])
+    return {
+        "commit": _run_git(["rev-parse", "HEAD"]),
+        "branch": _run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "dirty": bool(status),
+        "dirty_paths": [] if not status else status.splitlines(),
+    }
+
+
+def _run_metadata() -> dict[str, Any]:
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": list(sys.argv),
+        "git": _git_metadata(),
     }
 
 
@@ -4573,6 +4666,7 @@ def run_benchmark(
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
     answer_only_final: bool = False,
+    locked_eval_manifest: Optional[Mapping[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
@@ -4653,6 +4747,11 @@ def run_benchmark(
     effective_sample_indices = list(sample_indices) if sample_indices is not None else None
     if effective_sample_indices is not None:
         effective_sample_indices = effective_sample_indices[: min(limit, len(effective_sample_indices))]
+    sample_fingerprint_rows = _sample_fingerprints(
+        samples,
+        limit=limit,
+        sample_indices=effective_sample_indices,
+    )
     report_method_names = [name for name, _ in methods]
     eval_manifest = _build_eval_manifest(
         suite_name=suite_name,
@@ -4667,7 +4766,9 @@ def run_benchmark(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        sample_fingerprints=sample_fingerprint_rows,
     )
+    _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
 
@@ -5135,6 +5236,7 @@ def run_benchmark(
         latent_methods=provenance_latent_methods,
         max_rows=int(getattr(semantic_smoke_cfg, "max_diagnostic_rows", 10)),
     )
+    run_metadata = _run_metadata()
     artifact_manifest = _build_artifact_manifest(
         report_output_path=report_output_path,
         samples_output_path=samples_output_path,
@@ -5142,6 +5244,73 @@ def run_benchmark(
         eval_manifest_output_path=eval_manifest_output_path,
         eval_manifest=eval_manifest,
         latent_provenance_report=latent_provenance_report,
+        run_metadata=run_metadata,
+    )
+    transfer_comparison_cfg = getattr(
+        getattr(base_cfg, "reporting", None),
+        "transfer_comparison",
+        None,
+    )
+    configured_primary_baseline = getattr(
+        transfer_comparison_cfg,
+        "primary_baseline_method",
+        None,
+    )
+    default_primary_baseline = (
+        "verified_token_context_handoff"
+        if "verified_token_context_handoff" in provenance_baseline_methods
+        else "token_context_handoff"
+        if "token_context_handoff" in provenance_baseline_methods
+        else None
+    )
+    transfer_comparison_report = build_transfer_comparison_report(
+        summary_rows,
+        baseline_methods=provenance_baseline_methods,
+        latent_methods=provenance_latent_methods,
+        primary_baseline_method=(
+            str(configured_primary_baseline)
+            if configured_primary_baseline not in (None, "")
+            else default_primary_baseline
+        ),
+        min_accuracy_retention_ratio=getattr(
+            transfer_comparison_cfg,
+            "min_accuracy_retention_ratio",
+            None,
+        ),
+        max_latency_ratio=getattr(
+            transfer_comparison_cfg,
+            "max_latency_ratio",
+            None,
+        ),
+        require_latent_accuracy_gain=bool(
+            getattr(transfer_comparison_cfg, "require_latent_accuracy_gain", False)
+        ),
+    )
+    heterogeneous_transfer_cfg = getattr(
+        getattr(base_cfg, "reporting", None),
+        "heterogeneous_transfer",
+        None,
+    )
+    heterogeneous_transfer_report = build_heterogeneous_transfer_report(
+        sample_rows,
+        latent_methods=provenance_latent_methods,
+        model_pair_compatibility=suite_model_pair_compatibility,
+        generated_methods=GENERATED_LATENT_METHODS,
+        context_generated_methods=("generated_context_latent_handoff",),
+        require_generated_adapter_for_incompatible_pair=bool(
+            getattr(
+                heterogeneous_transfer_cfg,
+                "require_generated_adapter_for_incompatible_pair",
+                True,
+            )
+        ),
+        require_context_for_context_methods=bool(
+            getattr(
+                heterogeneous_transfer_cfg,
+                "require_context_for_context_methods",
+                True,
+            )
+        ),
     )
 
     write_csv(samples_output_path, sample_rows, STANDARD_SAMPLE_FIELDS)
@@ -5152,6 +5321,7 @@ def run_benchmark(
         "dataset_split": effective_split,
         "limit": limit,
         "sample_indices": effective_sample_indices,
+        "sample_content_digest": eval_manifest["sample_content_digest"],
         "eval_manifest": eval_manifest,
         "repetitions": repetitions,
         "latent_steps_values": latent_step_candidates,
@@ -5253,8 +5423,11 @@ def run_benchmark(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "runtime_smoke_report": runtime_smoke_report,
         "semantic_smoke_report": semantic_smoke_report,
+        "transfer_comparison_report": transfer_comparison_report,
+        "heterogeneous_transfer_report": heterogeneous_transfer_report,
         "latent_provenance_report": latent_provenance_report,
         "artifact_manifest": artifact_manifest,
+        "run_metadata": run_metadata,
         "phase_gate_report": phase_gate_report,
         "ode_scaling_report": build_ode_scaling_report(summary_rows),
         "summary_rows": summary_rows,
@@ -5305,6 +5478,7 @@ def prepare_generated_trajectory_adapter_cache(
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
     answer_only_final: bool = False,
+    locked_eval_manifest: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
@@ -5360,6 +5534,19 @@ def prepare_generated_trajectory_adapter_cache(
                 getattr(semantic_smoke_cfg, "sample_indices", None)
             )
     effective_sample_indices = _resolved_sample_indices(limit, sample_indices)
+    validation_size = _validation_size(base_cfg, dataset_name)
+    samples = get_dataloader(
+        dataset_name,
+        limit=limit,
+        split=effective_split,
+        validation_size=validation_size,
+        sample_indices=sample_indices,
+    )
+    sample_fingerprint_rows = _sample_fingerprints(
+        samples,
+        limit=limit,
+        sample_indices=effective_sample_indices,
+    )
     report_method_names = list(method_names or ("generated_latent_handoff",))
     eval_manifest = _build_eval_manifest(
         suite_name=suite_name,
@@ -5374,7 +5561,9 @@ def prepare_generated_trajectory_adapter_cache(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        sample_fingerprints=sample_fingerprint_rows,
     )
+    _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
     if prepare_adapter:
@@ -5447,12 +5636,14 @@ def prepare_generated_trajectory_adapter_cache(
             variant_state=variant_state,
             method_names=method_names,
         )
+    run_metadata = _run_metadata()
     artifact_manifest = _build_artifact_manifest(
         report_output_path=report_output_path,
         eval_manifest_output_path=eval_manifest_output_path,
         eval_manifest=eval_manifest,
         prepared_adapters=prepared_adapters,
         prepared_eval_traces=prepared_eval_traces,
+        run_metadata=run_metadata,
     )
     report_payload = {
         "suite": suite_name,
@@ -5460,6 +5651,7 @@ def prepare_generated_trajectory_adapter_cache(
         "dataset_split": effective_split,
         "limit": int(limit),
         "sample_indices": effective_sample_indices,
+        "sample_content_digest": eval_manifest["sample_content_digest"],
         "eval_manifest": eval_manifest,
         "methods": report_method_names,
         "agent_a_model": str(suite_cfg.agent_a_model),
@@ -5501,6 +5693,7 @@ def prepare_generated_trajectory_adapter_cache(
         "prepared_adapters": prepared_adapters,
         "prepared_eval_traces": prepared_eval_traces,
         "artifact_manifest": artifact_manifest,
+        "run_metadata": run_metadata,
     }
     write_json(report_output_path, report_payload)
     return report_payload
@@ -5863,8 +6056,10 @@ def main() -> None:
         help="Optional deterministic seed to stamp into benchmark metadata.",
     )
     args = parser.parse_args()
+    locked_eval_manifest = None
     if args.eval_manifest is not None:
-        _apply_eval_manifest_to_args(args, _load_eval_manifest(args.eval_manifest))
+        locked_eval_manifest = _load_eval_manifest(args.eval_manifest)
+        _apply_eval_manifest_to_args(args, locked_eval_manifest)
     if args.semantic_smoke or args.mvp_smoke or args.hetero_smoke:
         if args.limit is None:
             args.limit = DEFAULT_SEMANTIC_SMOKE_LIMIT
@@ -6021,6 +6216,7 @@ def main() -> None:
             mvp_smoke=args.mvp_smoke,
             hetero_smoke=args.hetero_smoke,
             answer_only_final=args.answer_only_final,
+            locked_eval_manifest=locked_eval_manifest,
         )
         print(f"Wrote generated trajectory prepare report to {args.report_output}")
         if args.write_eval_manifest is not None:
@@ -6134,6 +6330,7 @@ def main() -> None:
         mvp_smoke=args.mvp_smoke,
         hetero_smoke=args.hetero_smoke,
         answer_only_final=args.answer_only_final,
+        locked_eval_manifest=locked_eval_manifest,
     )
 
     print(f"Wrote per-sample benchmark rows to {args.samples_output}")
@@ -6144,6 +6341,16 @@ def main() -> None:
     print(f"Phase gate passed: {report_payload['phase_gate_report']['passed']}")
     if report_payload.get("semantic_smoke_report") is not None:
         print(f"Semantic smoke passed: {report_payload['semantic_smoke_report']['passed']}")
+    if report_payload.get("transfer_comparison_report") is not None:
+        print(
+            "Transfer comparison passed: "
+            f"{report_payload['transfer_comparison_report']['passed']}"
+        )
+    if report_payload.get("heterogeneous_transfer_report") is not None:
+        print(
+            "Heterogeneous transfer readiness passed: "
+            f"{report_payload['heterogeneous_transfer_report']['passed']}"
+        )
     print(f"\n{'Method':<30} {'Acc':>8} {'PPL':>10} {'Latency':>11} {'Cache %':>9}")
     print("-" * 78)
     for row in summary_rows:

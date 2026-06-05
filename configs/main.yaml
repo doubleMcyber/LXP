@@ -286,6 +286,14 @@ reporting:
     require_baseline_final_answer_marker: true
     require_final_answer_marker_methods: ["text_text_hybrid", "generated_latent_handoff"]
     max_diagnostic_rows: 5
+  transfer_comparison:
+    primary_baseline_method: "verified_token_context_handoff"
+    min_accuracy_retention_ratio: null
+    max_latency_ratio: null
+    require_latent_accuracy_gain: false
+  heterogeneous_transfer:
+    require_generated_adapter_for_incompatible_pair: true
+    require_context_for_context_methods: true
   phase_gates:
     phase1:
       required_repetitions: 3
