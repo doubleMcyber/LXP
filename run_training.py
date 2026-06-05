@@ -354,6 +354,111 @@ def _select_candidate_answer_by_nll(
     return best_answer, best_nll
 
 
+def _canonical_candidate_answer(
+    answer: str | None,
+    candidate_answers: Iterable[str],
+) -> str | None:
+    normalized_answer = normalize_answer(answer)
+    if not normalized_answer:
+        return None
+    for candidate in candidate_answers:
+        if normalize_answer(candidate) == normalized_answer:
+            return candidate
+    return None
+
+
+def _encode_candidate_answer_for_decoder(
+    tokenizer: Any,
+    answer: str,
+    *,
+    max_answer_length: int,
+    output_steps: int,
+) -> list[int]:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    max_width = max(1, min(int(max_answer_length), int(output_steps)))
+    answer_width = max_width if eos_token_id is None else max(1, max_width - 1)
+    token_ids = tokenizer.encode(str(answer).strip(), add_special_tokens=False)[:answer_width]
+    if eos_token_id is not None and len(token_ids) < max_width:
+        token_ids = [*token_ids, int(eos_token_id)]
+    return [int(token_id) for token_id in token_ids]
+
+
+def _select_candidate_answer_by_token_decoder(
+    *,
+    token_logits: torch.Tensor,
+    tokenizer: Any,
+    candidate_answers: Iterable[str],
+    max_answer_length: int,
+    candidate_prior_nll: dict[str, float] | None = None,
+    candidate_prior_weight: float = 0.0,
+) -> tuple[str | None, float | None]:
+    if token_logits.dim() == 3:
+        if int(token_logits.shape[0]) != 1:
+            raise ValueError("candidate token decoder scoring expects one eval row at a time")
+        token_logits = token_logits[0]
+    if token_logits.dim() != 2:
+        raise ValueError("token_logits must have shape [steps, vocab] or [1, steps, vocab]")
+
+    output_steps = int(token_logits.shape[0])
+    best_answer: str | None = None
+    best_nll: float | None = None
+    seen: set[str] = set()
+    for candidate in candidate_answers:
+        canonical = _canonical_candidate_answer(candidate, candidate_answers)
+        if canonical is None:
+            continue
+        normalized = normalize_answer(canonical)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        token_ids = _encode_candidate_answer_for_decoder(
+            tokenizer,
+            canonical,
+            max_answer_length=max_answer_length,
+            output_steps=output_steps,
+        )
+        if not token_ids:
+            continue
+        positions = torch.arange(len(token_ids), dtype=torch.long, device=token_logits.device)
+        targets = torch.tensor(token_ids, dtype=torch.long, device=token_logits.device)
+        logits = token_logits.index_select(0, positions).float()
+        token_nll = float(
+            torch.nn.functional.cross_entropy(logits, targets, reduction="mean")
+            .detach()
+            .cpu()
+            .item()
+        )
+        prior_nll = 0.0
+        if candidate_prior_nll:
+            prior_nll = float(candidate_prior_nll.get(normalized, 0.0))
+        score = token_nll + (max(0.0, float(candidate_prior_weight)) * prior_nll)
+        if best_nll is None or score < best_nll:
+            best_answer = canonical
+            best_nll = score
+    return best_answer, best_nll
+
+
+def _select_latent_candidate_fallback(
+    *,
+    candidate_answers: Iterable[str],
+    latent_probe_answer: str | None,
+    latent_semantic_readout_answer: str | None,
+    latent_token_decoder_answer: str | None,
+    actor_nll_answer: str | None,
+) -> tuple[str | None, str]:
+    candidates = tuple(candidate_answers)
+    for source, answer in (
+        ("latent_probe", latent_probe_answer),
+        ("latent_semantic_readout", latent_semantic_readout_answer),
+        ("latent_token_decoder", latent_token_decoder_answer),
+        ("actor_candidate_nll", actor_nll_answer),
+    ):
+        canonical = _canonical_candidate_answer(answer, candidates)
+        if canonical is not None:
+            return canonical, source
+    return None, "missing"
+
+
 def _text_prefix_embeddings(
     *,
     model: AutoModelForCausalLM,
@@ -591,6 +696,7 @@ def _build_evaluation_callback(
     semantic_readout_only: bool = False,
     semantic_bridge_actor_decode: bool = False,
     semantic_bridge_selected_answer_bias: float = 100.0,
+    latent_token_decoder_probe_prior_weight: float = 0.0,
     raw_decode_require_ready: bool = False,
     raw_decode_stop_after_steering: bool = True,
     raw_decode_stop_by_semantic_readout_length: bool = False,
@@ -742,6 +848,7 @@ def _build_evaluation_callback(
                 with torch.no_grad():
                     aligned_latents = hidden_processor(aligned_latents)
             latent_probe_predicted_answer = None
+            latent_probe_candidate_prior_nll: dict[str, float] = {}
             latent_probe = alignment_context.get("stage2_latent_answer_probe")
             latent_probe_candidates = tuple(
                 alignment_context.get("stage2_latent_answer_candidates") or candidate_answers
@@ -756,6 +863,13 @@ def _build_evaluation_callback(
                             :, : len(latent_probe_candidates)
                         ]
                         probe_index = int(probe_logits.argmax(dim=-1)[0].detach().cpu().item())
+                        probe_log_probs = torch.log_softmax(probe_logits[0].float(), dim=-1)
+                        latent_probe_candidate_prior_nll = {
+                            normalize_answer(candidate) or str(candidate): float(
+                                (-probe_log_probs[index]).detach().cpu().item()
+                            )
+                            for index, candidate in enumerate(latent_probe_candidates)
+                        }
                     latent_probe_predicted_answer = latent_probe_candidates[probe_index]
                     latent_probe_predicted_answers.append(latent_probe_predicted_answer)
                     if _answers_match(dataset_name, latent_probe_predicted_answer, target_answer):
@@ -774,6 +888,7 @@ def _build_evaluation_callback(
                     latent_semantic_readout_correct_count += 1
             latent_token_decode_predicted_answer = None
             latent_token_decode_text = ""
+            latent_token_decode_source = "not_used"
             latent_token_decoder = alignment_context.get("stage2_latent_token_decoder")
             if latent_token_decoder is not None:
                 latent_token_decode_surface_count += 1
@@ -796,12 +911,31 @@ def _build_evaluation_callback(
                             ),
                         )
                     token_ids = token_logits.argmax(dim=-1)[0].detach().cpu().tolist()
-                latent_token_decode_text = _decode_latent_token_ids(actor_tokenizer, token_ids)
-                latent_token_decode_predicted_answer = _predicted_answer_for_target(
-                    dataset_name,
-                    latent_token_decode_text,
-                    target_answer,
-                )
+                    constrained_token_answer, _ = (
+                        _select_candidate_answer_by_token_decoder(
+                            token_logits=token_logits,
+                            tokenizer=actor_tokenizer,
+                            candidate_answers=latent_probe_candidates,
+                            max_answer_length=config.answer_max_length,
+                            candidate_prior_nll=latent_probe_candidate_prior_nll,
+                            candidate_prior_weight=latent_token_decoder_probe_prior_weight,
+                        )
+                        if latent_probe_candidates
+                        else (None, None)
+                    )
+                latent_token_free_decode_text = _decode_latent_token_ids(actor_tokenizer, token_ids)
+                if constrained_token_answer is not None:
+                    latent_token_decode_text = str(constrained_token_answer)
+                    latent_token_decode_predicted_answer = constrained_token_answer
+                    latent_token_decode_source = "candidate_sequence_nll"
+                else:
+                    latent_token_decode_text = latent_token_free_decode_text
+                    latent_token_decode_predicted_answer = _predicted_answer_for_target(
+                        dataset_name,
+                        latent_token_decode_text,
+                        target_answer,
+                    )
+                    latent_token_decode_source = "greedy"
                 latent_token_decode_predicted_answers.append(latent_token_decode_predicted_answer)
                 if (
                     latent_token_decode_predicted_answer is not None
@@ -828,13 +962,24 @@ def _build_evaluation_callback(
                     prompt,
                     latent_answer=str(latent_semantic_readout_predicted_answer),
                 )
+                bridge_answer_token_ids = actor_tokenizer.encode(
+                    str(latent_semantic_readout_predicted_answer).strip(),
+                    add_special_tokens=False,
+                )
+                bridge_max_new_tokens = max(
+                    1,
+                    min(
+                        int(config.answer_max_length),
+                        len(bridge_answer_token_ids) if bridge_answer_token_ids else 1,
+                    ),
+                )
                 bridge_decode_metrics = generate_guided_answer_from_text_prefix(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
                     prefix_text=bridge_prompt,
                     candidate_answers=latent_probe_candidates,
                     selected_answer=str(latent_semantic_readout_predicted_answer),
-                    max_new_tokens=max(1, int(config.answer_max_length)),
+                    max_new_tokens=bridge_max_new_tokens,
                     selected_answer_bias=semantic_bridge_selected_answer_bias,
                     decoded_text_prefix=_ANSWER_DECODED_PREFIX,
                     stop_regex=_FINAL_ANSWER_STOP_REGEX,
@@ -894,13 +1039,34 @@ def _build_evaluation_callback(
             latent_first_token_metrics: dict[str, Any] = {}
             raw_decode_predicted_answer = None
             latent_candidate_predicted_answer = None
-            if not semantic_readout_only:
-                answer_prefix_embeds = _append_text_embeddings(
+            latent_candidate_nll_predicted_answer = None
+            latent_candidate_source = "not_used"
+            answer_prefix_embeds = _append_text_embeddings(
+                model=actor_model,
+                tokenizer=actor_tokenizer,
+                prefix_embeds=aligned_latents,
+                suffix_text=_ANSWER_SUFFIX_TEXT,
+            )
+            if candidate_answers:
+                latent_candidate_nll_predicted_answer, _ = _select_candidate_answer_by_nll(
                     model=actor_model,
                     tokenizer=actor_tokenizer,
-                    prefix_embeds=aligned_latents,
-                    suffix_text=_ANSWER_SUFFIX_TEXT,
+                    prefix_embeds=answer_prefix_embeds,
+                    candidate_answers=candidate_answers,
                 )
+                latent_candidate_predicted_answer, latent_candidate_source = (
+                    _select_latent_candidate_fallback(
+                        candidate_answers=candidate_answers,
+                        latent_probe_answer=latent_probe_predicted_answer,
+                        latent_semantic_readout_answer=latent_semantic_readout_predicted_answer,
+                        latent_token_decoder_answer=latent_token_decode_predicted_answer,
+                        actor_nll_answer=latent_candidate_nll_predicted_answer,
+                    )
+                )
+                latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
+                if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
+                    latent_candidate_correct_count += 1
+            if not semantic_readout_only:
                 raw_decode_max_new_tokens = max_new_tokens
                 if (
                     raw_decode_stop_by_semantic_readout_length
@@ -973,16 +1139,6 @@ def _build_evaluation_callback(
                     raw_decode_extracted_answer_count += 1
                 if _answers_match(dataset_name, raw_decode_predicted_answer, target_answer):
                     raw_decode_correct_count += 1
-                if candidate_answers:
-                    latent_candidate_predicted_answer, _ = _select_candidate_answer_by_nll(
-                        model=actor_model,
-                        tokenizer=actor_tokenizer,
-                        prefix_embeds=answer_prefix_embeds,
-                        candidate_answers=candidate_answers,
-                    )
-                    latent_candidate_predicted_answers.append(latent_candidate_predicted_answer)
-                    if _answers_match(dataset_name, latent_candidate_predicted_answer, target_answer):
-                        latent_candidate_correct_count += 1
             extraction_source = "decode"
             predicted_answer = raw_decode_predicted_answer
             token_decode_usable = (
@@ -1039,9 +1195,12 @@ def _build_evaluation_callback(
                             f"predicted={predicted_answer}",
                             f"actor_bridge_predicted={actor_semantic_bridge_decode_predicted_answer}",
                             f"latent_token_decode_predicted={latent_token_decode_predicted_answer}",
+                            f"latent_token_decode_source={latent_token_decode_source}",
                             f"raw_decode_predicted={raw_decode_predicted_answer}",
                             f"semantic_readout_predicted={latent_semantic_readout_predicted_answer}",
                             f"candidate_predicted={latent_candidate_predicted_answer}",
+                            f"candidate_source={latent_candidate_source}",
+                            f"candidate_nll_predicted={latent_candidate_nll_predicted_answer}",
                             f"probe_predicted={latent_probe_predicted_answer}",
                             f"latent_first_token_rank={latent_first_token_metrics.get('first_token_rank')}",
                             f"latent_first_token_predicted={latent_first_token_metrics.get('first_token_predicted_text')}",
@@ -1290,6 +1449,13 @@ def main() -> None:
             100.0,
         )
     )
+    latent_token_decoder_probe_prior_weight = float(
+        getattr(
+            getattr(cfg.training, "evaluation", None),
+            "latent_token_decoder_probe_prior_weight",
+            0.0,
+        )
+    )
     raw_decode_require_ready = bool(
         getattr(getattr(cfg.training, "evaluation", None), "require_raw_decode_ready", False)
     )
@@ -1314,6 +1480,7 @@ def main() -> None:
         semantic_readout_only=semantic_readout_only,
         semantic_bridge_actor_decode=semantic_bridge_actor_decode,
         semantic_bridge_selected_answer_bias=semantic_bridge_selected_answer_bias,
+        latent_token_decoder_probe_prior_weight=latent_token_decoder_probe_prior_weight,
         raw_decode_require_ready=raw_decode_require_ready,
         raw_decode_stop_after_steering=raw_decode_stop_after_steering,
         raw_decode_stop_by_semantic_readout_length=(

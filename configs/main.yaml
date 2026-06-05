@@ -244,6 +244,7 @@ training:
     semantic_readout_only: false
     semantic_bridge_actor_decode: false
     semantic_bridge_selected_answer_bias: 100.0
+    latent_token_decoder_probe_prior_weight: 0.0
     require_raw_decode_ready: false
     raw_decode_stop_after_steering: true
     raw_decode_stop_by_semantic_readout_length: false

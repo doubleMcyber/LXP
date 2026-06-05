@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""
+LXP Stage 2 Training Pipeline (Compressor & Reasoner)
+-----------------------------------------------------
+This module contains the training loop used to explicitly teach the models how to use the continuous latent space.
+Because LLMs cannot zero-shot read compressed math trajectories, this stage optimizes the bridge.
+
+Key Losses Optimized Here:
+1. Task Loss (L_task): Cross-entropy ensuring the downstream model outputs the correct final answer.
+2. Preference Loss (L_pref): KL Divergence ensuring the continuous thought produces the same token distribution as an expert Chain-of-Thought text.
+3. Geometric Loss (L_geom): Cosine similarity ensuring the latent vectors don't collapse into unstructured noise.
+"""
+
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
@@ -361,6 +373,48 @@ def _raw_decode_ready_for_early_stop(metrics: Mapping[str, Any]) -> bool:
     return (
         raw_accuracy >= 100.0
         and raw_extraction_rate >= 100.0
+        and (eval_samples <= 1 or unique_count > 1)
+        and _enabled_decode_surface_ready(
+            metrics,
+            enabled_key="heldout_actor_semantic_bridge_decode_enabled",
+            accuracy_key="heldout_actor_semantic_bridge_decode_accuracy",
+            extraction_key="heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage",
+            unique_key="heldout_actor_semantic_bridge_decode_unique_predicted_answer_count",
+            eval_samples=eval_samples,
+            require_key=None,
+        )
+        and _enabled_decode_surface_ready(
+            metrics,
+            enabled_key="heldout_latent_token_decode_enabled",
+            accuracy_key="heldout_latent_token_decode_accuracy",
+            extraction_key="heldout_latent_token_decode_answer_extraction_rate_percentage",
+            unique_key="heldout_latent_token_decode_unique_predicted_answer_count",
+            eval_samples=eval_samples,
+            require_key="heldout_latent_token_decode_require_ready",
+        )
+    )
+
+
+def _enabled_decode_surface_ready(
+    metrics: Mapping[str, Any],
+    *,
+    enabled_key: str,
+    accuracy_key: str,
+    extraction_key: str,
+    unique_key: str,
+    eval_samples: int,
+    require_key: str | None,
+) -> bool:
+    enabled = bool(metrics.get(enabled_key, False))
+    required = True if require_key is None else bool(metrics.get(require_key, False))
+    if not enabled or not required:
+        return True
+    accuracy = float(metrics.get(accuracy_key, 0.0) or 0.0)
+    extraction_rate = float(metrics.get(extraction_key, 0.0) or 0.0)
+    unique_count = int(float(metrics.get(unique_key, 0.0) or 0.0))
+    return (
+        accuracy >= 100.0
+        and extraction_rate >= 100.0
         and (eval_samples <= 1 or unique_count > 1)
     )
 
@@ -1520,6 +1574,19 @@ def train_reasoner_stage2(
     Stage II Interlat-style training loop:
     - Freeze Actor (Agent B) completely.
     - Update only Reasoner (Agent A).
+    
+    This loop optimizes Agent A to generate continuous ODE thoughts that Agent B can decode zero-shot.
+    It passes the trajectory through the Orthogonal Procrustes bridge and updates Agent A's weights 
+    using the LatentCompressorLoss (Task Utility + Preference KL Divergence + Geometric Cosine Similarity).
+    
+    Args:
+        reasoner_model: Agent A, whose parameters will be updated.
+        actor_model: Agent B, whose parameters are strictly frozen (requires_grad = False).
+        train_dataloader: Stream of math/coding problems and expert Chain-of-Thought text targets.
+        config: Hyperparameters including loss lambdas (`lambda_task`, `lambda_pref`, `lambda_geom`).
+        
+    Returns:
+        A list of diagnostic dictionaries containing loss curves and metrics for plotting (e.g., WandB).
     """
     if config.wandb_enabled:
         wandb.init(

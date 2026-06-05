@@ -12,6 +12,8 @@ from run_training import (
     _predicted_answer_for_target,
     _resolve_training_device,
     _resolve_training_torch_dtype,
+    _select_candidate_answer_by_token_decoder,
+    _select_latent_candidate_fallback,
     _unique_candidate_answers,
     _training_device_map,
 )
@@ -100,6 +102,68 @@ def test_actor_answer_prompt_uses_few_shot_examples_without_target_leak() -> Non
     assert prompt.rstrip().endswith("Question: What is 8 + 5?")
 
 
+class _CandidateTokenizer:
+    eos_token_id = 0
+    pad_token_id = 0
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        del add_special_tokens
+        return {
+            "4": [4],
+            "42": [42],
+            "5": [5],
+        }.get(str(text).strip(), [])
+
+
+def test_candidate_token_decoder_scores_whole_candidate_sequences() -> None:
+    logits = torch.zeros(1, 3, 64)
+    logits[0, 0, 42] = 8.0
+    logits[0, 1, 0] = 8.0
+    logits[0, 0, 4] = 2.0
+    logits[0, 0, 5] = 1.0
+
+    answer, nll = _select_candidate_answer_by_token_decoder(
+        token_logits=logits,
+        tokenizer=_CandidateTokenizer(),
+        candidate_answers=("4", "42", "5"),
+        max_answer_length=3,
+    )
+
+    assert answer == "42"
+    assert nll is not None
+
+
+def test_candidate_token_decoder_can_use_probe_prior_for_ambiguous_logits() -> None:
+    logits = torch.zeros(1, 2, 64)
+    logits[0, 0, 4] = 4.0
+    logits[0, 1, 0] = 4.0
+    logits[0, 0, 42] = 3.9
+
+    answer, _ = _select_candidate_answer_by_token_decoder(
+        token_logits=logits,
+        tokenizer=_CandidateTokenizer(),
+        candidate_answers=("4", "42"),
+        max_answer_length=2,
+        candidate_prior_nll={"4": 5.0, "42": 0.0},
+        candidate_prior_weight=1.0,
+    )
+
+    assert answer == "42"
+
+
+def test_latent_candidate_fallback_prefers_trained_latent_readouts() -> None:
+    answer, source = _select_latent_candidate_fallback(
+        candidate_answers=("4", "42", "5"),
+        latent_probe_answer="42",
+        latent_semantic_readout_answer="4",
+        latent_token_decoder_answer="5",
+        actor_nll_answer="4",
+    )
+
+    assert answer == "42"
+    assert source == "latent_probe"
+
+
 def test_mac_mps_stage2_smoke_command_is_small_and_explicit() -> None:
     args = argparse.Namespace(
         python="venv/bin/python",
@@ -151,6 +215,7 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
     assert "training.evaluation.semantic_readout_only=true" in command
     assert "training.evaluation.semantic_bridge_actor_decode=true" in command
     assert "training.evaluation.semantic_bridge_selected_answer_bias=100.0" in command
+    assert "training.evaluation.latent_token_decoder_probe_prior_weight=8.0" in command
     assert "training.evaluation.baseline_few_shot_examples=4" in command
     assert "training.train_reasoner=false" in command
     assert "training.learning_rate=3.0e-4" in command
@@ -174,6 +239,7 @@ def test_mac_mps_stage2_smoke_command_can_eval_on_train() -> None:
     assert "training.latent_token_decoder.lr_multiplier=10.0" in command
     assert "training.latent_token_decoder.output_steps=8" in command
     assert "training.latent_token_decoder.candidate_token_mask=true" in command
+    assert "training.latent_token_decoder.require_ready=true" in command
     assert "training.latent_token_decoder.eos_weight=2.0" in command
     assert "training.latent_token_decoder.margin=4.0" in command
     assert "training.latent_soft_prompt_decoder.enabled=false" in command
@@ -231,3 +297,4 @@ def test_mac_mps_stage2_smoke_full_decode_trains_raw_actor_steering() -> None:
     assert "training.latent_logit_steering.eos_weight=1.0" in command
     assert "training.latent_logit_steering.pooling=mean_last" in command
     assert "training.latent_token_decoder.enabled=false" in command
+    assert "training.latent_token_decoder.require_ready=false" in command

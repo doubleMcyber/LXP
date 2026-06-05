@@ -1588,6 +1588,16 @@ def build_training_smoke_report(
     latent_probe_unique_count = (
         None if latent_probe_unique_raw is None else int(float(latent_probe_unique_raw))
     )
+    latent_candidate_accuracy_raw = final_eval.get("heldout_latent_candidate_accuracy")
+    latent_candidate_accuracy = (
+        None if latent_candidate_accuracy_raw is None else float(latent_candidate_accuracy_raw)
+    )
+    latent_candidate_unique_raw = final_eval.get(
+        "heldout_latent_candidate_unique_predicted_answer_count"
+    )
+    latent_candidate_unique_count = (
+        None if latent_candidate_unique_raw is None else int(float(latent_candidate_unique_raw))
+    )
     latent_token_decode_accuracy_raw = final_eval.get("heldout_latent_token_decode_accuracy")
     latent_token_decode_accuracy = (
         None if latent_token_decode_accuracy_raw is None else float(latent_token_decode_accuracy_raw)
@@ -1842,6 +1852,17 @@ def build_training_smoke_report(
         ),
         "final_heldout_latent_candidate_unique_predicted_answer_count": final_eval.get(
             "heldout_latent_candidate_unique_predicted_answer_count"
+        ),
+        "latent_candidate_fallback_ready": (
+            latent_candidate_accuracy is not None
+            and latent_candidate_accuracy >= 100.0
+            and (
+                eval_samples <= 1
+                or (
+                    latent_candidate_unique_count is not None
+                    and latent_candidate_unique_count > 1
+                )
+            )
         ),
         "final_heldout_latent_probe_accuracy": latent_probe_accuracy,
         "final_heldout_latent_probe_unique_predicted_answer_count": latent_probe_unique_count,

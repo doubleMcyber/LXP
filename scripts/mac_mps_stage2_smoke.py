@@ -18,6 +18,7 @@ from scripts.render_stage2_report import render_stage2_report
 def build_command(args: argparse.Namespace) -> list[str]:
     output_dir = Path(args.output_dir)
     full_decode_eval = bool(getattr(args, "full_decode_eval", False))
+    auxiliary_decode_surfaces = not full_decode_eval
     raw_decode_output_steps = int(getattr(args, "raw_decode_output_steps", 2))
     raw_answer_loss_weight = float(getattr(args, "raw_answer_loss_weight", 12.0))
     raw_answer_first_token_loss_weight = float(
@@ -66,8 +67,9 @@ def build_command(args: argparse.Namespace) -> list[str]:
             [
                 "training.evaluation.smoke_eval_set=train_overfit",
                 f"training.evaluation.semantic_readout_only={str(not full_decode_eval).lower()}",
-                f"training.evaluation.semantic_bridge_actor_decode={str(not full_decode_eval).lower()}",
+                f"training.evaluation.semantic_bridge_actor_decode={str(auxiliary_decode_surfaces).lower()}",
                 "training.evaluation.semantic_bridge_selected_answer_bias=100.0",
+                "training.evaluation.latent_token_decoder_probe_prior_weight=8.0",
                 f"training.evaluation.require_raw_decode_ready={str(full_decode_eval).lower()}",
                 "training.evaluation.raw_decode_stop_after_steering=true",
                 f"training.evaluation.raw_decode_stop_by_semantic_readout_length={str(full_decode_eval).lower()}",
@@ -107,12 +109,13 @@ def build_command(args: argparse.Namespace) -> list[str]:
                 f"{raw_logit_steering_later_answer_token_weight}",
                 f"training.latent_logit_steering.eos_weight={raw_logit_steering_eos_weight}",
                 "training.latent_logit_steering.pooling=mean_last",
-                f"training.latent_token_decoder.enabled={str(not full_decode_eval).lower()}",
+                f"training.latent_token_decoder.enabled={str(auxiliary_decode_surfaces).lower()}",
                 "training.latent_token_decoder.rank=128",
                 "training.latent_token_decoder.vocabulary_mode=low_rank",
                 "training.latent_token_decoder.lr_multiplier=10.0",
                 "training.latent_token_decoder.output_steps=8",
                 "training.latent_token_decoder.candidate_token_mask=true",
+                f"training.latent_token_decoder.require_ready={str(auxiliary_decode_surfaces).lower()}",
                 "training.latent_token_decoder.eos_weight=2.0",
                 "training.latent_token_decoder.margin=4.0",
                 "training.latent_soft_prompt_decoder.enabled=false",
@@ -198,6 +201,9 @@ def _print_report_summary(report_path: Path) -> None:
             ),
             "latent_candidate_accuracy": smoke_report.get(
                 "final_heldout_latent_candidate_accuracy"
+            ),
+            "latent_candidate_fallback_ready": smoke_report.get(
+                "latent_candidate_fallback_ready"
             ),
             "latent_probe_accuracy": smoke_report.get(
                 "final_heldout_latent_probe_accuracy"
