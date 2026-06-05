@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from omegaconf import OmegaConf
 import pytest
@@ -26,6 +27,7 @@ from benchmark_all import (
     _format_token_context_handoff_prompt,
     _format_verified_token_context_handoff_prompt,
     _format_verified_final_answer_text,
+    _generated_trajectory_adapter_train_on_missing,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_target_text,
@@ -775,6 +777,26 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
     cfg.handoff.generated_trajectory_adapter.target_alignment = "character"
     with pytest.raises(ValueError, match="generated_text"):
         _generated_trajectory_adapter_target_alignment(cfg)
+
+
+def test_generated_trajectory_adapter_requires_explicit_train_on_missing() -> None:
+    repo_config = OmegaConf.load(Path(__file__).resolve().parents[1] / "configs" / "main.yaml")
+
+    assert repo_config.handoff.adapter.train_on_missing is False
+    assert repo_config.handoff.generated_trajectory_adapter.train_on_missing is False
+    assert _generated_trajectory_adapter_train_on_missing(OmegaConf.create({})) is False
+
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "train_on_missing": True,
+                },
+            },
+        }
+    )
+
+    assert _generated_trajectory_adapter_train_on_missing(cfg) is True
 
 
 def test_generated_trajectory_final_answer_target_uses_latest_marker() -> None:

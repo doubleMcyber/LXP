@@ -154,6 +154,7 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     contrast_values = _metric_series(history, "answer_contrast_accuracy")
     adapter_updates = _metric_series(history, "handoff_adapter_update_norm")
     probe_updates = _metric_series(history, "latent_answer_probe_update_norm")
+    latest_adapter_update = adapter_updates[-1] if adapter_updates else None
 
     html_text = f"""<!doctype html>
 <html lang="en">
@@ -223,6 +224,45 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     .probe .bar-fill {{ background: var(--ok); }}
     .decode .bar-fill {{ background: var(--fail); }}
     .baseline .bar-fill {{ background: var(--warn); }}
+    .transfer-map {{ grid-template-columns: repeat(4, minmax(160px, 1fr)); align-items: stretch; }}
+    .transfer-node {{
+      position: relative;
+      min-height: 150px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      background: linear-gradient(180deg, #ffffff 0%, #fbfaf7 100%);
+    }}
+    .transfer-node:not(:last-child)::after {{
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -16px;
+      width: 18px;
+      border-top: 2px solid var(--purple);
+    }}
+    .transfer-node:not(:last-child)::before {{
+      content: "";
+      position: absolute;
+      top: calc(50% - 5px);
+      right: -17px;
+      border-left: 8px solid var(--purple);
+      border-top: 6px solid transparent;
+      border-bottom: 6px solid transparent;
+      z-index: 1;
+    }}
+    .transfer-title {{ font-weight: 800; margin-bottom: 8px; }}
+    .transfer-copy {{ color: var(--muted); min-height: 42px; }}
+    .metric-chip {{
+      display: inline-block;
+      margin-top: 12px;
+      padding: 6px 8px;
+      border-radius: 999px;
+      background: #f0edf8;
+      color: #4c1d95;
+      font-size: 12px;
+      font-weight: 700;
+    }}
     .chart-grid {{ grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }}
     .line-chart {{ width: 100%; height: auto; min-height: 170px; }}
     .line-chart line {{ stroke: var(--line); stroke-width: 1; }}
@@ -238,6 +278,8 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
     .two-col {{ grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr); }}
     @media (max-width: 820px) {{
       .two-col {{ grid-template-columns: 1fr; }}
+      .transfer-map {{ grid-template-columns: 1fr; }}
+      .transfer-node::before, .transfer-node::after {{ display: none; }}
       .bar-row {{ grid-template-columns: 1fr; }}
       .bar-value {{ font-weight: 700; }}
     }}
@@ -281,6 +323,35 @@ def render_stage2_report(report_path: Path, history_path: Path, output_path: Pat
         <div class="status-row"><h3>Phase Gate</h3><span class="badge">{phase_label}</span></div>
         <div class="card-value">{_fmt_number(smoke.get("final_heldout_answer_perplexity"))}</div>
         <div class="subhead">Final heldout answer perplexity.</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Latent Transfer Map</h2>
+      <div class="subhead">
+        A screen-recordable path from sender reasoning to receiver answer generation, inspired by latent-state handoff systems that avoid decode/re-encode bottlenecks.
+      </div>
+      <div class="grid transfer-map" style="margin-top: 14px;">
+        <div class="transfer-node">
+          <div class="transfer-title">Agent A Reasoner</div>
+          <div class="transfer-copy">Produces a hidden-state trajectory from the prompt instead of exposing a long text rationale.</div>
+          <span class="metric-chip">model {html.escape(str(report.get("model_pair", "A -> B")).split("->", 1)[0].strip() or "A")}</span>
+        </div>
+        <div class="transfer-node">
+          <div class="transfer-title">Geometric Handoff</div>
+          <div class="transfer-copy">Aligns sender states into receiver space with orthogonal or hybrid-affine adapter geometry.</div>
+          <span class="metric-chip">adapter update {_fmt_number(latest_adapter_update)}</span>
+        </div>
+        <div class="transfer-node">
+          <div class="transfer-title">Receiver Manifold</div>
+          <div class="transfer-copy">Projects the latent packet toward valid receiver embeddings before answer decoding.</div>
+          <span class="metric-chip">candidate {_fmt_percent(smoke.get("final_heldout_latent_candidate_accuracy"))}</span>
+        </div>
+        <div class="transfer-node">
+          <div class="transfer-title">Agent B Decode</div>
+          <div class="transfer-copy">Uses the latent prefix to rank, probe, sequence-decode, then gate open generation.</div>
+          <span class="metric-chip">sequence {_fmt_percent(smoke.get("final_heldout_latent_sequence_decoder_sequence_accuracy"))}</span>
+        </div>
       </div>
     </section>
 

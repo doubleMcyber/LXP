@@ -64,7 +64,7 @@ handoff:
   latent_prefix_mode: "sequence"
   adapter:
     enabled: false
-    train_on_missing: true
+    train_on_missing: false
     cache_dir: ".cache/handoff_adapter"
     dataset_name: "gsm8k"
     train_split: "train"
@@ -78,7 +78,7 @@ handoff:
     use_bias: true
   generated_trajectory_adapter:
     enabled: false
-    train_on_missing: true
+    train_on_missing: false
     cache_dir: ".cache/generated_trajectory_adapter"
     training_rows_cache_dir: ".cache/generated_trajectory_rows"
     trace_cache_enabled: true

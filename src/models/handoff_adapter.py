@@ -74,8 +74,16 @@ def aggregate_hidden_layers(
         raise ValueError("layers and weights must have the same length")
     if not layers:
         raise ValueError("at least one layer is required")
-    normalized = torch.as_tensor(weights, dtype=torch.float32, device=layers[0].device)
-    normalized = normalized / normalized.sum().clamp_min(1e-8)
+    normalized = torch.as_tensor(
+        weights,
+        dtype=torch.float32,
+        device=layers[0].device,
+    ).flatten()
+    if not torch.isfinite(normalized).all():
+        raise ValueError("weights must contain only finite values")
+    if torch.any(normalized <= 0):
+        raise ValueError("weights must be strictly positive")
+    normalized = normalized / normalized.sum()
     output = torch.zeros_like(layers[0], dtype=torch.float32)
     for layer, weight in zip(layers, normalized):
         output = output + layer.float() * weight

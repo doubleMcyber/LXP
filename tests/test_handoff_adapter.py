@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from src.models.handoff_adapter import (
     HandoffAdapterFitConfig,
+    aggregate_hidden_layers,
     fit_handoff_adapter_state,
     project_to_embedding_manifold,
     resample_sequence,
@@ -60,6 +62,30 @@ def test_resample_sequence_changes_step_count_without_changing_dim() -> None:
     assert resized.shape == (1, 5, 4)
     assert torch.allclose(resized[:, :1, :], sequence[:, :1, :])
     assert torch.allclose(resized[:, -1:, :], sequence[:, -1:, :])
+
+
+def test_aggregate_hidden_layers_normalizes_valid_weights() -> None:
+    layers = (
+        torch.ones(1, 2, 3),
+        torch.full((1, 2, 3), 3.0),
+    )
+
+    aggregated = aggregate_hidden_layers(layers, weights=(1.0, 3.0))
+
+    assert torch.allclose(aggregated, torch.full((1, 2, 3), 2.5))
+
+
+def test_aggregate_hidden_layers_rejects_invalid_weights() -> None:
+    layers = (
+        torch.ones(1, 2, 3),
+        torch.full((1, 2, 3), 3.0),
+    )
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        aggregate_hidden_layers(layers, weights=(1.0, 0.0))
+
+    with pytest.raises(ValueError, match="finite"):
+        aggregate_hidden_layers(layers, weights=(1.0, float("nan")))
 
 
 def test_fit_handoff_adapter_state_learns_train_split_mapping() -> None:

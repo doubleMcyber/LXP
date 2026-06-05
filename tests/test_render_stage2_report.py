@@ -66,6 +66,8 @@ def test_render_stage2_report_includes_probe_and_diagnostics(tmp_path) -> None:
 
     html = output_path.read_text(encoding="utf-8")
     assert "LXP Stage II Latent Transfer Report" in html
+    assert "Latent Transfer Map" in html
+    assert "Geometric Handoff" in html
     assert "Latent Probe" in html
     assert "Sequence Decoder" in html
     assert "100.00%" in html

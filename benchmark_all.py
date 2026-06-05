@@ -1524,7 +1524,7 @@ def _generated_trajectory_adapter_enabled(cfg: Any) -> bool:
 
 
 def _generated_trajectory_adapter_train_on_missing(cfg: Any) -> bool:
-    return bool(getattr(_generated_trajectory_adapter_cfg(cfg), "train_on_missing", True))
+    return bool(getattr(_generated_trajectory_adapter_cfg(cfg), "train_on_missing", False))
 
 
 def _generated_trajectory_adapter_train_limit(cfg: Any) -> int:
@@ -5678,6 +5678,11 @@ def main() -> None:
         help="Disable the generated-trajectory adapter for this benchmark run.",
     )
     parser.add_argument(
+        "--generated-trajectory-adapter-train-on-missing",
+        action="store_true",
+        help="Fit and cache the generated-trajectory adapter if no matching adapter cache exists.",
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-no-train-on-missing",
         action="store_true",
         help="Require a prebuilt generated-trajectory adapter cache instead of fitting one.",
@@ -5974,7 +5979,9 @@ def main() -> None:
             prompt_calibration_strength=args.prompt_calibration_strength,
             prompt_calibration_max_norm_ratio=args.prompt_calibration_max_norm_ratio,
             generated_trajectory_adapter_train_on_missing=(
-                False
+                True
+                if args.generated_trajectory_adapter_train_on_missing
+                else False
                 if args.generated_trajectory_adapter_no_train_on_missing
                 else None
             ),
@@ -6083,7 +6090,11 @@ def main() -> None:
             else None
         ),
         generated_trajectory_adapter_train_on_missing=(
-            False if args.generated_trajectory_adapter_no_train_on_missing else None
+            True
+            if args.generated_trajectory_adapter_train_on_missing
+            else False
+            if args.generated_trajectory_adapter_no_train_on_missing
+            else None
         ),
         generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
         generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
