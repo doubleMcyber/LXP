@@ -1778,6 +1778,21 @@ def build_training_phase2_report(
         "final_heldout_latent_probe_accuracy": final_heldout_entry.get(
             "heldout_latent_probe_accuracy"
         ),
+        "final_heldout_latent_sequence_decoder_token_accuracy": final_heldout_entry.get(
+            "heldout_latent_sequence_decoder_token_accuracy"
+        ),
+        "final_heldout_latent_sequence_decoder_sequence_accuracy": final_heldout_entry.get(
+            "heldout_latent_sequence_decoder_sequence_accuracy"
+        ),
+        "final_heldout_latent_sequence_decoder_length_accuracy": final_heldout_entry.get(
+            "heldout_latent_sequence_decoder_length_accuracy"
+        ),
+        "final_heldout_latent_generation_smoke_ready": final_heldout_entry.get(
+            "heldout_latent_generation_smoke_ready"
+        ),
+        "final_heldout_latent_generation_smoke_skipped_count": final_heldout_entry.get(
+            "heldout_latent_generation_smoke_skipped_count"
+        ),
         "final_heldout_latent_first_token_accuracy": final_heldout_entry.get(
             "heldout_latent_first_token_accuracy"
         ),
@@ -1939,6 +1954,18 @@ def build_training_smoke_report(
     )
     raw_decode_require_ready = bool(
         final_eval.get("heldout_raw_decode_require_ready", False)
+    )
+    latent_sequence_accuracy_raw = final_eval.get(
+        "heldout_latent_sequence_decoder_sequence_accuracy"
+    )
+    latent_sequence_accuracy = (
+        None if latent_sequence_accuracy_raw is None else float(latent_sequence_accuracy_raw)
+    )
+    latent_sequence_unique_raw = final_eval.get(
+        "heldout_latent_sequence_decoder_unique_predicted_answer_count"
+    )
+    latent_sequence_unique_count = (
+        None if latent_sequence_unique_raw is None else int(float(latent_sequence_unique_raw))
     )
 
     missing_requirements: list[str] = []
@@ -2175,6 +2202,25 @@ def build_training_smoke_report(
         ),
         "final_heldout_latent_probe_accuracy": latent_probe_accuracy,
         "final_heldout_latent_probe_unique_predicted_answer_count": latent_probe_unique_count,
+        "final_heldout_latent_sequence_decoder_token_accuracy": final_eval.get(
+            "heldout_latent_sequence_decoder_token_accuracy"
+        ),
+        "final_heldout_latent_sequence_decoder_sequence_accuracy": latent_sequence_accuracy,
+        "final_heldout_latent_sequence_decoder_length_accuracy": final_eval.get(
+            "heldout_latent_sequence_decoder_length_accuracy"
+        ),
+        "final_heldout_latent_sequence_decoder_unique_predicted_answer_count": (
+            latent_sequence_unique_count
+        ),
+        "final_heldout_latent_generation_smoke_ready": final_eval.get(
+            "heldout_latent_generation_smoke_ready"
+        ),
+        "final_heldout_latent_generation_smoke_skipped_count": final_eval.get(
+            "heldout_latent_generation_smoke_skipped_count"
+        ),
+        "final_heldout_latent_generation_sequence_accuracy_threshold": final_eval.get(
+            "heldout_latent_generation_sequence_accuracy_threshold"
+        ),
         "final_heldout_latent_first_token_accuracy": final_eval.get(
             "heldout_latent_first_token_accuracy"
         ),
@@ -2186,6 +2232,14 @@ def build_training_smoke_report(
             and latent_probe_accuracy >= 100.0
             and latent_probe_unique_count is not None
             and latent_probe_unique_count > 1
+        ),
+        "latent_sequence_decoder_ready": (
+            latent_sequence_accuracy is not None
+            and latent_sequence_accuracy >= float(
+                final_eval.get("heldout_latent_generation_sequence_accuracy_threshold", 95.0) or 95.0
+            )
+            and latent_sequence_unique_count is not None
+            and latent_sequence_unique_count > 1
         ),
         "final_heldout_extraction_failure_count": final_eval.get(
             "heldout_extraction_failure_count"

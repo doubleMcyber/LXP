@@ -64,7 +64,7 @@ handoff:
   latent_prefix_mode: "sequence"
   adapter:
     enabled: false
-    train_on_missing: true
+    train_on_missing: false
     cache_dir: ".cache/handoff_adapter"
     dataset_name: "gsm8k"
     train_split: "train"
@@ -78,7 +78,7 @@ handoff:
     use_bias: true
   generated_trajectory_adapter:
     enabled: false
-    train_on_missing: true
+    train_on_missing: false
     cache_dir: ".cache/generated_trajectory_adapter"
     training_rows_cache_dir: ".cache/generated_trajectory_rows"
     trace_cache_enabled: true
@@ -153,6 +153,7 @@ training:
   lambda_latent_token_decoder: 0.0
   lambda_answer_contrast: 0.0
   lambda_answer_probe: 0.0
+  lambda_latent_sequence_decoder: 4.0
   answer_contrast_temperature: 1.0
   answer_suffix_text: "\nFinal answer: "
   answer_max_length: 32
@@ -185,6 +186,15 @@ training:
     max_candidates: 64
     hidden_multiplier: 2
     dropout: 0.0
+  latent_sequence_decoder:
+    enabled: true
+    max_answer_length: 32
+    vocabulary_mode: tied
+    num_heads: 4
+    hidden_multiplier: 2
+    dropout: 0.0
+    scale: 1.0
+    generation_min_sequence_accuracy: 95.0
   latent_soft_prompt_decoder:
     enabled: false
     output_steps: 0

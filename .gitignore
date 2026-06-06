@@ -23,6 +23,7 @@ __pycache__/
 .hydra/
 .pytest_cache/
 .ruff_cache/
+.venv/
 venv/
 *.pt
 *.pth

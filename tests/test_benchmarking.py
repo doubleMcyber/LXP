@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from omegaconf import OmegaConf
@@ -27,6 +28,7 @@ from benchmark_all import (
     _format_token_context_handoff_prompt,
     _format_verified_token_context_handoff_prompt,
     _format_verified_final_answer_text,
+    _generated_trajectory_adapter_train_on_missing,
     _generated_trajectory_adapter_input_space,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_target_text,
@@ -983,6 +985,26 @@ def test_generated_trajectory_adapter_input_space_is_validated() -> None:
         _generated_trajectory_adapter_target_alignment(cfg)
 
 
+def test_generated_trajectory_adapter_requires_explicit_train_on_missing() -> None:
+    repo_config = OmegaConf.load(Path(__file__).resolve().parents[1] / "configs" / "main.yaml")
+
+    assert repo_config.handoff.adapter.train_on_missing is False
+    assert repo_config.handoff.generated_trajectory_adapter.train_on_missing is False
+    assert _generated_trajectory_adapter_train_on_missing(OmegaConf.create({})) is False
+
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "train_on_missing": True,
+                },
+            },
+        }
+    )
+
+    assert _generated_trajectory_adapter_train_on_missing(cfg) is True
+
+
 def test_generated_trajectory_final_answer_target_uses_latest_marker() -> None:
     cfg = OmegaConf.create(
         {
@@ -1615,6 +1637,13 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
                 "heldout_answer_extraction_rate_percentage": 100.0,
                 "heldout_decode_answer_extraction_rate_percentage": 33.333,
                 "heldout_candidate_fallback_rate_percentage": 66.667,
+                "heldout_latent_sequence_decoder_token_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_sequence_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_length_accuracy": 100.0,
+                "heldout_latent_sequence_decoder_unique_predicted_answer_count": 3.0,
+                "heldout_latent_generation_smoke_ready": True,
+                "heldout_latent_generation_smoke_skipped_count": 0.0,
+                "heldout_latent_generation_sequence_accuracy_threshold": 95.0,
                 "heldout_extraction_failure_count": 0.0,
                 "heldout_eval_diagnostics": "target=13 | predicted=13 | source=candidate_nll",
                 "heldout_answer_perplexity": 250.0,
@@ -1628,6 +1657,8 @@ def test_build_training_smoke_report_passes_structural_smoke_without_accuracy() 
     assert report["final_heldout_answer_extraction_rate_percentage"] == 100.0
     assert report["final_heldout_decode_answer_extraction_rate_percentage"] == 33.333
     assert report["final_heldout_candidate_fallback_rate_percentage"] == 66.667
+    assert report["final_heldout_latent_sequence_decoder_sequence_accuracy"] == 100.0
+    assert report["latent_sequence_decoder_ready"] is True
     assert report["final_heldout_extraction_failure_count"] == 0.0
     assert "source=candidate_nll" in report["heldout_eval_diagnostics"]
 
