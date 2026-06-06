@@ -118,9 +118,24 @@ _REASONING_COMPLEXITY_PATTERNS: tuple[str, ...] = (
 
 
 def load_agent(model_name: str, torch_dtype: str = "bfloat16", device_map: str = "auto") -> AutoModelForCausalLM:
+    dtype = _DTYPE_MAP.get(torch_dtype, torch.bfloat16)
+    normalized_device_map = "" if device_map is None else str(device_map).strip().lower()
+    if normalized_device_map in {"none", "cpu", "mps"}:
+        if normalized_device_map == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("device_map=mps requested, but torch MPS is not available")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            trust_remote_code=True,
+        )
+        if normalized_device_map == "mps":
+            return model.to(torch.device("mps"))
+        if normalized_device_map == "cpu":
+            return model.to(torch.device("cpu"))
+        return model
     return AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=_DTYPE_MAP.get(torch_dtype, torch.bfloat16),
+        dtype=dtype,
         device_map=device_map,
         trust_remote_code=True,
     )

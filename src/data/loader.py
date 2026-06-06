@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 
 def pick_field(row: dict, keys: tuple[str, ...]) -> str:
@@ -119,9 +119,62 @@ def load_gsm8k(
     raise RuntimeError("Failed to load a GSM8K dataset candidate") from last_error
 
 
+def _long_context_reasoning(sample_id: int, answer: int, *, horizon_steps: int) -> str:
+    lines = [
+        f"Scratch step {step:04d}: sample {sample_id} keeps candidate answer {answer}; "
+        "ignore distractors and preserve the exact final scalar."
+        for step in range(1, horizon_steps + 1)
+    ]
+    lines.append(f"Verification: every retained candidate is {answer}.")
+    lines.append(f"Final answer: {answer}.")
+    return "\n".join(lines)
+
+
+def load_long_context_handoff(
+    limit: int = 100,
+    split: str = "validation",
+    *,
+    validation_size: Optional[int] = None,
+    sample_indices: Optional[Sequence[int]] = None,
+):
+    """Build a deterministic local long-horizon handoff benchmark.
+
+    The prompt is intentionally short while ``sender_reasoning_text`` is long.
+    This isolates receiver-side handoff payload length: token-context baselines
+    must prefill the full upstream trace, while latent handoff methods transfer
+    the sender hidden trajectory and a compact receiver prefix.
+    """
+    del validation_size
+    split_offsets = {"train": 0, "validation": 10_000, "test": 20_000}
+    offset = split_offsets.get(split, 30_000)
+    row_count = max(int(limit or 0), max(sample_indices or [0]) + 1 if sample_indices else 0, 256)
+    rows = []
+    for local_index in range(row_count):
+        sample_id = offset + local_index
+        answer = 1000 + ((sample_id * 37) % 9000)
+        horizon_steps = 96 + (local_index % 5) * 32
+        rows.append(
+            {
+                "question": (
+                    f"Long-horizon handoff sample {sample_id}. "
+                    "Use the upstream sender trace and return only the final scalar answer."
+                ),
+                "answer": f"#### {answer}",
+                "sender_reasoning_text": _long_context_reasoning(
+                    sample_id,
+                    answer,
+                    horizon_steps=horizon_steps,
+                ),
+                "horizon_steps": horizon_steps,
+            }
+        )
+    return _select_rows(Dataset.from_list(rows), limit, sample_indices=sample_indices)
+
+
 _LOADERS = {
     "math": load_math_level5,
     "gsm8k": load_gsm8k,
+    "long_context_handoff": load_long_context_handoff,
 }
 
 
@@ -149,6 +202,13 @@ def get_dataset_split(
             validation_size=validation_size,
             sample_indices=sample_indices,
         )
+    if dataset_name == "long_context_handoff":
+        return load_long_context_handoff(
+            limit=limit,
+            split=split,
+            validation_size=validation_size,
+            sample_indices=sample_indices,
+        )
     raise ValueError(
         f"Unknown dataset {dataset_name!r}. "
         f"Supported: {', '.join(sorted(_LOADERS))}"
@@ -165,7 +225,7 @@ def get_dataloader(
 ):
     """Load a benchmark dataset by name.
 
-    Supported names: "math", "gsm8k".
+    Supported names: "math", "gsm8k", "long_context_handoff".
     """
     return get_dataset_split(
         dataset_name,

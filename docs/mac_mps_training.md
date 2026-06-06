@@ -128,6 +128,30 @@ venv/bin/python scripts/mac_mps_stage2_smoke.py \
 If that fails on memory, go back to `0.8B -> 0.8B` and use MPS for code-level
 iteration only.
 
+## Long-Context Context-Vs-Latent Validation
+
+After the code-level Stage-II smoke is structurally healthy, run the local
+long-context validation profile:
+
+```bash
+venv/bin/python -B scripts/run_production_validation.py \
+  --profile long_context_mps \
+  --execute \
+  --replay
+```
+
+This uses the deterministic `long_context_handoff` dataset, where each example
+has a short question plus a frozen long sender trace. Token-context controls pass
+that long trace to the receiver; latent methods use the trace as the sender
+reasoning source. The report compares accuracy, latency, and
+receiver-side input-token count so the long-horizon claim can be stated as a
+measured tradeoff instead of a narrative claim.
+
+The command intentionally requests `--device-map mps`. If
+`torch.backends.mps.is_available()` is false, the benchmark fails before loading
+weights. That is the correct behavior for timing-sensitive validation: CPU
+fallback is useful for code debugging, but it cannot prove MPS speed.
+
 ## Overfit Readiness Smoke
 
 Before spending time on held-out quality, verify that Stage II can overfit a tiny

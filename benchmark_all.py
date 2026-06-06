@@ -5,7 +5,10 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
+import sys
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -53,11 +56,13 @@ from src.utils.benchmarking import (
     STANDARD_SUMMARY_FIELDS,
     aggregate_standard_rows,
     build_ode_scaling_report,
+    build_heterogeneous_transfer_report,
     build_phase1_gate_report,
     build_phase3_gate_report,
     build_runtime_smoke_report,
     build_semantic_smoke_report,
     build_standard_row_base,
+    build_transfer_comparison_report,
     write_csv,
     write_json,
 )
@@ -541,8 +546,38 @@ def _generate_agent_a_token_ids(
     return _trim_generated_ids_to_final_answer(tokenizer_a, generated_ids)
 
 
+def _frozen_sender_reasoning_text(state: Mapping[str, Any]) -> Optional[str]:
+    row = state.get("_current_sample_row")
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("sender_reasoning_text", "sender_reasoning", "reasoning_text"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
 def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) -> dict[str, Any]:
     tokenizer_a = state["tokenizer_a"]
+    frozen_reasoning_text = _frozen_sender_reasoning_text(state)
+    if frozen_reasoning_text is not None:
+        frozen_ids = tokenizer_a.encode(frozen_reasoning_text, add_special_tokens=False)
+        frozen_answer = _final_answer_marker_value(frozen_reasoning_text)
+        return {
+            "token_ids": [int(token_id) for token_id in frozen_ids],
+            "initial_token_ids": [int(token_id) for token_id in frozen_ids],
+            "initial_reasoning_text": frozen_reasoning_text,
+            "initial_predicted_answer": frozen_answer,
+            "revision_enabled": False,
+            "revision_applied": False,
+            "revision_token_ids": [],
+            "revision_reasoning_text": "",
+            "revision_predicted_answer": None,
+            "revision_decision_applied": False,
+            "revision_decision_token_ids": [],
+            "revision_decision_reasoning_text": "",
+            "revision_decision_predicted_answer": None,
+        }
     max_new_tokens = _reasoner_generation_max_new_tokens(cfg)
     cache = state.setdefault("_reasoner_token_ids_cache", {})
     cache_key = (
@@ -714,19 +749,19 @@ def _normalize_numeric_answer(answer: Optional[str]) -> Optional[str]:
 
 
 def _target_answer(dataset_name: str, row: Any) -> Optional[str]:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _extract_gsm8k_target_answer(pick_field(row, ("answer", "solution")))
     return extract_boxed_text(pick_field(row, ("solution", "answer")))
 
 
 def _predicted_answer(dataset_name: str, decoded_text: str) -> Optional[str]:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _extract_gsm8k_predicted_answer(decoded_text)
     return extract_boxed_text(decoded_text)
 
 
 def _answers_match(dataset_name: str, predicted_answer: Optional[str], target_answer: Optional[str]) -> bool:
-    if dataset_name == "gsm8k":
+    if dataset_name in {"gsm8k", "long_context_handoff"}:
         return _normalize_numeric_answer(predicted_answer) == _normalize_numeric_answer(target_answer)
     return normalize_answer(predicted_answer) == normalize_answer(target_answer)
 
@@ -854,7 +889,10 @@ def _alignment_variant_state(
     cache_key = (str(strategy), bool(prompt_calibration_enabled))
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached
+        cached_cfg, cached_state = cached
+        if "_current_sample_row" in state:
+            cached_state["_current_sample_row"] = state["_current_sample_row"]
+        return cached_cfg, cached_state
     variant_cfg = _alignment_variant_cfg(
         cfg,
         strategy=strategy,
@@ -866,6 +904,8 @@ def _alignment_variant_state(
         "_generated_sender_consensus_cache",
     ):
         variant_state[cache_name] = state.setdefault(cache_name, {})
+    if "_current_sample_row" in state:
+        variant_state["_current_sample_row"] = state["_current_sample_row"]
     cache[cache_key] = (variant_cfg, variant_state)
     return variant_cfg, variant_state
 
@@ -881,6 +921,22 @@ def _reasoner_metadata_for_text_hybrid(
     cfg: Any,
     state: dict[str, Any],
 ) -> dict[str, Any]:
+    frozen_reasoning_text = _frozen_sender_reasoning_text(state)
+    if frozen_reasoning_text is not None:
+        generation_metadata = _generate_reasoner_metadata(prompt, cfg, state)
+        generated_token_ids = [int(token_id) for token_id in generation_metadata["token_ids"]]
+        return {
+            "token_ids": generated_token_ids,
+            "reasoning_text": frozen_reasoning_text,
+            "trace_cache_hit": None,
+            "trace_cache_path": "",
+            "sender_revision_enabled": False,
+            "sender_revision_applied": False,
+            "sender_initial_predicted_answer": generation_metadata.get("initial_predicted_answer"),
+            "sender_revision_predicted_answer": None,
+            "sender_revision_decision_applied": False,
+            "sender_revision_decision_predicted_answer": None,
+        }
     trace_cache_path: Optional[Path] = None
     if _generated_trajectory_adapter_trace_cache_enabled(cfg):
         cache_key = _generated_trajectory_trace_cache_key(
@@ -971,6 +1027,40 @@ def _resolved_sample_indices(limit: int, sample_indices: Optional[Sequence[int]]
     return [int(index) for index in list(sample_indices)[: max(0, int(limit))]]
 
 
+def _sample_fingerprint(
+    row: Mapping[str, Any],
+    *,
+    sample_index: int,
+) -> dict[str, Any]:
+    prompt = pick_field(dict(row), ("question", "problem"))
+    target = pick_field(dict(row), ("answer", "solution", "target"))
+    return {
+        "sample_index": int(sample_index),
+        "prompt_sha256": _stable_json_digest(prompt),
+        "target_sha256": _stable_json_digest(target),
+        "prompt_char_count": len(prompt),
+        "target_char_count": len(target),
+    }
+
+
+def _sample_fingerprints(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+    sample_indices: Optional[Sequence[int]],
+) -> list[dict[str, Any]]:
+    resolved_indices = _resolved_sample_indices(limit, sample_indices)
+    fingerprints: list[dict[str, Any]] = []
+    for row_index, row in enumerate(list(samples)[: max(0, int(limit))]):
+        sample_index = (
+            int(resolved_indices[row_index])
+            if row_index < len(resolved_indices)
+            else int(row_index)
+        )
+        fingerprints.append(_sample_fingerprint(row, sample_index=sample_index))
+    return fingerprints
+
+
 def _build_eval_manifest(
     *,
     suite_name: str,
@@ -985,7 +1075,13 @@ def _build_eval_manifest(
     semantic_smoke: bool,
     mvp_smoke: bool,
     hetero_smoke: bool,
+    max_new_tokens: Optional[int] = None,
+    reasoner_max_new_tokens: Optional[int] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
+    sample_fingerprints: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
+    fingerprint_rows = [dict(row) for row in (sample_fingerprints or ())]
     manifest = {
         "manifest_schema_version": EVAL_MANIFEST_SCHEMA_VERSION,
         "suite": str(suite_name),
@@ -997,11 +1093,19 @@ def _build_eval_manifest(
         "agent_a_model": str(agent_a_model),
         "agent_b_model": str(agent_b_model),
         "seed": int(seed),
+        "max_new_tokens": None if max_new_tokens is None else int(max_new_tokens),
+        "reasoner_max_new_tokens": (
+            None if reasoner_max_new_tokens is None else int(reasoner_max_new_tokens)
+        ),
+        "torch_dtype": None if torch_dtype is None else str(torch_dtype),
+        "device_map": None if device_map is None else str(device_map),
         "smoke_profile": {
             "semantic_smoke": bool(semantic_smoke),
             "mvp_smoke": bool(mvp_smoke),
             "hetero_smoke": bool(hetero_smoke),
         },
+        "sample_fingerprints": fingerprint_rows,
+        "sample_content_digest": _stable_json_digest(fingerprint_rows),
     }
     manifest["manifest_digest"] = _manifest_digest(manifest)
     return manifest
@@ -1031,6 +1135,24 @@ def _load_eval_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _validate_eval_manifest_sample_lock(
+    resolved_manifest: Mapping[str, Any],
+    locked_manifest: Optional[Mapping[str, Any]],
+) -> None:
+    if locked_manifest is None:
+        return
+    expected_digest = locked_manifest.get("sample_content_digest")
+    if expected_digest and resolved_manifest.get("sample_content_digest") != expected_digest:
+        raise ValueError(
+            "Eval manifest sample content digest mismatch: "
+            f"expected {expected_digest}, "
+            f"computed {resolved_manifest.get('sample_content_digest')}"
+        )
+    expected_fingerprints = locked_manifest.get("sample_fingerprints")
+    if expected_fingerprints and resolved_manifest.get("sample_fingerprints") != expected_fingerprints:
+        raise ValueError("Eval manifest sample fingerprints do not match resolved samples")
+
+
 def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str, Any]) -> None:
     args.suite = str(manifest["suite"])
     args.dataset = str(manifest["dataset"])
@@ -1041,6 +1163,14 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
     args.agent_a_model = str(manifest["agent_a_model"])
     args.agent_b_model = str(manifest["agent_b_model"])
     args.seed = int(manifest["seed"])
+    if manifest.get("max_new_tokens") is not None:
+        args.max_new_tokens = int(manifest["max_new_tokens"])
+    if manifest.get("reasoner_max_new_tokens") is not None:
+        args.reasoner_max_new_tokens = int(manifest["reasoner_max_new_tokens"])
+    if manifest.get("torch_dtype") is not None:
+        args.torch_dtype = str(manifest["torch_dtype"])
+    if manifest.get("device_map") is not None:
+        args.device_map = str(manifest["device_map"])
     smoke_profile = manifest.get("smoke_profile") or {}
     args.semantic_smoke = bool(smoke_profile.get("semantic_smoke", False))
     args.mvp_smoke = bool(smoke_profile.get("mvp_smoke", False))
@@ -1057,6 +1187,7 @@ def _build_artifact_manifest(
     latent_provenance_report: Optional[Mapping[str, Any]] = None,
     prepared_adapters: Sequence[Mapping[str, Any]] = (),
     prepared_eval_traces: Optional[Mapping[str, Any]] = None,
+    run_metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     cache_paths = {
         "sender_trace": [],
@@ -1097,8 +1228,39 @@ def _build_artifact_manifest(
         "eval_manifest_digest": (
             None if eval_manifest is None else eval_manifest.get("manifest_digest")
         ),
+        "run_metadata": dict(run_metadata or {}),
         "cache_paths": deduped_cache_paths,
         "do_not_commit_cache_artifacts": True,
+    }
+
+
+def _git_metadata() -> dict[str, Any]:
+    def _run_git(args: Sequence[str]) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        return result.stdout.strip()
+
+    status = _run_git(["status", "--short"])
+    return {
+        "commit": _run_git(["rev-parse", "HEAD"]),
+        "branch": _run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "dirty": bool(status),
+        "dirty_paths": [] if not status else status.splitlines(),
+    }
+
+
+def _run_metadata() -> dict[str, Any]:
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": list(sys.argv),
+        "git": _git_metadata(),
     }
 
 
@@ -2217,6 +2379,7 @@ def _build_generated_trajectory_training_rows(
         prompt = pick_field(row, ("question", "problem"))
         if not str(prompt).strip():
             continue
+        state["_current_sample_row"] = dict(row)
         sender_state = _collect_sender_generated_consensus_state(
             prompt,
             state,
@@ -2591,6 +2754,7 @@ def _prepare_generated_trajectory_eval_traces(
             prompt = pick_field(row, ("question", "problem"))
             if not str(prompt).strip():
                 continue
+            variant_state["_current_sample_row"] = dict(row)
             sender_state = _collect_sender_generated_consensus_state(
                 prompt,
                 variant_state,
@@ -2839,6 +3003,7 @@ def _decode_handoff(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -2975,6 +3140,7 @@ def run_pure_text_cot(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3037,6 +3203,7 @@ def run_text_text_hybrid(
         "decoded_text": decoded_text,
         "sender_reasoning_text": reasoning_text,
         "sender_reasoning_token_count": len(reasoning_token_ids),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "sender_reasoning_status": _sender_reasoning_status(
             reasoning_token_ids,
             reasoning_text,
@@ -3169,6 +3336,7 @@ def run_token_context_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3243,6 +3411,7 @@ def run_verified_token_context_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -3314,6 +3483,7 @@ def run_sender_answer_text_handoff(
             cfg=cfg,
         ),
         "generated_tokens": int(decode_metrics["generated_tokens"]),
+        "receiver_input_token_count": int(prefix_state["prefix_seq_len"]),
         "decode_status": "decoded" if decoded_text.strip() else "empty_decode",
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
@@ -4324,6 +4494,8 @@ def _configured_base_cfg(
     *,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -4368,6 +4540,10 @@ def _configured_base_cfg(
         agent_b_model=agent_b_model,
         hetero_smoke=hetero_smoke,
     )
+    if torch_dtype is not None:
+        base_cfg.torch_dtype = str(torch_dtype)
+    if device_map is not None:
+        base_cfg.device_map = str(device_map)
     if latent_pooling is not None:
         base_cfg.handoff.latent_pooling = str(latent_pooling)
     if receiver_context_mode is not None:
@@ -4521,6 +4697,12 @@ def _apply_model_profile_defaults(
         cfg.agent_b_model = str(agent_b_model)
 
 
+def _require_requested_device_available(cfg: Any) -> None:
+    device_map = str(getattr(cfg, "device_map", "auto")).strip().lower()
+    if device_map == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("device_map=mps requested, but torch MPS is not available")
+
+
 def run_benchmark(
     *,
     suite_name: str,
@@ -4537,6 +4719,8 @@ def run_benchmark(
     latent_steps_values: Optional[list[int]] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -4573,10 +4757,13 @@ def run_benchmark(
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
     answer_only_final: bool = False,
+    locked_eval_manifest: Optional[Mapping[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
         agent_b_model=agent_b_model,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
         latent_pooling=latent_pooling,
         receiver_context_mode=receiver_context_mode,
         receiver_context_latent_position=receiver_context_latent_position,
@@ -4626,12 +4813,15 @@ def run_benchmark(
         hetero_smoke=hetero_smoke,
         answer_only_final=answer_only_final,
     )
+    if dataset_name == "long_context_handoff":
+        base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
     semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
     if sample_indices is None and semantic_smoke_cfg is not None:
         sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
     effective_split = dataset_split or _default_split_for_dataset(dataset_name)
     validation_size = _validation_size(base_cfg, dataset_name)
     suite_cfg = _suite_cfg(base_cfg, suite_name)
+    _require_requested_device_available(suite_cfg)
     latent_step_candidates = latent_steps_values or [int(getattr(suite_cfg, "latent_steps", 0))]
     methods = _methods_for_suite(suite_name, method_names)
     compatibility_cache: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4653,6 +4843,11 @@ def run_benchmark(
     effective_sample_indices = list(sample_indices) if sample_indices is not None else None
     if effective_sample_indices is not None:
         effective_sample_indices = effective_sample_indices[: min(limit, len(effective_sample_indices))]
+    sample_fingerprint_rows = _sample_fingerprints(
+        samples,
+        limit=limit,
+        sample_indices=effective_sample_indices,
+    )
     report_method_names = [name for name, _ in methods]
     eval_manifest = _build_eval_manifest(
         suite_name=suite_name,
@@ -4667,7 +4862,13 @@ def run_benchmark(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        max_new_tokens=int(getattr(suite_cfg, "max_new_tokens", 0)),
+        reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
+        torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
+        device_map=str(getattr(suite_cfg, "device_map", "")),
+        sample_fingerprints=sample_fingerprint_rows,
     )
+    _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
 
@@ -4694,6 +4895,7 @@ def run_benchmark(
                     )
                     prompt = pick_field(row, ("question", "problem"))
                     target_answer = _target_answer(dataset_name, row)
+                    state["_current_sample_row"] = dict(row)
                     predicted_answer: Optional[str] = None
                     decoded_text = ""
                     result: dict[str, Any] = {}
@@ -4795,6 +4997,13 @@ def run_benchmark(
                         "text_baseline" if method_name in TEXT_BASELINE_METHODS else "latent_only",
                     )
                     receiver_context_token_count = int(row_result.get("receiver_context_token_count", 0) or 0)
+                    receiver_input_token_count = int(
+                        row_result.get(
+                            "receiver_input_token_count",
+                            receiver_context_token_count,
+                        )
+                        or 0
+                    )
                     receiver_context_latent_position = row_result.get(
                         "receiver_context_latent_position",
                         "not_applicable"
@@ -4818,6 +5027,7 @@ def run_benchmark(
                             "receiver_context_reason": receiver_context_reason,
                             "receiver_context_token_count": receiver_context_token_count,
                             "receiver_context_latent_position": receiver_context_latent_position,
+                            "receiver_input_token_count": receiver_input_token_count,
                             "decode_status": decode_status,
                             "prompt": prompt,
                             "target_answer": target_answer,
@@ -5135,6 +5345,7 @@ def run_benchmark(
         latent_methods=provenance_latent_methods,
         max_rows=int(getattr(semantic_smoke_cfg, "max_diagnostic_rows", 10)),
     )
+    run_metadata = _run_metadata()
     artifact_manifest = _build_artifact_manifest(
         report_output_path=report_output_path,
         samples_output_path=samples_output_path,
@@ -5142,6 +5353,73 @@ def run_benchmark(
         eval_manifest_output_path=eval_manifest_output_path,
         eval_manifest=eval_manifest,
         latent_provenance_report=latent_provenance_report,
+        run_metadata=run_metadata,
+    )
+    transfer_comparison_cfg = getattr(
+        getattr(base_cfg, "reporting", None),
+        "transfer_comparison",
+        None,
+    )
+    configured_primary_baseline = getattr(
+        transfer_comparison_cfg,
+        "primary_baseline_method",
+        None,
+    )
+    default_primary_baseline = (
+        "verified_token_context_handoff"
+        if "verified_token_context_handoff" in provenance_baseline_methods
+        else "token_context_handoff"
+        if "token_context_handoff" in provenance_baseline_methods
+        else None
+    )
+    transfer_comparison_report = build_transfer_comparison_report(
+        summary_rows,
+        baseline_methods=provenance_baseline_methods,
+        latent_methods=provenance_latent_methods,
+        primary_baseline_method=(
+            str(configured_primary_baseline)
+            if configured_primary_baseline not in (None, "")
+            else default_primary_baseline
+        ),
+        min_accuracy_retention_ratio=getattr(
+            transfer_comparison_cfg,
+            "min_accuracy_retention_ratio",
+            None,
+        ),
+        max_latency_ratio=getattr(
+            transfer_comparison_cfg,
+            "max_latency_ratio",
+            None,
+        ),
+        require_latent_accuracy_gain=bool(
+            getattr(transfer_comparison_cfg, "require_latent_accuracy_gain", False)
+        ),
+    )
+    heterogeneous_transfer_cfg = getattr(
+        getattr(base_cfg, "reporting", None),
+        "heterogeneous_transfer",
+        None,
+    )
+    heterogeneous_transfer_report = build_heterogeneous_transfer_report(
+        sample_rows,
+        latent_methods=provenance_latent_methods,
+        model_pair_compatibility=suite_model_pair_compatibility,
+        generated_methods=GENERATED_LATENT_METHODS,
+        context_generated_methods=("generated_context_latent_handoff",),
+        require_generated_adapter_for_incompatible_pair=bool(
+            getattr(
+                heterogeneous_transfer_cfg,
+                "require_generated_adapter_for_incompatible_pair",
+                True,
+            )
+        ),
+        require_context_for_context_methods=bool(
+            getattr(
+                heterogeneous_transfer_cfg,
+                "require_context_for_context_methods",
+                True,
+            )
+        ),
     )
 
     write_csv(samples_output_path, sample_rows, STANDARD_SAMPLE_FIELDS)
@@ -5152,6 +5430,7 @@ def run_benchmark(
         "dataset_split": effective_split,
         "limit": limit,
         "sample_indices": effective_sample_indices,
+        "sample_content_digest": eval_manifest["sample_content_digest"],
         "eval_manifest": eval_manifest,
         "repetitions": repetitions,
         "latent_steps_values": latent_step_candidates,
@@ -5253,8 +5532,11 @@ def run_benchmark(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "runtime_smoke_report": runtime_smoke_report,
         "semantic_smoke_report": semantic_smoke_report,
+        "transfer_comparison_report": transfer_comparison_report,
+        "heterogeneous_transfer_report": heterogeneous_transfer_report,
         "latent_provenance_report": latent_provenance_report,
         "artifact_manifest": artifact_manifest,
+        "run_metadata": run_metadata,
         "phase_gate_report": phase_gate_report,
         "ode_scaling_report": build_ode_scaling_report(summary_rows),
         "summary_rows": summary_rows,
@@ -5275,6 +5557,8 @@ def prepare_generated_trajectory_adapter_cache(
     reasoner_max_new_tokens: Optional[int] = None,
     agent_a_model: Optional[str] = None,
     agent_b_model: Optional[str] = None,
+    torch_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
     latent_pooling: Optional[str] = None,
     receiver_context_mode: Optional[str] = None,
     receiver_context_latent_position: Optional[str] = None,
@@ -5305,10 +5589,13 @@ def prepare_generated_trajectory_adapter_cache(
     mvp_smoke: bool = False,
     hetero_smoke: bool = False,
     answer_only_final: bool = False,
+    locked_eval_manifest: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     base_cfg = _configured_base_cfg(
         agent_a_model=agent_a_model,
         agent_b_model=agent_b_model,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
         latent_pooling=latent_pooling,
         receiver_context_mode=receiver_context_mode,
         receiver_context_latent_position=receiver_context_latent_position,
@@ -5351,7 +5638,10 @@ def prepare_generated_trajectory_adapter_cache(
         hetero_smoke=hetero_smoke,
         answer_only_final=answer_only_final,
     )
+    if dataset_name == "long_context_handoff":
+        base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
     suite_cfg = _suite_cfg(base_cfg, suite_name)
+    _require_requested_device_available(suite_cfg)
     effective_split = dataset_split or _default_split_for_dataset(dataset_name)
     if sample_indices is None:
         semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
@@ -5360,6 +5650,19 @@ def prepare_generated_trajectory_adapter_cache(
                 getattr(semantic_smoke_cfg, "sample_indices", None)
             )
     effective_sample_indices = _resolved_sample_indices(limit, sample_indices)
+    validation_size = _validation_size(base_cfg, dataset_name)
+    samples = get_dataloader(
+        dataset_name,
+        limit=limit,
+        split=effective_split,
+        validation_size=validation_size,
+        sample_indices=sample_indices,
+    )
+    sample_fingerprint_rows = _sample_fingerprints(
+        samples,
+        limit=limit,
+        sample_indices=effective_sample_indices,
+    )
     report_method_names = list(method_names or ("generated_latent_handoff",))
     eval_manifest = _build_eval_manifest(
         suite_name=suite_name,
@@ -5374,7 +5677,13 @@ def prepare_generated_trajectory_adapter_cache(
         semantic_smoke=semantic_smoke,
         mvp_smoke=mvp_smoke,
         hetero_smoke=hetero_smoke,
+        max_new_tokens=int(getattr(suite_cfg, "max_new_tokens", 0)),
+        reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
+        torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
+        device_map=str(getattr(suite_cfg, "device_map", "")),
+        sample_fingerprints=sample_fingerprint_rows,
     )
+    _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
     if prepare_adapter:
@@ -5447,12 +5756,14 @@ def prepare_generated_trajectory_adapter_cache(
             variant_state=variant_state,
             method_names=method_names,
         )
+    run_metadata = _run_metadata()
     artifact_manifest = _build_artifact_manifest(
         report_output_path=report_output_path,
         eval_manifest_output_path=eval_manifest_output_path,
         eval_manifest=eval_manifest,
         prepared_adapters=prepared_adapters,
         prepared_eval_traces=prepared_eval_traces,
+        run_metadata=run_metadata,
     )
     report_payload = {
         "suite": suite_name,
@@ -5460,6 +5771,7 @@ def prepare_generated_trajectory_adapter_cache(
         "dataset_split": effective_split,
         "limit": int(limit),
         "sample_indices": effective_sample_indices,
+        "sample_content_digest": eval_manifest["sample_content_digest"],
         "eval_manifest": eval_manifest,
         "methods": report_method_names,
         "agent_a_model": str(suite_cfg.agent_a_model),
@@ -5501,6 +5813,7 @@ def prepare_generated_trajectory_adapter_cache(
         "prepared_adapters": prepared_adapters,
         "prepared_eval_traces": prepared_eval_traces,
         "artifact_manifest": artifact_manifest,
+        "run_metadata": run_metadata,
     }
     write_json(report_output_path, report_payload)
     return report_payload
@@ -5518,7 +5831,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dataset",
-        choices=("gsm8k", "math"),
+        choices=("gsm8k", "math", "long_context_handoff"),
         default=DEFAULT_DATASET,
         help=f"Dataset to evaluate (default: {DEFAULT_DATASET}).",
     )
@@ -5610,6 +5923,17 @@ def main() -> None:
         "--agent-b-model",
         default=None,
         help="Optional override for Agent B model.",
+    )
+    parser.add_argument(
+        "--torch-dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default=None,
+        help="Optional override for cfg.torch_dtype.",
+    )
+    parser.add_argument(
+        "--device-map",
+        default=None,
+        help="Optional override for cfg.device_map, for example auto or none.",
     )
     parser.add_argument(
         "--latent-pooling",
@@ -5868,8 +6192,10 @@ def main() -> None:
         help="Optional deterministic seed to stamp into benchmark metadata.",
     )
     args = parser.parse_args()
+    locked_eval_manifest = None
     if args.eval_manifest is not None:
-        _apply_eval_manifest_to_args(args, _load_eval_manifest(args.eval_manifest))
+        locked_eval_manifest = _load_eval_manifest(args.eval_manifest)
+        _apply_eval_manifest_to_args(args, locked_eval_manifest)
     if args.semantic_smoke or args.mvp_smoke or args.hetero_smoke:
         if args.limit is None:
             args.limit = DEFAULT_SEMANTIC_SMOKE_LIMIT
@@ -5972,6 +6298,8 @@ def main() -> None:
             reasoner_max_new_tokens=args.reasoner_max_new_tokens,
             agent_a_model=args.agent_a_model,
             agent_b_model=args.agent_b_model,
+            torch_dtype=args.torch_dtype,
+            device_map=args.device_map,
             latent_pooling=args.latent_pooling,
             receiver_context_mode=args.receiver_context_mode,
             receiver_context_latent_position=args.receiver_context_latent_position,
@@ -6028,6 +6356,7 @@ def main() -> None:
             mvp_smoke=args.mvp_smoke,
             hetero_smoke=args.hetero_smoke,
             answer_only_final=args.answer_only_final,
+            locked_eval_manifest=locked_eval_manifest,
         )
         print(f"Wrote generated trajectory prepare report to {args.report_output}")
         if args.write_eval_manifest is not None:
@@ -6067,6 +6396,8 @@ def main() -> None:
         latent_steps_values=latent_steps_values,
         agent_a_model=args.agent_a_model,
         agent_b_model=args.agent_b_model,
+        torch_dtype=args.torch_dtype,
+        device_map=args.device_map,
         latent_pooling=args.latent_pooling,
         receiver_context_mode=args.receiver_context_mode,
         receiver_context_latent_position=args.receiver_context_latent_position,
@@ -6145,6 +6476,7 @@ def main() -> None:
         mvp_smoke=args.mvp_smoke,
         hetero_smoke=args.hetero_smoke,
         answer_only_final=args.answer_only_final,
+        locked_eval_manifest=locked_eval_manifest,
     )
 
     print(f"Wrote per-sample benchmark rows to {args.samples_output}")
@@ -6155,6 +6487,16 @@ def main() -> None:
     print(f"Phase gate passed: {report_payload['phase_gate_report']['passed']}")
     if report_payload.get("semantic_smoke_report") is not None:
         print(f"Semantic smoke passed: {report_payload['semantic_smoke_report']['passed']}")
+    if report_payload.get("transfer_comparison_report") is not None:
+        print(
+            "Transfer comparison passed: "
+            f"{report_payload['transfer_comparison_report']['passed']}"
+        )
+    if report_payload.get("heterogeneous_transfer_report") is not None:
+        print(
+            "Heterogeneous transfer readiness passed: "
+            f"{report_payload['heterogeneous_transfer_report']['passed']}"
+        )
     print(f"\n{'Method':<30} {'Acc':>8} {'PPL':>10} {'Latency':>11} {'Cache %':>9}")
     print("-" * 78)
     for row in summary_rows:

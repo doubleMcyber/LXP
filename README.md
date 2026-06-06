@@ -14,8 +14,8 @@ Generated benchmark, training, sweep, and visualization outputs default to `outp
 Semantic smoke gates are the fastest end-to-end checks for latent handoff quality:
 
 ```bash
-venv/bin/python benchmark_all.py --semantic-smoke
-venv/bin/python benchmark_all.py --hetero-smoke
+venv/bin/python -B benchmark_all.py --semantic-smoke
+venv/bin/python -B benchmark_all.py --hetero-smoke
 ```
 
 The default semantic smoke uses `Qwen/Qwen3.5-2B -> Qwen/Qwen3.5-0.8B` with a generated-reasoning latent handoff. The default hetero smoke uses `LGAI-EXAONE/EXAONE-4.0-1.2B -> Qwen/Qwen3.5-0.8B` with a 640-token sender budget, character-aligned generated trajectory adapter, and top-4 receiver embedding-manifold projection. Reports include overall latent accuracy, sender final-answer completion rate, and latent accuracy conditioned on Agent A producing the correct answer.
@@ -41,19 +41,72 @@ venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --lim
 ```
 
 Benchmark reports include an `eval_manifest` with resolved dataset, split, sample
-indices, method list, model pair, seed, smoke profile, and a stable digest. Write
-the same lock file separately with `--write-eval-manifest`, then replay it with
-`--eval-manifest` before any paid GPU run:
+indices, method list, model pair, seed, smoke profile, hashed sample
+fingerprints, a sample-content digest, and a stable manifest digest. Reports
+also include a `transfer_comparison_report` and
+`heterogeneous_transfer_report`, so token-context controls and cross-family
+adapter/context readiness are tracked in the JSON report instead of inferred
+manually from CSV files. Summary rows also include receiver-side input token
+pressure (`mean_receiver_input_token_count`, `max_receiver_input_token_count`,
+and `total_receiver_input_tokens`), and the transfer comparison report includes
+receiver-token ratio and savings fields. This lets long-context runs test
+whether latent handoff is actually compressing Agent B's context, not just
+whether it decodes an answer. Transfer retention, latency, and hetero-readiness
+thresholds can be hardened in `configs/main.yaml` under
+`reporting.transfer_comparison` and `reporting.heterogeneous_transfer`. Write
+the same lock file separately with
+`--write-eval-manifest`, then replay it with `--eval-manifest` before any paid
+GPU run:
 
 ```bash
-venv/bin/python benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --methods token_context_handoff,verified_token_context_handoff,sender_answer_text_handoff,generated_context_latent_handoff --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing --write-eval-manifest outputs/locked_eval_manifest_5.json
-venv/bin/python benchmark_all.py --eval-manifest outputs/locked_eval_manifest_5.json --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing
+venv/bin/python -B benchmark_all.py --hetero-smoke --sample-indices 0,1,2,3,4 --limit 5 --methods token_context_handoff,verified_token_context_handoff,sender_answer_text_handoff,generated_context_latent_handoff --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing --write-eval-manifest outputs/locked_eval_manifest_5.json
+venv/bin/python -B benchmark_all.py --eval-manifest outputs/locked_eval_manifest_5.json --generated-trajectory-adapter-input-space raw --enable-sender-revision --generated-trajectory-adapter-no-train-on-missing
 ```
+
+The staged production validation runner assembles the same workflow in the
+recommended order:
+
+```bash
+venv/bin/python -B scripts/run_production_validation.py
+venv/bin/python -B scripts/run_production_validation.py --execute --profile local --replay
+```
+
+Use `--profile gpu` or `--profile scale` only after the local profile passes and
+the report's semantic, comparison, and heterogeneous transfer sections are
+interpretable.
+
+### Long-Context And MPS Validation
+
+The repo includes a deterministic local `long_context_handoff` dataset for
+testing the claim that latent handoff can preserve the answer while avoiding a
+large receiver-side text context. Each row contains a short question, the target
+answer, and a frozen long sender trace. The benchmark runner feeds that trace
+into token-context controls while latent methods use it as Agent A's reasoning
+source, making receiver token pressure directly comparable.
+
+Inspect the long-context Apple Silicon profile:
+
+```bash
+venv/bin/python -B scripts/run_production_validation.py --profile long_context_mps
+```
+
+Run it on a machine where `torch.backends.mps.is_available()` is `True`:
+
+```bash
+venv/bin/python -B scripts/run_production_validation.py --profile long_context_mps --execute --replay
+```
+
+This profile uses `--dataset long_context_handoff`, `--torch-dtype float32`,
+`--device-map mps`, and short decode budgets appropriate for local iteration.
+If MPS is unavailable, the benchmark now fails before loading weights instead
+of silently falling back or producing misleading timings. The report summary
+prints best latent accuracy, latency ratio, receiver-token ratio, and
+receiver-token savings percentage.
 
 For a bounded DigitalOcean pilot, inspect the planned commands locally first:
 
 ```bash
-venv/bin/python scripts/do_gpu_pilot.py
+venv/bin/python -B scripts/do_gpu_pilot.py
 ```
 
 On the GPU host, run the same pilot with `--execute`.

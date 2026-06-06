@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from omegaconf import OmegaConf
 import pytest
@@ -42,10 +43,13 @@ from benchmark_all import (
     _load_generated_trajectory_adapter_from_disk,
     _methods_for_suite,
     _predicted_answer,
+    _sample_fingerprints,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
+    _require_requested_device_available,
     _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
+    _validate_eval_manifest_sample_lock,
 )
 from src.utils.benchmarking import (
     REPORT_SCHEMA_VERSION,
@@ -56,6 +60,8 @@ from src.utils.benchmarking import (
     build_runtime_smoke_report,
     build_semantic_smoke_report,
     build_standard_row_base,
+    build_heterogeneous_transfer_report,
+    build_transfer_comparison_report,
     build_training_phase2_report,
     build_training_smoke_report,
 )
@@ -92,6 +98,14 @@ def test_handoff_decode_prompt_respects_receiver_context_mode() -> None:
 
     cfg.handoff.receiver_context.mode = "none"
     assert _handoff_decode_prompt("question", cfg) is None
+
+
+def test_benchmark_guard_fails_fast_when_mps_unavailable() -> None:
+    cfg = OmegaConf.create({"device_map": "mps"})
+
+    with patch("benchmark_all.torch.backends.mps.is_available", return_value=False):
+        with pytest.raises(RuntimeError, match="MPS is not available"):
+            _require_requested_device_available(cfg)
 
 
 def test_build_standard_row_base_uses_cfg_metadata() -> None:
@@ -163,6 +177,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "predicted_answer": "1",
             "decoded_text": "1",
             "generated_tokens": 1,
+            "receiver_input_token_count": 120,
             "answer_token_count": 1,
             "answer_nll": 0.5,
             "answer_perplexity": 1.6487,
@@ -213,6 +228,7 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
             "predicted_answer": "0",
             "decoded_text": "0",
             "generated_tokens": 1,
+            "receiver_input_token_count": 180,
             "answer_token_count": 1,
             "answer_nll": 1.0,
             "answer_perplexity": 2.7183,
@@ -251,6 +267,9 @@ def test_aggregate_standard_rows_computes_rates_and_means() -> None:
     assert summary["accuracy_when_sender_correct_percentage"] == 50.0
     assert summary["average_latency_seconds"] == 2.0
     assert summary["tokens_per_second"] == 0.5
+    assert summary["total_receiver_input_tokens"] == 300
+    assert summary["mean_receiver_input_token_count"] == 150.0
+    assert summary["max_receiver_input_token_count"] == 180
     assert summary["cache_transfer_rate_percentage"] == 100.0
     assert summary["confidence_gate_trigger_rate_percentage"] == 50.0
     assert summary["mean_post_alignment_l2_distance"] == 0.30000000000000004
@@ -708,6 +727,22 @@ def test_verified_token_context_handoff_prompt_prioritizes_verified_answer() -> 
 
 
 def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
+    sample_fingerprints = [
+        {
+            "sample_index": 9,
+            "prompt_sha256": "prompt-a",
+            "target_sha256": "target-a",
+            "prompt_char_count": 100,
+            "target_char_count": 12,
+        },
+        {
+            "sample_index": 11,
+            "prompt_sha256": "prompt-b",
+            "target_sha256": "target-b",
+            "prompt_char_count": 90,
+            "target_char_count": 8,
+        },
+    ]
     manifest = _build_eval_manifest(
         suite_name="standard",
         dataset_name="gsm8k",
@@ -721,6 +756,7 @@ def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
         semantic_smoke=False,
         mvp_smoke=False,
         hetero_smoke=True,
+        sample_fingerprints=sample_fingerprints,
     )
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -729,12 +765,182 @@ def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
 
     assert loaded["manifest_digest"] == manifest["manifest_digest"]
     assert loaded["sample_indices"] == [9, 11, 19]
+    assert loaded["sample_fingerprints"] == sample_fingerprints
+    assert loaded["sample_content_digest"]
 
     tampered = dict(manifest)
     tampered["sample_indices"] = [9, 11, 18]
     path.write_text(json.dumps(tampered), encoding="utf-8")
     with pytest.raises(ValueError, match="digest mismatch"):
         _load_eval_manifest(path)
+
+
+def test_sample_fingerprints_lock_prompt_and_target_content() -> None:
+    rows = [
+        {"question": "How many?", "answer": "#### 3"},
+        {"problem": "Find x", "solution": "\\boxed{4}"},
+    ]
+
+    fingerprints = _sample_fingerprints(rows, limit=2, sample_indices=[5, 7])
+
+    assert [row["sample_index"] for row in fingerprints] == [5, 7]
+    assert fingerprints[0]["prompt_sha256"] != fingerprints[1]["prompt_sha256"]
+    assert fingerprints[0]["target_sha256"] != fingerprints[1]["target_sha256"]
+    assert fingerprints[0]["prompt_char_count"] == len("How many?")
+
+
+def test_eval_manifest_sample_lock_flags_changed_content() -> None:
+    locked_manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="gsm8k",
+        dataset_split="validation",
+        limit=1,
+        sample_indices=[0],
+        methods=("generated_context_latent_handoff",),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=0,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+        sample_fingerprints=[
+            {
+                "sample_index": 0,
+                "prompt_sha256": "old-prompt",
+                "target_sha256": "old-target",
+                "prompt_char_count": 10,
+                "target_char_count": 2,
+            }
+        ],
+    )
+    resolved_manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="gsm8k",
+        dataset_split="validation",
+        limit=1,
+        sample_indices=[0],
+        methods=("generated_context_latent_handoff",),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=0,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+        sample_fingerprints=[
+            {
+                "sample_index": 0,
+                "prompt_sha256": "new-prompt",
+                "target_sha256": "old-target",
+                "prompt_char_count": 10,
+                "target_char_count": 2,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="sample content digest mismatch"):
+        _validate_eval_manifest_sample_lock(resolved_manifest, locked_manifest)
+
+
+def test_transfer_comparison_report_tracks_accuracy_latency_and_retention() -> None:
+    summary_rows = [
+        {
+            "method": "verified_token_context_handoff",
+            "sample_count": 10,
+            "accuracy_percentage": 80.0,
+            "average_latency_seconds": 2.0,
+            "answer_perplexity": 1.5,
+            "mean_receiver_input_token_count": 1000.0,
+        },
+        {
+            "method": "generated_context_latent_handoff",
+            "sample_count": 10,
+            "accuracy_percentage": 72.0,
+            "average_latency_seconds": 3.0,
+            "answer_perplexity": 1.8,
+            "mean_receiver_input_token_count": 250.0,
+            "cache_transfer_rate_percentage": None,
+            "handoff_ok_rate_percentage": 100.0,
+            "non_empty_decoded_rate_percentage": 100.0,
+        },
+    ]
+
+    report = build_transfer_comparison_report(
+        summary_rows,
+        baseline_methods=("verified_token_context_handoff",),
+        latent_methods=("generated_context_latent_handoff",),
+        primary_baseline_method="verified_token_context_handoff",
+        min_accuracy_retention_ratio=0.9,
+        max_latency_ratio=2.0,
+    )
+
+    assert report["passed"] is True
+    [comparison] = report["comparisons"]
+    assert comparison["accuracy_delta_percentage"] == -8.0
+    assert comparison["accuracy_retention_ratio"] == 0.9
+    assert comparison["latency_ratio"] == 1.5
+    assert comparison["answer_perplexity_delta"] == pytest.approx(0.3)
+    assert comparison["receiver_input_token_ratio"] == 0.25
+    assert comparison["receiver_input_token_savings_percentage"] == 75.0
+
+
+def test_transfer_comparison_report_flags_retention_failures() -> None:
+    report = build_transfer_comparison_report(
+        [
+            {"method": "token_context_handoff", "accuracy_percentage": 90.0},
+            {"method": "generated_context_latent_handoff", "accuracy_percentage": 45.0},
+        ],
+        baseline_methods=("token_context_handoff",),
+        latent_methods=("generated_context_latent_handoff",),
+        min_accuracy_retention_ratio=0.9,
+    )
+
+    assert report["passed"] is False
+    assert any("retained" in item for item in report["missing_requirements"])
+
+
+def test_heterogeneous_transfer_report_requires_adapter_and_context_for_incompatible_pairs() -> None:
+    report = build_heterogeneous_transfer_report(
+        [
+            {
+                "method": "generated_context_latent_handoff",
+                "kv_cache_status": "not_provided",
+                "handoff_adapter_status": "generated_trajectory_loaded_raw",
+                "handoff_adapter_applied": True,
+                "receiver_context_status": "used_prompt_prefix",
+            },
+        ],
+        latent_methods=("generated_context_latent_handoff",),
+        generated_methods=("generated_context_latent_handoff",),
+        context_generated_methods=("generated_context_latent_handoff",),
+        model_pair_compatibility={"kv_cache_compatible": False},
+    )
+
+    assert report["passed"] is True
+    assert report["generated_adapter_applied_row_count"] == 1
+    assert report["receiver_context_used_row_count"] == 1
+
+
+def test_heterogeneous_transfer_report_flags_direct_kv_and_missing_adapter() -> None:
+    report = build_heterogeneous_transfer_report(
+        [
+            {
+                "method": "generated_context_latent_handoff",
+                "kv_cache_status": "unsupported_architecture_mismatch",
+                "handoff_adapter_status": "generated_trajectory_missing_raw",
+                "handoff_adapter_applied": False,
+                "receiver_context_status": "not_used",
+            },
+        ],
+        latent_methods=("generated_context_latent_handoff",),
+        generated_methods=("generated_context_latent_handoff",),
+        context_generated_methods=("generated_context_latent_handoff",),
+        model_pair_compatibility={"kv_cache_compatible": False},
+    )
+
+    assert report["passed"] is False
+    assert report["direct_cache_attempt_row_count"] == 1
+    assert report["missing_generated_adapter_row_count"] == 1
+    assert any("direct KV-cache" in item for item in report["missing_requirements"])
 
 
 def test_gsm8k_answer_matching_accepts_integer_valued_decimals() -> None:
@@ -1563,6 +1769,82 @@ def test_build_training_smoke_report_flags_degenerate_actor_text_baseline() -> N
     assert report["latent_training_ready"] is False
     assert report["final_heldout_actor_text_baseline_degenerate_prediction"] is True
     assert any("Actor text baseline is degenerate" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_gates_enabled_token_decoder() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 66.667,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 2.0,
+                "heldout_latent_token_decode_enabled": True,
+                "heldout_latent_token_decode_require_ready": True,
+                "heldout_latent_token_decode_accuracy": 66.667,
+                "heldout_latent_token_decode_answer_extraction_rate_percentage": 100.0,
+                "heldout_latent_token_decode_unique_predicted_answer_count": 2.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["latent_token_decoder_ready"] is False
+    assert any("Latent token decoder" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_gates_enabled_actor_bridge_decoder() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 66.667,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 2.0,
+                "heldout_actor_semantic_bridge_decode_enabled": True,
+                "heldout_actor_semantic_bridge_decode_accuracy": 66.667,
+                "heldout_actor_semantic_bridge_decode_answer_extraction_rate_percentage": 100.0,
+                "heldout_actor_semantic_bridge_decode_unique_predicted_answer_count": 2.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["actor_semantic_bridge_decoder_ready"] is False
+    assert any("Actor semantic bridge decode" in item for item in report["missing_requirements"])
+
+
+def test_build_training_smoke_report_gates_required_raw_actor_decode() -> None:
+    report = build_training_smoke_report(
+        [
+            {"epoch": 0.0, "step": 0.0, "loss": 4.0},
+            {
+                "epoch": 0.0,
+                "step": 1.0,
+                "heldout_exact_match_accuracy": 66.667,
+                "heldout_answer_extraction_rate_percentage": 100.0,
+                "heldout_unique_predicted_answer_count": 2.0,
+                "heldout_raw_decode_require_ready": True,
+                "heldout_raw_decode_exact_match_accuracy": 66.667,
+                "heldout_raw_decode_answer_extraction_rate_percentage": 100.0,
+                "heldout_raw_decode_unique_predicted_answer_count": 2.0,
+                "heldout_answer_perplexity": 1.0,
+                "heldout_eval_samples": 3.0,
+            },
+        ]
+    )
+
+    assert report["passed"] is False
+    assert report["raw_actor_free_decoder_ready"] is False
+    assert any("Raw actor free decode" in item for item in report["missing_requirements"])
 
 
 def test_methods_for_suite_exposes_phase1_homogeneous_entrypoint() -> None:

@@ -44,3 +44,18 @@ def test_gsm8k_split_can_select_explicit_sample_indices_after_split() -> None:
         )
 
     assert [row["question"] for row in validation_split] == ["q5", "q8"]
+
+
+def test_long_context_handoff_is_local_and_has_frozen_sender_trace() -> None:
+    rows = get_dataset_split(
+        "long_context_handoff",
+        "validation",
+        limit=2,
+        sample_indices=[0, 1],
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["answer"].startswith("#### ")
+    assert "Final answer:" in rows[0]["sender_reasoning_text"]
+    assert rows[0]["horizon_steps"] >= 96
+    assert len(rows[0]["sender_reasoning_text"]) > len(rows[0]["question"]) * 10

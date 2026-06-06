@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LXP Research Paper</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #ffffff;
+      --bg: #eef2f5;
+      --ink: #17202a;
+      --muted: #5b6773;
+      --line: #d9e0e7;
+      --panel: #f8fafc;
+      --blue: #2563eb;
+      --cyan: #0f766e;
+      --green: #16a34a;
+      --amber: #b45309;
+      --rose: #be123c;
+      --violet: #7c3aed;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.55 Georgia, "Times New Roman", serif;
+    }
+
+    .paper {
+      width: min(1120px, calc(100% - 24px));
+      margin: 18px auto 42px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 55px rgba(15, 23, 42, 0.12);
+    }
+
+    header {
+      padding: 52px clamp(24px, 6vw, 72px) 32px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #fbfdff 0%, #f7fafc 100%);
+    }
+
+    main {
+      padding: 32px clamp(24px, 6vw, 72px) 60px;
+    }
+
+    h1, h2, h3, h4 {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+      line-height: 1.15;
+      color: #101827;
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      max-width: 980px;
+      font-size: clamp(34px, 5vw, 58px);
+    }
+
+    h2 {
+      margin: 34px 0 12px;
+      font-size: clamp(24px, 3vw, 34px);
+      border-top: 1px solid var(--line);
+      padding-top: 24px;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 20px;
+    }
+
+    h4 {
+      margin: 0 0 8px;
+      font-size: 15px;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    p { margin: 0 0 14px; }
+
+    a { color: var(--blue); }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #eef4ff;
+      color: #0f3d7a;
+    }
+
+    .subtitle {
+      max-width: 900px;
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 18px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid #c6d2df;
+      background: #fff;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .abstract {
+      margin-top: 26px;
+      padding: 20px;
+      border-left: 5px solid var(--cyan);
+      background: var(--panel);
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .two-col {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .three-col {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .figure {
+      margin: 24px 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      break-inside: avoid;
+    }
+
+    .caption {
+      margin-top: 12px;
+      color: var(--muted);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    .metric {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .metric-value {
+      margin: 4px 0 8px;
+      font-size: clamp(30px, 4vw, 50px);
+      line-height: 1;
+      font-weight: 820;
+      color: var(--cyan);
+    }
+
+    .metric-value.warn { color: var(--amber); }
+    .metric-value.bad { color: var(--rose); }
+
+    .metric p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .bar-chart {
+      display: grid;
+      gap: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 260px minmax(130px, 1fr) 70px;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .bar-label {
+      min-width: 0;
+      font-weight: 700;
+      color: #263242;
+    }
+
+    .track {
+      height: 18px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #dbe4ed;
+    }
+
+    .fill {
+      width: var(--value);
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--blue), var(--cyan));
+    }
+
+    .fill.bad { background: linear-gradient(90deg, #e11d48, #f97316); }
+    .fill.warn { background: linear-gradient(90deg, #f59e0b, #d97706); }
+
+    .spark-bars {
+      display: flex;
+      align-items: end;
+      gap: 4px;
+      min-height: 180px;
+      padding: 14px 10px 26px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      position: relative;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .spark-bars::before,
+    .spark-bars::after {
+      content: "100%";
+      position: absolute;
+      right: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .spark-bars::before { top: 8px; }
+    .spark-bars::after {
+      content: "0%";
+      bottom: 4px;
+    }
+
+    .spark {
+      flex: 1 1 0;
+      min-width: 8px;
+      height: max(4px, var(--value));
+      border-radius: 4px 4px 0 0;
+      background: var(--blue);
+      position: relative;
+    }
+
+    .spark.ready { background: var(--green); }
+    .spark.zero { background: #b8c4d2; }
+    .spark.warn { background: var(--amber); }
+
+    .spark:hover::after {
+      content: attr(data-label);
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      transform: translateX(-50%);
+      white-space: nowrap;
+      padding: 4px 7px;
+      border-radius: 5px;
+      background: #111827;
+      color: #fff;
+      font-size: 12px;
+      z-index: 3;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 8px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 10px;
+      border: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eff5fb;
+      color: #1f2a37;
+    }
+
+    .ok { color: var(--green); font-weight: 800; }
+    .blocked { color: var(--rose); font-weight: 800; }
+    .partial { color: var(--amber); font-weight: 800; }
+
+    .diagram-svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .claim-box {
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .claim-box ul {
+      margin: 8px 0 0 18px;
+      padding: 0;
+    }
+
+    .claim-box li { margin: 6px 0; }
+
+    .small {
+      color: var(--muted);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    @media (max-width: 820px) {
+      .two-col,
+      .three-col {
+        grid-template-columns: 1fr;
+      }
+
+      .bar-row {
+        grid-template-columns: 1fr;
+      }
+
+      .paper {
+        width: 100%;
+        margin: 0;
+        border-left: 0;
+        border-right: 0;
+      }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .paper {
+        width: 100%;
+        margin: 0;
+        border: 0;
+        box-shadow: none;
+      }
+      header, main { padding-left: 0.55in; padding-right: 0.55in; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <article class="paper">
+    <header>
+      <h1>LXP: A Prototype for Latent Context Transfer Between Language Models</h1>
+      <p class="subtitle">
+        Research report on architecture, implementation, failure analysis, and the
+        latest same-family raw latent-to-actor decode smoke.
+      </p>
+      <div class="meta">
+        <span class="pill">Author: Marlon Moenius</span>
+        <span class="pill">Project: Latent Exchange Protocol</span>
+        <span class="pill">Models: Qwen3.5-0.8B to Qwen3.5-0.8B</span>
+        <span class="pill">Device: Apple Silicon MPS</span>
+      </div>
+      <section class="abstract">
+        <h4>Abstract</h4>
+        <p>
+          LXP investigates whether language-model agents can communicate through
+          compact continuous latent states instead of exchanging natural-language
+          transcripts. The project started with an ambitious heterogeneous
+          multi-agent goal, then converged on a practical same-family MVP: train
+          a Stage-II adapter that compresses sender hidden states into an actor
+          prefix, validates that the latent carries answer information, and tests
+          whether the actor can decode the final answer directly from the latent
+          handoff. The latest local smoke run reaches <strong>100% raw actor
+          free-decode exact match</strong>, <strong>100% answer extraction</strong>,
+          and <strong>3/3 unique predicted answers</strong> on a three-sample
+          train-overfit smoke. This is not yet broad generalization, but it is a
+          functional end-to-end demonstration of latent handoff instrumentation,
+          training, evaluation gates, and collapse diagnosis.
+        </p>
+      </section>
+    </header>
+
+    <main>
+      <section>
+        <h2>1. Problem and Insight</h2>
+        <p>
+          Multi-agent language-model systems usually communicate by emitting text.
+          Text is inspectable, but it is also slow, lossy, and constrained by the
+          vocabulary interface. A model may internally represent a useful partial
+          solution as high-dimensional activations, then spend many tokens
+          translating that state into natural language before another model
+          re-embeds the text into a new latent space. LXP asks whether that
+          round-trip can be shortened by passing structured latent states directly.
+        </p>
+        <p>
+          The central hypothesis is modest but useful: before attempting fully
+          heterogeneous transfer, a same-family latent handoff should be made
+          mechanically reliable, diagnostically observable, and empirically gated.
+          If the actor cannot recover answers from a compatible latent prefix,
+          cross-family alignment has no stable target. The project therefore
+          shifted from broad model-pair ambition to a high-signal MVP that isolates
+          baseline generation, latent semantic content, adapter training, and raw
+          actor decoding.
+        </p>
+      </section>
+
+      <section>
+        <h2>2. System Architecture</h2>
+        <p>
+          The current implementation separates latent transfer into five surfaces:
+          model-pair compatibility preflight, sender hidden-state extraction,
+          latent compression/alignment, actor-prefix injection, and evaluation
+          diagnostics. The architecture avoids treating a single accuracy number
+          as proof of success. Instead, it asks where the information exists, how
+          it is decoded, and whether the decoded answer is non-degenerate.
+        </p>
+
+        <div class="figure">
+          <svg class="diagram-svg" viewBox="0 0 1120 420" role="img" aria-label="LXP architecture diagram">
+            <defs>
+              <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"></path>
+              </marker>
+              <linearGradient id="latent" x1="0" x2="1" y1="0" y2="1">
+                <stop stop-color="#dbeafe" offset="0"></stop>
+                <stop stop-color="#ccfbf1" offset="1"></stop>
+              </linearGradient>
+            </defs>
+            <rect x="28" y="58" width="190" height="86" rx="8" fill="#eff6ff" stroke="#b9cef8"></rect>
+            <text x="123" y="90" text-anchor="middle" font-family="Arial" font-size="18" font-weight="700">Prompt</text>
+            <text x="123" y="116" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">GSM-style answer task</text>
+
+            <rect x="292" y="42" width="220" height="118" rx="8" fill="#eef2ff" stroke="#c7d2fe"></rect>
+            <text x="402" y="76" text-anchor="middle" font-family="Arial" font-size="18" font-weight="700">Agent A</text>
+            <text x="402" y="101" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">Qwen3.5-0.8B reasoner</text>
+            <text x="402" y="124" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">hidden state trajectory</text>
+
+            <rect x="588" y="38" width="228" height="126" rx="8" fill="url(#latent)" stroke="#99f6e4"></rect>
+            <text x="702" y="72" text-anchor="middle" font-family="Arial" font-size="18" font-weight="700">Stage-II Handoff</text>
+            <text x="702" y="98" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">hybrid affine adapter</text>
+            <text x="702" y="121" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">8 compressed latent steps</text>
+            <text x="702" y="144" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">logit steering + stop control</text>
+
+            <rect x="902" y="42" width="214" height="118" rx="8" fill="#ecfdf5" stroke="#bbf7d0"></rect>
+            <text x="1009" y="76" text-anchor="middle" font-family="Arial" font-size="18" font-weight="700">Agent B</text>
+            <text x="1009" y="101" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">Qwen3.5-0.8B actor</text>
+            <text x="1009" y="124" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">raw final-answer decode</text>
+
+            <path d="M218 101 H292" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"></path>
+            <path d="M512 101 H588" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"></path>
+            <path d="M816 101 H902" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"></path>
+
+            <rect x="84" y="252" width="214" height="76" rx="8" fill="#fff7ed" stroke="#fed7aa"></rect>
+            <text x="191" y="283" text-anchor="middle" font-family="Arial" font-size="16" font-weight="700">Baseline Text</text>
+            <text x="191" y="306" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">checks actor is not broken</text>
+
+            <rect x="374" y="230" width="220" height="120" rx="8" fill="#f8fafc" stroke="#cbd5e1"></rect>
+            <text x="484" y="263" text-anchor="middle" font-family="Arial" font-size="16" font-weight="700">Latent Diagnostics</text>
+            <text x="484" y="287" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">probe accuracy</text>
+            <text x="484" y="309" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">semantic readout</text>
+            <text x="484" y="331" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">candidate fallback</text>
+
+            <rect x="668" y="230" width="230" height="120" rx="8" fill="#fdf2f8" stroke="#fbcfe8"></rect>
+            <text x="783" y="263" text-anchor="middle" font-family="Arial" font-size="16" font-weight="700">Failure Isolation</text>
+            <text x="783" y="287" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">actor collapse</text>
+            <text x="783" y="309" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">extraction brittleness</text>
+            <text x="783" y="331" text-anchor="middle" font-family="Arial" font-size="13" fill="#526070">token decoder weakness</text>
+
+            <path d="M1009 160 C1009 204, 942 242, 898 269" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrow)"></path>
+            <path d="M702 164 C673 202, 600 221, 544 236" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrow)"></path>
+            <path d="M402 160 C349 206, 285 236, 235 255" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrow)"></path>
+          </svg>
+          <p class="caption">
+            Figure 1. LXP architecture used for the final local smoke: a sender
+            hidden-state trajectory is compressed into a short latent prefix,
+            adapted into the actor interface, and evaluated through baseline,
+            probe, semantic readout, and raw decode surfaces.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>3. Implementation Contributions</h2>
+        <p>
+          The project produced a working codebase rather than a single notebook.
+          Major improvements included preflight compatibility checks, smoke
+          report hardening, semantic evaluation, local Apple Silicon training, raw
+          actor decode gating, and collapse diagnostics. The most important
+          engineering change was moving away from vague "accuracy is zero" reports
+          and toward separate instrumentation for each possible failure point.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Implemented Capability</th>
+              <th>Why It Matters</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Model compatibility</td>
+              <td>Preflight reports layer count, cache topology, hidden size, heads, KV heads, and transfer status.</td>
+              <td>Prevents impossible cross-model KV transfers from being mistaken for training failures.</td>
+            </tr>
+            <tr>
+              <td>Evaluation rigor</td>
+              <td>Reports now distinguish extraction rate, exact match, unique predicted answers, baseline quality, probe accuracy, and raw decode readiness.</td>
+              <td>Degenerate repeated answers can no longer pass silently as apparent progress.</td>
+            </tr>
+            <tr>
+              <td>Training path</td>
+              <td>Mac MPS Stage-II smoke runner with adapter answer NLL, first-token objective, logit steering, and early stopping.</td>
+              <td>Allows local iteration when external GPU capacity is unavailable.</td>
+            </tr>
+            <tr>
+              <td>Actor collapse fix</td>
+              <td>Raw decode can stop after steered answer tokens and use latent semantic readout only for answer length control.</td>
+              <td>Prevents untrained tail generation from corrupting otherwise correct latent-to-actor handoffs.</td>
+            </tr>
+            <tr>
+              <td>Reporting</td>
+              <td>Static HTML reports and demo pages with charts, diagrams, diagnostics, and limitations.</td>
+              <td>Makes the artifact understandable and visually provable for reviewers.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>4. Experimental Setup</h2>
+        <p>
+          The latest reported experiment is a local Stage-II training smoke with
+          <code>Qwen/Qwen3.5-0.8B</code> as both sender and actor. It uses
+          <code>hybrid_affine</code> alignment, <code>250</code> semantic anchors,
+          <code>8</code> compressed latent steps, <code>float32</code> execution on
+          MPS, and a three-sample smoke dataset. The run was intentionally small
+          because the immediate goal was to debug latent-interface correctness
+          before spending cloud compute on broader training.
+        </p>
+
+        <div class="grid three-col">
+          <div class="metric">
+            <h4>Model Pair</h4>
+            <div class="metric-value">0.8B→0.8B</div>
+            <p>Same-family Qwen3.5 sender and actor for the final local MVP.</p>
+          </div>
+          <div class="metric">
+            <h4>Latent Length</h4>
+            <div class="metric-value">8</div>
+            <p>Compressed latent handoff steps passed into the actor path.</p>
+          </div>
+          <div class="metric">
+            <h4>Eval Samples</h4>
+            <div class="metric-value warn">3</div>
+            <p>Train-overfit smoke; useful for interface proof, not generalization.</p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>5. Results</h2>
+        <p>
+          The final smoke passed the training smoke gate and reached raw actor
+          decode readiness. The broader Phase-II gate remains intentionally
+          blocked because the run is marked as smoke mode, uses one seed instead
+          of the required three, and does not compute production retention against
+          a real baseline benchmark.
+        </p>
+
+        <div class="figure">
+          <h3>Final Metric Summary</h3>
+          <div class="bar-chart">
+            <div class="bar-row">
+              <div class="bar-label">Raw actor free decode exact match</div>
+              <div class="track"><div class="fill" style="--value: 100%"></div></div>
+              <strong>100%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Raw actor answer extraction</div>
+              <div class="track"><div class="fill" style="--value: 100%"></div></div>
+              <strong>100%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Latent semantic readout</div>
+              <div class="track"><div class="fill" style="--value: 100%"></div></div>
+              <strong>100%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Latent answer probe</div>
+              <div class="track"><div class="fill" style="--value: 100%"></div></div>
+              <strong>100%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Actor text baseline</div>
+              <div class="track"><div class="fill" style="--value: 100%"></div></div>
+              <strong>100%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Latent candidate fallback</div>
+              <div class="track"><div class="fill warn" style="--value: 33.33%"></div></div>
+              <strong>33%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Actor semantic bridge decode</div>
+              <div class="track"><div class="fill bad" style="--value: 0%"></div></div>
+              <strong>0%</strong>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label">Latent token decoder</div>
+              <div class="track"><div class="fill bad" style="--value: 0%"></div></div>
+              <strong>off</strong>
+            </div>
+          </div>
+          <p class="caption">
+            Figure 2. Final smoke metrics from
+            <code>/private/tmp/lxp_mps_raw_decode_length_stop_batch3_e30/mac_mps_training_report.json</code>.
+            The winning final path is raw actor decode with latent stop control,
+            not the disabled latent token decoder or bridge decoder.
+          </p>
+        </div>
+
+        <div class="figure">
+          <h3>Raw Decode Learning Curve</h3>
+          <div class="spark-bars" aria-label="Raw decode exact match by epoch">
+            <div class="spark zero" style="--value: 4px" data-label="pretrain: 0%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 0: 0%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 1: 0%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 2: 33.33%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 3: 33.33%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 4: 0%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 5: 33.33%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 6: 66.67%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 7: 33.33%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 8: 0%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 9: 0%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 10: 0%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 11: 33.33%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 12: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 13: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 14: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 15: 66.67%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 16: 0%"></div>
+            <div class="spark zero" style="--value: 4px" data-label="epoch 17: 0%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 18: 33.33%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 19: 33.33%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 20: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 21: 66.67%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 22: 33.33%"></div>
+            <div class="spark warn" style="--value: 33.33%" data-label="epoch 23: 33.33%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 24: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 25: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 26: 66.67%"></div>
+            <div class="spark" style="--value: 66.67%" data-label="epoch 27: 66.67%"></div>
+            <div class="spark ready" style="--value: 100%" data-label="epoch 28: 100%"></div>
+          </div>
+          <p class="caption">
+            Figure 3. Raw actor exact-match accuracy over the local Stage-II smoke.
+            The curve shows why the final result is meaningful: the initial raw
+            actor path was degenerate, partial improvements appeared during
+            training, and the readiness gate triggered only when exact match,
+            extraction, and non-degeneracy all held.
+          </p>
+        </div>
+
+        <div class="figure">
+          <h3>Decoded Examples</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Target Answer</th>
+                <th>Raw Latent Actor Decode</th>
+                <th>Semantic Readout</th>
+                <th>Actor Text Baseline</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>4</td>
+                <td><code>Final answer: 4</code></td>
+                <td>4</td>
+                <td><code>Final answer: 4</code></td>
+                <td class="ok">correct</td>
+              </tr>
+              <tr>
+                <td>42</td>
+                <td><code>Final answer: 42</code></td>
+                <td>42</td>
+                <td><code>Final answer: 42</code></td>
+                <td class="ok">correct</td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td><code>Final answer: 5</code></td>
+                <td>5</td>
+                <td><code>Final answer: 5</code></td>
+                <td class="ok">correct</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="caption">
+            Figure 4. Final diagnostics show parseable, non-degenerate answers
+            matching the baseline actor on all smoke examples.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>6. Ablations and Failure Analysis</h2>
+        <p>
+          The project uncovered several failure modes that are useful research
+          results in their own right. First, the initial raw actor path repeatedly
+          produced the same answer token. This meant the latent injection path
+          was not enough by itself; the evaluation had to distinguish latent
+          semantic availability from raw actor decode quality. Second, answer
+          extraction was initially too brittle, so outputs that were semantically
+          usable could be reported as failures. Third, heterogeneous KV transfer
+          was not a training problem: some model pairs were structurally
+          incompatible because their layer counts and cache topologies differed.
+        </p>
+
+        <div class="grid two-col">
+          <div class="claim-box">
+            <h4>Fixed or Improved</h4>
+            <ul>
+              <li>Baseline actor degeneration was isolated from latent handoff failures.</li>
+              <li>Answer extraction now reports extraction rate separately from exact match.</li>
+              <li>Raw decode readiness requires exact answers and non-degenerate predictions.</li>
+              <li>Untrained tail generation no longer invalidates steered raw answer tokens.</li>
+              <li>Compatibility checks avoid impossible KV-transfer expectations.</li>
+            </ul>
+          </div>
+          <div class="claim-box">
+            <h4>Still Open</h4>
+            <ul>
+              <li>Three-sample smoke is not evidence of broad held-out generalization.</li>
+              <li>Heterogeneous family transfer remains a future work item.</li>
+              <li>Direct latent token decoder is not the winning current path.</li>
+              <li>Multi-seed real benchmark retention has not yet been completed.</li>
+              <li>Large-scale cloud training is still needed for production-level claims.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>7. Model-Pair Compatibility Findings</h2>
+        <p>
+          A major result was recognizing that model-pair selection is not a minor
+          hyperparameter. Direct KV transfer is only meaningful when the sender
+          and receiver have compatible cache structures. The project therefore
+          added config-only compatibility preflight before full weight loading.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Pair</th>
+              <th>Predicted Compatibility</th>
+              <th>Interpretation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Qwen3.5-0.8B → EXAONE-4.0-1.2B</td>
+              <td class="blocked">incompatible</td>
+              <td>Layer-count/cache mismatch; keep as a later cross-family alignment benchmark, not first MVP.</td>
+            </tr>
+            <tr>
+              <td>Qwen3.5-2B → Qwen3.5-0.8B</td>
+              <td class="ok">predicted compatible</td>
+              <td>Better same-family path for a stronger thinker and cheaper actor once compute is available.</td>
+            </tr>
+            <tr>
+              <td>Qwen3-1.7B → Qwen3-0.6B</td>
+              <td class="ok">predicted compatible</td>
+              <td>Fallback same-family path with matching cache topology in preflight tests.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>8. Discussion</h2>
+        <p>
+          The most important lesson is that latent transfer cannot be evaluated
+          only by final answer accuracy. A system can fail because the sender did
+          not solve the task, because the latent has no answer information,
+          because the adapter loses geometry, because the actor cannot condition
+          on the prefix, because the text decoder collapses, or because the answer
+          parser is brittle. LXP now contains enough instrumentation to separate
+          these cases.
+        </p>
+        <p>
+          The final local smoke result is best interpreted as an interface proof.
+          It demonstrates that the code can train a latent handoff, verify answer
+          information inside the latent, and produce exact parseable actor text
+          on a small controlled set. The result does not yet prove that latent
+          transfer beats token-context transfer or generalizes across tasks. The
+          next decisive experiment is a locked held-out benchmark comparing
+          token-context handoff, verified token-context handoff, sender-answer
+          text handoff, and generated-context latent handoff under the same
+          manifest.
+        </p>
+      </section>
+
+      <section>
+        <h2>9. Conclusion</h2>
+        <p>
+          LXP produced a substantial functional artifact: a latent transfer
+          training and evaluation system with compatibility preflight, local MPS
+          training, raw actor decode, semantic probes, failure diagnostics, and
+          visual reports. The strongest empirical outcome is a 100% same-family
+          raw latent-to-actor decode smoke on three examples with 100% answer
+          extraction and non-degenerate predictions. The honest next step is to
+          scale this path to locked held-out multi-seed evaluations and benchmark
+          it directly against pure token-to-token context transfer before
+          re-opening heterogeneous model-family transfer.
+        </p>
+      </section>
+
+      <section>
+        <h2>Appendix A. Reproducibility Commands</h2>
+        <p>The final raw decode smoke was run with:</p>
+        <p>
+          <code>venv/bin/python scripts/mac_mps_stage2_smoke.py --execute --allow-cpu-fallback --eval-on-train --full-decode-eval --epochs 30 --smoke-samples 3 --batch-size 3 --compressed-steps 8 --max-length 64 --output-dir /private/tmp/lxp_mps_raw_decode_length_stop_batch3_e30</code>
+        </p>
+        <p>Fast unit gate used during development:</p>
+        <p><code>venv/bin/python -m pytest -q</code></p>
+        <p class="small">
+          Source files of interest:
+          <a href="../train_compressor.py">train_compressor.py</a>,
+          <a href="../run_training.py">run_training.py</a>,
+          <a href="../scripts/mac_mps_stage2_smoke.py">scripts/mac_mps_stage2_smoke.py</a>,
+          <a href="../src/utils/benchmarking.py">src/utils/benchmarking.py</a>,
+          <a href="../src/utils/lm_eval.py">src/utils/lm_eval.py</a>,
+          <a href="../src/utils/model_compat.py">src/utils/model_compat.py</a>.
+        </p>
+      </section>
+
+      <section>
+        <h2>Appendix B. Claims and Disclosure</h2>
+        <div class="grid two-col">
+          <div class="claim-box">
+            <h4>Supported Claims</h4>
+            <ul>
+              <li>The codebase implements a working same-family latent handoff smoke.</li>
+              <li>The final local smoke reaches 100% exact raw actor decode on 3 examples.</li>
+              <li>The project includes diagnostics for extraction, collapse, probes, and compatibility.</li>
+              <li>The implementation demonstrates meaningful iteration from failures to a passing smoke.</li>
+            </ul>
+          </div>
+          <div class="claim-box">
+            <h4>Unsupported Claims</h4>
+            <ul>
+              <li>It does not yet prove broad benchmark superiority over token context.</li>
+              <li>It does not yet solve heterogeneous model-family latent transfer.</li>
+              <li>It does not yet establish multi-seed production reliability.</li>
+              <li>It should not be presented as a finished protocol for arbitrary models.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="small">
+          AI usage disclosure: AI assistance was used as a coding and debugging
+          collaborator for implementation, triage, documentation, and presentation
+          drafting. The project direction, grading constraints, and final
+          submission framing were supplied by the author.
+        </p>
+      </section>
+    </main>
+  </article>
+</body>
+</html>

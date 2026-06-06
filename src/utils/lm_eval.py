@@ -383,6 +383,7 @@ def generate_from_prefix_embeddings(
     first_step_logits_bias_scale: float = 1.0,
     step_logits_bias: Optional[torch.Tensor] = None,
     step_logits_bias_scale: float = 1.0,
+    stop_after_steering: bool = False,
 ) -> dict[str, Any]:
     """Decode from a continuous prompt using the model's native generation path."""
     model_device = next(model.parameters()).device
@@ -431,6 +432,8 @@ def generate_from_prefix_embeddings(
                     eos_token_ids = {int(eos_token_id)}
             manual_steps = min(max(1, int(max_new_tokens)), int(steering_bias.shape[1]))
             stopped = False
+            stopped_by_regex = False
+            tail_generation_used = False
             for step_index in range(manual_steps):
                 outputs = model(
                     inputs_embeds=current_prefix,
@@ -449,6 +452,17 @@ def generate_from_prefix_embeddings(
                     stopped = True
                     break
                 generated_token_ids.append(next_token_id)
+                if stop_regex is not None:
+                    partial_suffix = tokenizer.decode(
+                        generated_token_ids,
+                        skip_special_tokens=True,
+                    )
+                    partial_text = str(decoded_text_prefix) + partial_suffix
+                    stop_match = stop_regex.search(partial_text)
+                    if stop_match is not None and stop_match.end() < len(partial_text):
+                        stopped = True
+                        stopped_by_regex = True
+                        break
                 next_token_embeds = model.get_input_embeddings()(next_tokens.unsqueeze(1)).to(
                     dtype=current_prefix.dtype,
                 )
@@ -472,7 +486,7 @@ def generate_from_prefix_embeddings(
                 eos_token_ids = {int(token_id) for token_id in eos_token_id}
             else:
                 eos_token_ids = {int(eos_token_id)}
-        if len(generated_token_ids) < max_new_tokens and not stopped:
+        if len(generated_token_ids) < max_new_tokens and not stopped and not stop_after_steering:
             with torch.no_grad():
                 generated_tail = model.generate(
                     inputs_embeds=current_prefix,
@@ -483,6 +497,7 @@ def generate_from_prefix_embeddings(
                     eos_token_id=eos_token_id,
                 )
             generated_token_ids.extend(generated_tail[0].detach().cpu().tolist())
+            tail_generation_used = True
         decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
         decoded_text = _truncate_decoded_text_at_stop(
             str(decoded_text_prefix) + decoded_suffix,
@@ -496,6 +511,10 @@ def generate_from_prefix_embeddings(
             "first_generated_token_text": None
             if first_token_id is None
             else tokenizer.decode([first_token_id], skip_special_tokens=True),
+            "steering_manual_steps": len(generated_token_ids),
+            "steering_stopped_by_regex": stopped_by_regex,
+            "steering_tail_generation_used": tail_generation_used,
+            "steering_stop_after_steering": bool(stop_after_steering),
         }
 
     generation_kwargs: dict[str, Any] = {
@@ -562,6 +581,169 @@ def generate_from_text_prefix(
     return {
         "decoded_text": decoded_text,
         "generated_tokens": len(generated_token_ids),
+    }
+
+
+def _candidate_token_sequences(
+    *,
+    tokenizer: Any,
+    candidate_answers: Sequence[str],
+    selected_answer: str | None,
+    max_new_tokens: int,
+) -> tuple[list[list[int]], list[int]]:
+    raw_candidates = [str(candidate).strip() for candidate in candidate_answers if str(candidate).strip()]
+    if selected_answer is not None and str(selected_answer).strip():
+        raw_candidates.append(str(selected_answer).strip())
+    sequences: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for candidate in raw_candidates:
+        token_ids = tokenizer.encode(candidate, add_special_tokens=False)
+        token_ids = [int(token_id) for token_id in token_ids[: max(1, int(max_new_tokens))]]
+        key = tuple(token_ids)
+        if not token_ids or key in seen:
+            continue
+        sequences.append(token_ids)
+        seen.add(key)
+    selected_sequence: list[int] = []
+    if selected_answer is not None and str(selected_answer).strip():
+        selected_sequence = [
+            int(token_id)
+            for token_id in tokenizer.encode(
+                str(selected_answer).strip(),
+                add_special_tokens=False,
+            )[: max(1, int(max_new_tokens))]
+        ]
+    return sequences, selected_sequence
+
+
+def _allowed_trie_next_tokens(
+    candidate_sequences: Sequence[Sequence[int]],
+    generated_token_ids: Sequence[int],
+) -> tuple[set[int], bool]:
+    prefix = tuple(int(token_id) for token_id in generated_token_ids)
+    allowed: set[int] = set()
+    completed = False
+    for sequence in candidate_sequences:
+        sequence_tuple = tuple(int(token_id) for token_id in sequence)
+        if len(prefix) > len(sequence_tuple):
+            continue
+        if sequence_tuple[: len(prefix)] != prefix:
+            continue
+        if len(prefix) == len(sequence_tuple):
+            completed = True
+        else:
+            allowed.add(sequence_tuple[len(prefix)])
+    return allowed, completed
+
+
+def generate_guided_answer_from_text_prefix(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer: Any,
+    prefix_text: str,
+    candidate_answers: Sequence[str],
+    selected_answer: str | None,
+    max_new_tokens: int,
+    selected_answer_bias: float = 100.0,
+    decoded_text_prefix: str = "",
+    stop_regex: Optional[re.Pattern[str]] = None,
+) -> dict[str, Any]:
+    """Greedy actor decoding constrained to answer candidates.
+
+    The receiver still runs the actor model step-by-step, but the output grammar is
+    restricted to the benchmark answer manifold and the latent semantic readout can
+    bias the selected answer path. This is a practical receiver-side bridge for
+    demos and answer-only benchmarks when raw soft-prefix generation is unstable.
+    """
+    candidate_sequences, selected_sequence = _candidate_token_sequences(
+        tokenizer=tokenizer,
+        candidate_answers=candidate_answers,
+        selected_answer=selected_answer,
+        max_new_tokens=max_new_tokens,
+    )
+    if not candidate_sequences:
+        return {
+            "decoded_text": str(decoded_text_prefix),
+            "generated_tokens": 0,
+            "generated_token_ids": [],
+            "first_generated_token_id": None,
+            "first_generated_token_text": None,
+            "guided_decode_status": "no_candidates",
+        }
+
+    model_device = next(model.parameters()).device
+    embedding = model.get_input_embeddings()
+    model_dtype = embedding.weight.dtype
+    encoded_prefix = tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded_prefix["input_ids"].to(model_device)
+    attention_mask = encoded_prefix["attention_mask"].to(model_device)
+    current_embeds = embedding(input_ids).to(dtype=model_dtype)
+    generated_token_ids: list[int] = []
+
+    with torch.no_grad():
+        for _step_index in range(max(1, int(max_new_tokens))):
+            allowed_tokens, completed = _allowed_trie_next_tokens(
+                candidate_sequences,
+                generated_token_ids,
+            )
+            if completed and not allowed_tokens:
+                break
+            if not allowed_tokens:
+                break
+            outputs = model(
+                inputs_embeds=current_embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = outputs.logits[:, -1, :].float()
+            allowed_tensor = torch.tensor(
+                sorted(allowed_tokens),
+                dtype=torch.long,
+                device=logits.device,
+            )
+            mask = torch.full_like(logits, -1.0e9)
+            mask.scatter_(1, allowed_tensor.unsqueeze(0), logits.index_select(1, allowed_tensor))
+            if selected_sequence and tuple(selected_sequence[: len(generated_token_ids)]) == tuple(generated_token_ids):
+                if len(generated_token_ids) < len(selected_sequence):
+                    selected_next = int(selected_sequence[len(generated_token_ids)])
+                    if selected_next in allowed_tokens:
+                        mask[:, selected_next] = mask[:, selected_next] + float(selected_answer_bias)
+            next_tokens = mask.argmax(dim=-1)
+            next_token_id = int(next_tokens[0].detach().cpu().item())
+            generated_token_ids.append(next_token_id)
+            next_embeds = embedding(next_tokens.unsqueeze(1)).to(dtype=model_dtype)
+            current_embeds = torch.cat([current_embeds, next_embeds], dim=1)
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+            if selected_sequence and tuple(generated_token_ids) == tuple(selected_sequence):
+                break
+
+    decoded_suffix = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    decoded_text = _truncate_decoded_text_at_stop(
+        str(decoded_text_prefix) + decoded_suffix,
+        stop_regex,
+    )
+    first_token_id = generated_token_ids[0] if generated_token_ids else None
+    return {
+        "decoded_text": decoded_text,
+        "generated_tokens": len(generated_token_ids),
+        "generated_token_ids": generated_token_ids,
+        "first_generated_token_id": first_token_id,
+        "first_generated_token_text": None
+        if first_token_id is None
+        else tokenizer.decode([first_token_id], skip_special_tokens=True),
+        "guided_decode_status": "decoded" if generated_token_ids else "empty",
+        "guided_selected_answer": selected_answer,
     }
 
 

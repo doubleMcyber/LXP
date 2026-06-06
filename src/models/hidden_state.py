@@ -360,6 +360,14 @@ class LatentLogitSteeringHead(nn.Module):
     ) -> torch.Tensor:
         return self.forward_sequence(hidden_states, vocabulary_weight, output_steps=1)[:, 0, :]
 
+class LatentTokenDecoderHead(LatentLogitSteeringHead):
+    """Direct answer-token decoder over the actor tokenizer vocabulary.
+
+    This shares the low-rank vocabulary projection machinery used by logit steering,
+    but its logits are interpreted as the decoded answer sequence rather than as a
+    bias added to the actor's autoregressive logits.
+    """
+
 
 class LatentSequenceDecoderHead(nn.Module):
     """Cheap latent-to-answer-token decoder with an explicit stop length."""
