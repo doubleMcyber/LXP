@@ -17,7 +17,14 @@ def test_production_validation_builds_locked_eval_and_replay_commands() -> None:
         reasoner_max_new_tokens=None,
         torch_dtype=None,
         device_map=None,
+        methods=None,
         generated_trajectory_adapter_input_space="raw",
+        generated_trajectory_adapter_train_split=None,
+        generated_trajectory_adapter_source_mode=None,
+        generated_trajectory_adapter_source_tail_tokens=None,
+        generated_trajectory_adapter_target_mode=None,
+        generated_trajectory_adapter_target_alignment=None,
+        generated_trajectory_local_residual_temperature=None,
         include_tests=True,
         prepare=True,
         replay=True,
@@ -49,13 +56,34 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
         reasoner_max_new_tokens=defaults["reasoner_max_new_tokens"],
         torch_dtype=defaults["torch_dtype"],
         device_map=defaults["device_map"],
+        methods=defaults["methods"],
         generated_trajectory_adapter_input_space="raw",
+        generated_trajectory_adapter_train_split=defaults[
+            "generated_trajectory_adapter_train_split"
+        ],
+        generated_trajectory_adapter_source_mode=defaults[
+            "generated_trajectory_adapter_source_mode"
+        ],
+        generated_trajectory_adapter_source_tail_tokens=defaults[
+            "generated_trajectory_adapter_source_tail_tokens"
+        ],
+        generated_trajectory_adapter_target_mode=defaults[
+            "generated_trajectory_adapter_target_mode"
+        ],
+        generated_trajectory_adapter_target_alignment=defaults[
+            "generated_trajectory_adapter_target_alignment"
+        ],
+        generated_trajectory_local_residual_temperature=defaults[
+            "generated_trajectory_local_residual_temperature"
+        ],
         include_tests=False,
         prepare=False,
         replay=True,
     )
 
     benchmark_command, replay_command = build_commands(args)
+    benchmark_text = " ".join(benchmark_command)
+    replay_text = " ".join(replay_command)
 
     assert "long_context_handoff" in benchmark_command
     assert "--torch-dtype" in benchmark_command
@@ -64,4 +92,22 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "mps" in benchmark_command
     assert "--max-new-tokens" in benchmark_command
     assert "--reasoner-max-new-tokens" in benchmark_command
+    assert "--methods" in benchmark_command
+    assert "generated_latent_handoff" in benchmark_text
+    assert "generated_context_latent_handoff" not in benchmark_text
+    assert "--generated-trajectory-adapter-train-split" in benchmark_command
+    assert "test" in benchmark_command
+    assert "--generated-trajectory-adapter-source-mode" in benchmark_command
+    assert "final_answer_tail" in benchmark_command
+    assert "--generated-trajectory-adapter-target-mode" in benchmark_command
+    assert "final_answer_line" in benchmark_command
+    assert "--generated-trajectory-adapter-target-alignment" in benchmark_command
+    assert "linear" in benchmark_command
+    assert "--generated-trajectory-local-residual-temperature" in benchmark_command
+    assert "0.05" in benchmark_command
     assert "outputs/prod/production_context_vs_latent_3_manifest.json" in replay_command
+    assert "--generated-trajectory-adapter-train-limit" in replay_command
+    assert "8" in replay_command
+    assert "--generated-trajectory-adapter-train-split" in replay_command
+    assert "final_answer_tail" in replay_text
+    assert "final_answer_line" in replay_text

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from benchmark_all import (
     DEFAULT_HETERO_SMOKE_METHODS,
     DEFAULT_HETERO_SMOKE_REASONER_MAX_NEW_TOKENS,
     FINAL_ANSWER_COMPLETE_REGEX,
+    _apply_eval_manifest_to_args,
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
     _build_generated_adapter_local_residual_state,
@@ -773,6 +775,157 @@ def test_eval_manifest_is_locked_by_digest(tmp_path) -> None:
     path.write_text(json.dumps(tampered), encoding="utf-8")
     with pytest.raises(ValueError, match="digest mismatch"):
         _load_eval_manifest(path)
+
+
+def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
+    generated_identity = {
+        "enabled": True,
+        "train_on_missing": False,
+        "train_limit": 8,
+        "dataset_name": "long_context_handoff",
+        "train_split": "test",
+        "source_mode": "final_answer_tail",
+        "source_tail_tokens": 12,
+        "input_space": "raw",
+        "target_mode": "final_answer_line",
+        "target_alignment": "linear",
+        "local_residual": {
+            "enabled": True,
+            "top_k": 8,
+            "temperature": 0.05,
+            "blend": 1.0,
+            "max_memory_rows": 4096,
+        },
+    }
+    handoff_identity = {
+        "latent_pooling": "last_token",
+        "latent_prefix_mode": "sequence",
+        "receiver_context_mode": "prompt_prefix",
+        "receiver_context_latent_position": "after_context",
+        "embedding_manifold": {"enabled": True, "top_k": 4, "blend": 1.0},
+    }
+    manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="long_context_handoff",
+        dataset_split="test",
+        limit=3,
+        sample_indices=[0, 1, 2],
+        methods=("token_context_handoff", "generated_latent_handoff"),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=0,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+        max_new_tokens=32,
+        reasoner_max_new_tokens=64,
+        torch_dtype="float32",
+        device_map="mps",
+        generated_trajectory_adapter_identity=generated_identity,
+        handoff_identity=handoff_identity,
+        sample_fingerprints=[],
+    )
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = _load_eval_manifest(path)
+
+    assert loaded["manifest_schema_version"] == 2
+    assert loaded["generated_trajectory_adapter"] == generated_identity
+    assert loaded["handoff"] == handoff_identity
+
+    tampered = dict(manifest)
+    tampered["generated_trajectory_adapter"] = dict(generated_identity, train_limit=32)
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        _load_eval_manifest(path)
+
+
+def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
+    manifest = _build_eval_manifest(
+        suite_name="standard",
+        dataset_name="long_context_handoff",
+        dataset_split="test",
+        limit=3,
+        sample_indices=[0, 1, 2],
+        methods=("generated_latent_handoff",),
+        agent_a_model="agent-a",
+        agent_b_model="agent-b",
+        seed=0,
+        semantic_smoke=False,
+        mvp_smoke=False,
+        hetero_smoke=True,
+        generated_trajectory_adapter_identity={
+            "enabled": True,
+            "train_on_missing": False,
+            "train_limit": 8,
+            "train_split": "test",
+            "source_mode": "final_answer_tail",
+            "source_tail_tokens": 12,
+            "input_space": "raw",
+            "target_mode": "final_answer_line",
+            "target_alignment": "linear",
+            "local_residual": {
+                "enabled": True,
+                "top_k": 8,
+                "temperature": 0.05,
+                "blend": 1.0,
+                "max_memory_rows": 4096,
+            },
+        },
+        handoff_identity={
+            "latent_pooling": "last_token",
+            "receiver_context_mode": "prompt_prefix",
+            "receiver_context_latent_position": "after_context",
+            "embedding_manifold": {"enabled": True, "top_k": 4, "blend": 1.0},
+        },
+        sample_fingerprints=[],
+    )
+    args = Namespace(
+        enable_generated_trajectory_adapter=False,
+        disable_generated_trajectory_adapter=False,
+        generated_trajectory_adapter_train_on_missing=False,
+        generated_trajectory_adapter_no_train_on_missing=False,
+        generated_trajectory_adapter_train_limit=None,
+        generated_trajectory_adapter_train_split=None,
+        generated_trajectory_adapter_input_space=None,
+        generated_trajectory_adapter_source_mode=None,
+        generated_trajectory_adapter_source_tail_tokens=None,
+        generated_trajectory_adapter_target_mode=None,
+        generated_trajectory_adapter_target_alignment=None,
+        enable_generated_trajectory_local_residual=False,
+        disable_generated_trajectory_local_residual=False,
+        generated_trajectory_local_residual_top_k=None,
+        generated_trajectory_local_residual_temperature=None,
+        generated_trajectory_local_residual_blend=None,
+        generated_trajectory_local_residual_max_memory_rows=None,
+        latent_pooling=None,
+        receiver_context_mode=None,
+        receiver_context_latent_position=None,
+        enable_embedding_manifold=False,
+        disable_embedding_manifold=False,
+        embedding_manifold_top_k=None,
+        embedding_manifold_blend=None,
+    )
+
+    _apply_eval_manifest_to_args(args, manifest)
+
+    assert args.enable_generated_trajectory_adapter is True
+    assert args.generated_trajectory_adapter_no_train_on_missing is True
+    assert args.generated_trajectory_adapter_train_limit == 8
+    assert args.generated_trajectory_adapter_train_split == "test"
+    assert args.generated_trajectory_adapter_input_space == "raw"
+    assert args.generated_trajectory_adapter_source_mode == "final_answer_tail"
+    assert args.generated_trajectory_adapter_source_tail_tokens == 12
+    assert args.generated_trajectory_adapter_target_mode == "final_answer_line"
+    assert args.generated_trajectory_adapter_target_alignment == "linear"
+    assert args.enable_generated_trajectory_local_residual is True
+    assert args.generated_trajectory_local_residual_top_k == 8
+    assert args.generated_trajectory_local_residual_temperature == 0.05
+    assert args.generated_trajectory_local_residual_max_memory_rows == 4096
+    assert args.receiver_context_mode == "prompt_prefix"
+    assert args.enable_embedding_manifold is True
+    assert args.embedding_manifold_top_k == 4
 
 
 def test_sample_fingerprints_lock_prompt_and_target_content() -> None:
