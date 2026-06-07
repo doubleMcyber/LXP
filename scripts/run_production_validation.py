@@ -14,6 +14,13 @@ DEFAULT_METHODS = (
     "generated_context_latent_handoff",
 )
 
+LONG_CONTEXT_METHODS = (
+    "token_context_handoff",
+    "verified_token_context_handoff",
+    "sender_answer_text_handoff",
+    "generated_latent_handoff",
+)
+
 
 PROFILE_DEFAULTS = {
     "local": {
@@ -24,6 +31,13 @@ PROFILE_DEFAULTS = {
         "reasoner_max_new_tokens": None,
         "torch_dtype": None,
         "device_map": None,
+        "methods": DEFAULT_METHODS,
+        "generated_trajectory_adapter_train_split": None,
+        "generated_trajectory_adapter_source_mode": None,
+        "generated_trajectory_adapter_source_tail_tokens": None,
+        "generated_trajectory_adapter_target_mode": None,
+        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_local_residual_temperature": None,
     },
     "mps": {
         "dataset": "gsm8k",
@@ -33,6 +47,13 @@ PROFILE_DEFAULTS = {
         "reasoner_max_new_tokens": 640,
         "torch_dtype": "float32",
         "device_map": "mps",
+        "methods": DEFAULT_METHODS,
+        "generated_trajectory_adapter_train_split": None,
+        "generated_trajectory_adapter_source_mode": None,
+        "generated_trajectory_adapter_source_tail_tokens": None,
+        "generated_trajectory_adapter_target_mode": None,
+        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_local_residual_temperature": None,
     },
     "long_context_mps": {
         "dataset": "long_context_handoff",
@@ -42,6 +63,13 @@ PROFILE_DEFAULTS = {
         "reasoner_max_new_tokens": 64,
         "torch_dtype": "float32",
         "device_map": "mps",
+        "methods": LONG_CONTEXT_METHODS,
+        "generated_trajectory_adapter_train_split": "test",
+        "generated_trajectory_adapter_source_mode": "final_answer_tail",
+        "generated_trajectory_adapter_source_tail_tokens": 12,
+        "generated_trajectory_adapter_target_mode": "final_answer_line",
+        "generated_trajectory_adapter_target_alignment": "linear",
+        "generated_trajectory_local_residual_temperature": 0.05,
     },
     "gpu": {
         "dataset": "gsm8k",
@@ -51,6 +79,13 @@ PROFILE_DEFAULTS = {
         "reasoner_max_new_tokens": None,
         "torch_dtype": None,
         "device_map": None,
+        "methods": DEFAULT_METHODS,
+        "generated_trajectory_adapter_train_split": None,
+        "generated_trajectory_adapter_source_mode": None,
+        "generated_trajectory_adapter_source_tail_tokens": None,
+        "generated_trajectory_adapter_target_mode": None,
+        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_local_residual_temperature": None,
     },
     "scale": {
         "dataset": "gsm8k",
@@ -60,6 +95,13 @@ PROFILE_DEFAULTS = {
         "reasoner_max_new_tokens": None,
         "torch_dtype": None,
         "device_map": None,
+        "methods": DEFAULT_METHODS,
+        "generated_trajectory_adapter_train_split": None,
+        "generated_trajectory_adapter_source_mode": None,
+        "generated_trajectory_adapter_source_tail_tokens": None,
+        "generated_trajectory_adapter_target_mode": None,
+        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_local_residual_temperature": None,
     },
 }
 
@@ -96,6 +138,48 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
         str(args.train_limit),
         "--enable-sender-revision",
     ]
+    if getattr(args, "generated_trajectory_adapter_train_split", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-train-split",
+                args.generated_trajectory_adapter_train_split,
+            ]
+        )
+    if getattr(args, "generated_trajectory_adapter_source_mode", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-source-mode",
+                args.generated_trajectory_adapter_source_mode,
+            ]
+        )
+    if getattr(args, "generated_trajectory_adapter_source_tail_tokens", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-source-tail-tokens",
+                str(args.generated_trajectory_adapter_source_tail_tokens),
+            ]
+        )
+    if getattr(args, "generated_trajectory_adapter_target_mode", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-target-mode",
+                args.generated_trajectory_adapter_target_mode,
+            ]
+        )
+    if getattr(args, "generated_trajectory_adapter_target_alignment", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-target-alignment",
+                args.generated_trajectory_adapter_target_alignment,
+            ]
+        )
+    if getattr(args, "generated_trajectory_local_residual_temperature", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-local-residual-temperature",
+                str(args.generated_trajectory_local_residual_temperature),
+            ]
+        )
     if args.max_new_tokens is not None:
         command.extend(["--max-new-tokens", str(args.max_new_tokens)])
     if args.reasoner_max_new_tokens is not None:
@@ -108,7 +192,13 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
 
 
 def build_commands(args: argparse.Namespace) -> list[list[str]]:
-    methods_csv = ",".join(DEFAULT_METHODS)
+    methods = tuple(getattr(args, "methods", None) or DEFAULT_METHODS)
+    methods_csv = ",".join(methods)
+    generated_methods_csv = ",".join(
+        method for method in methods if method.startswith("generated_")
+    )
+    if not generated_methods_csv:
+        generated_methods_csv = "generated_latent_handoff"
     manifest_path = _with_output_dir(
         args,
         f"production_context_vs_latent_{args.eval_limit}_manifest.json",
@@ -124,7 +214,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
                 "benchmark_all.py",
                 *_common_hetero_args(args),
                 "--methods",
-                "generated_context_latent_handoff",
+                generated_methods_csv,
                 "--prepare-generated-trajectory-eval-traces",
                 "--report-output",
                 _with_output_dir(
@@ -139,7 +229,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
                 "benchmark_all.py",
                 *_common_hetero_args(args),
                 "--methods",
-                "generated_context_latent_handoff",
+                generated_methods_csv,
                 "--prepare-generated-trajectory-adapter",
                 "--report-output",
                 _with_output_dir(
@@ -172,21 +262,9 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
             [
                 *_python_command(args),
                 "benchmark_all.py",
+                *_common_hetero_args(args),
                 "--eval-manifest",
                 manifest_path,
-                "--generated-trajectory-adapter-input-space",
-                args.generated_trajectory_adapter_input_space,
-                *(
-                    ["--torch-dtype", args.torch_dtype]
-                    if args.torch_dtype is not None
-                    else []
-                ),
-                *(
-                    ["--device-map", args.device_map]
-                    if args.device_map is not None
-                    else []
-                ),
-                "--enable-sender-revision",
                 "--generated-trajectory-adapter-no-train-on-missing",
                 "--report-output",
                 _with_output_dir(
@@ -274,11 +352,34 @@ def main() -> int:
     parser.add_argument("--reasoner-max-new-tokens", type=int, default=None)
     parser.add_argument("--torch-dtype", choices=("float32", "float16", "bfloat16"), default=None)
     parser.add_argument("--device-map", default=None)
+    parser.add_argument("--methods", default=None)
     parser.add_argument(
         "--generated-trajectory-adapter-input-space",
         choices=("raw", "aligned"),
         default="raw",
     )
+    parser.add_argument("--generated-trajectory-adapter-train-split", default=None)
+    parser.add_argument(
+        "--generated-trajectory-adapter-source-mode",
+        choices=("generated_text", "final_answer_tail"),
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-adapter-source-tail-tokens",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-adapter-target-mode",
+        choices=("generated_text", "final_answer_line"),
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-adapter-target-alignment",
+        choices=("character", "linear"),
+        default=None,
+    )
+    parser.add_argument("--generated-trajectory-local-residual-temperature", type=float, default=None)
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--replay", action="store_true")
@@ -303,6 +404,35 @@ def main() -> int:
         args.torch_dtype = defaults["torch_dtype"]
     if args.device_map is None:
         args.device_map = defaults["device_map"]
+    args.methods = tuple(
+        method.strip()
+        for method in str(args.methods or ",".join(defaults["methods"])).split(",")
+        if method.strip()
+    )
+    if args.generated_trajectory_adapter_train_split is None:
+        args.generated_trajectory_adapter_train_split = defaults[
+            "generated_trajectory_adapter_train_split"
+        ]
+    if args.generated_trajectory_adapter_source_mode is None:
+        args.generated_trajectory_adapter_source_mode = defaults[
+            "generated_trajectory_adapter_source_mode"
+        ]
+    if args.generated_trajectory_adapter_source_tail_tokens is None:
+        args.generated_trajectory_adapter_source_tail_tokens = defaults[
+            "generated_trajectory_adapter_source_tail_tokens"
+        ]
+    if args.generated_trajectory_adapter_target_mode is None:
+        args.generated_trajectory_adapter_target_mode = defaults[
+            "generated_trajectory_adapter_target_mode"
+        ]
+    if args.generated_trajectory_adapter_target_alignment is None:
+        args.generated_trajectory_adapter_target_alignment = defaults[
+            "generated_trajectory_adapter_target_alignment"
+        ]
+    if args.generated_trajectory_local_residual_temperature is None:
+        args.generated_trajectory_local_residual_temperature = defaults[
+            "generated_trajectory_local_residual_temperature"
+        ]
     args.include_tests = not args.skip_tests
     args.prepare = not args.skip_prepare
 

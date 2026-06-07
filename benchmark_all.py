@@ -133,7 +133,7 @@ DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
 DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
     "generated_latent_handoff",
 )
-EVAL_MANIFEST_SCHEMA_VERSION = 1
+EVAL_MANIFEST_SCHEMA_VERSION = 2
 ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
 TEXT_BASELINE_METHODS = frozenset(
     (
@@ -1079,6 +1079,8 @@ def _build_eval_manifest(
     reasoner_max_new_tokens: Optional[int] = None,
     torch_dtype: Optional[str] = None,
     device_map: Optional[str] = None,
+    generated_trajectory_adapter_identity: Optional[Mapping[str, Any]] = None,
+    handoff_identity: Optional[Mapping[str, Any]] = None,
     sample_fingerprints: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     fingerprint_rows = [dict(row) for row in (sample_fingerprints or ())]
@@ -1099,6 +1101,12 @@ def _build_eval_manifest(
         ),
         "torch_dtype": None if torch_dtype is None else str(torch_dtype),
         "device_map": None if device_map is None else str(device_map),
+        "generated_trajectory_adapter": (
+            None
+            if generated_trajectory_adapter_identity is None
+            else dict(generated_trajectory_adapter_identity)
+        ),
+        "handoff": None if handoff_identity is None else dict(handoff_identity),
         "smoke_profile": {
             "semantic_smoke": bool(semantic_smoke),
             "mvp_smoke": bool(mvp_smoke),
@@ -1116,7 +1124,8 @@ def _load_eval_manifest(path: Path) -> dict[str, Any]:
         manifest = json.load(handle)
     if not isinstance(manifest, dict):
         raise ValueError(f"Eval manifest must be a JSON object: {path}")
-    if int(manifest.get("manifest_schema_version", 0)) != EVAL_MANIFEST_SCHEMA_VERSION:
+    schema_version = int(manifest.get("manifest_schema_version", 0))
+    if schema_version < 1 or schema_version > EVAL_MANIFEST_SCHEMA_VERSION:
         raise ValueError(
             "Unsupported eval manifest schema version: "
             f"{manifest.get('manifest_schema_version')}"
@@ -1171,6 +1180,84 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
         args.torch_dtype = str(manifest["torch_dtype"])
     if manifest.get("device_map") is not None:
         args.device_map = str(manifest["device_map"])
+    generated_adapter = manifest.get("generated_trajectory_adapter")
+    if isinstance(generated_adapter, Mapping):
+        if generated_adapter.get("enabled") is not None:
+            if bool(generated_adapter.get("enabled")):
+                args.enable_generated_trajectory_adapter = True
+                args.disable_generated_trajectory_adapter = False
+            else:
+                args.disable_generated_trajectory_adapter = True
+                args.enable_generated_trajectory_adapter = False
+        if generated_adapter.get("train_on_missing") is not None:
+            if bool(generated_adapter.get("train_on_missing")):
+                args.generated_trajectory_adapter_train_on_missing = True
+                args.generated_trajectory_adapter_no_train_on_missing = False
+            else:
+                args.generated_trajectory_adapter_no_train_on_missing = True
+                args.generated_trajectory_adapter_train_on_missing = False
+        if generated_adapter.get("train_limit") is not None:
+            args.generated_trajectory_adapter_train_limit = int(generated_adapter["train_limit"])
+        if generated_adapter.get("train_split") is not None:
+            args.generated_trajectory_adapter_train_split = str(generated_adapter["train_split"])
+        if generated_adapter.get("input_space") is not None:
+            args.generated_trajectory_adapter_input_space = str(generated_adapter["input_space"])
+        if generated_adapter.get("source_mode") is not None:
+            args.generated_trajectory_adapter_source_mode = str(generated_adapter["source_mode"])
+        if generated_adapter.get("source_tail_tokens") is not None:
+            args.generated_trajectory_adapter_source_tail_tokens = int(
+                generated_adapter["source_tail_tokens"]
+            )
+        if generated_adapter.get("target_mode") is not None:
+            args.generated_trajectory_adapter_target_mode = str(generated_adapter["target_mode"])
+        if generated_adapter.get("target_alignment") is not None:
+            args.generated_trajectory_adapter_target_alignment = str(
+                generated_adapter["target_alignment"]
+            )
+        local_residual = generated_adapter.get("local_residual")
+        if isinstance(local_residual, Mapping):
+            if local_residual.get("enabled") is not None:
+                if bool(local_residual.get("enabled")):
+                    args.enable_generated_trajectory_local_residual = True
+                    args.disable_generated_trajectory_local_residual = False
+                else:
+                    args.disable_generated_trajectory_local_residual = True
+                    args.enable_generated_trajectory_local_residual = False
+            if local_residual.get("top_k") is not None:
+                args.generated_trajectory_local_residual_top_k = int(local_residual["top_k"])
+            if local_residual.get("temperature") is not None:
+                args.generated_trajectory_local_residual_temperature = float(
+                    local_residual["temperature"]
+                )
+            if local_residual.get("blend") is not None:
+                args.generated_trajectory_local_residual_blend = float(local_residual["blend"])
+            if local_residual.get("max_memory_rows") is not None:
+                args.generated_trajectory_local_residual_max_memory_rows = int(
+                    local_residual["max_memory_rows"]
+                )
+    handoff = manifest.get("handoff")
+    if isinstance(handoff, Mapping):
+        if handoff.get("latent_pooling") is not None:
+            args.latent_pooling = str(handoff["latent_pooling"])
+        if handoff.get("receiver_context_mode") is not None:
+            args.receiver_context_mode = str(handoff["receiver_context_mode"])
+        if handoff.get("receiver_context_latent_position") is not None:
+            args.receiver_context_latent_position = str(
+                handoff["receiver_context_latent_position"]
+            )
+        embedding_manifold = handoff.get("embedding_manifold")
+        if isinstance(embedding_manifold, Mapping):
+            if embedding_manifold.get("enabled") is not None:
+                if bool(embedding_manifold.get("enabled")):
+                    args.enable_embedding_manifold = True
+                    args.disable_embedding_manifold = False
+                else:
+                    args.disable_embedding_manifold = True
+                    args.enable_embedding_manifold = False
+            if embedding_manifold.get("top_k") is not None:
+                args.embedding_manifold_top_k = int(embedding_manifold["top_k"])
+            if embedding_manifold.get("blend") is not None:
+                args.embedding_manifold_blend = float(embedding_manifold["blend"])
     smoke_profile = manifest.get("smoke_profile") or {}
     args.semantic_smoke = bool(smoke_profile.get("semantic_smoke", False))
     args.mvp_smoke = bool(smoke_profile.get("mvp_smoke", False))
@@ -2034,6 +2121,44 @@ def _generated_trajectory_adapter_training_rows_cache_key(
         _generated_trajectory_adapter_target_alignment(cfg),
         _generated_trajectory_adapter_input_space(cfg),
     )
+
+
+def _generated_trajectory_adapter_identity_manifest(cfg: Any) -> dict[str, Any]:
+    """Resolved generated-adapter identity fields that must survive replay."""
+    return {
+        "enabled": _generated_trajectory_adapter_enabled(cfg),
+        "train_on_missing": _generated_trajectory_adapter_train_on_missing(cfg),
+        "train_limit": _generated_trajectory_adapter_train_limit(cfg),
+        "dataset_name": _generated_trajectory_adapter_dataset_name(cfg),
+        "train_split": _generated_trajectory_adapter_train_split(cfg),
+        "source_mode": _generated_trajectory_adapter_source_mode(cfg),
+        "source_tail_tokens": _generated_trajectory_adapter_source_tail_tokens(cfg),
+        "input_space": _generated_trajectory_adapter_input_space(cfg),
+        "target_mode": _generated_trajectory_adapter_target_mode(cfg),
+        "target_alignment": _generated_trajectory_adapter_target_alignment(cfg),
+        "local_residual": {
+            "enabled": _generated_trajectory_adapter_local_residual_enabled(cfg),
+            "top_k": _generated_trajectory_adapter_local_residual_top_k(cfg),
+            "temperature": _generated_trajectory_adapter_local_residual_temperature(cfg),
+            "blend": _generated_trajectory_adapter_local_residual_blend(cfg),
+            "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(cfg),
+        },
+    }
+
+
+def _handoff_identity_manifest(cfg: Any) -> dict[str, Any]:
+    embedding_cfg = getattr(getattr(cfg, "handoff", None), "embedding_manifold", None)
+    return {
+        "latent_pooling": _latent_pooling_mode(cfg),
+        "latent_prefix_mode": _latent_prefix_mode(cfg),
+        "receiver_context_mode": _receiver_context_mode(cfg),
+        "receiver_context_latent_position": _receiver_context_latent_position(cfg),
+        "embedding_manifold": {
+            "enabled": bool(getattr(embedding_cfg, "enabled", False)),
+            "top_k": int(getattr(embedding_cfg, "top_k", 1)),
+            "blend": float(getattr(embedding_cfg, "blend", 1.0)),
+        },
+    }
 
 
 def _receiver_embedding_sequence_for_text(
@@ -4508,6 +4633,7 @@ def _configured_base_cfg(
     generated_trajectory_adapter_enabled: Optional[bool] = None,
     generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
     generated_trajectory_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
@@ -4515,6 +4641,7 @@ def _configured_base_cfg(
     generated_trajectory_adapter_target_mode: Optional[str] = None,
     generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
     generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     embedding_manifold_enabled: Optional[bool] = None,
@@ -4574,6 +4701,10 @@ def _configured_base_cfg(
         base_cfg.handoff.generated_trajectory_adapter.train_limit = int(
             generated_trajectory_adapter_train_limit
         )
+    if generated_trajectory_adapter_train_split is not None:
+        base_cfg.handoff.generated_trajectory_adapter.train_split = str(
+            generated_trajectory_adapter_train_split
+        )
     if generated_trajectory_adapter_input_space is not None:
         base_cfg.handoff.generated_trajectory_adapter.input_space = str(
             generated_trajectory_adapter_input_space
@@ -4601,6 +4732,10 @@ def _configured_base_cfg(
     if generated_trajectory_adapter_local_residual_top_k is not None:
         base_cfg.handoff.generated_trajectory_adapter.local_residual.top_k = int(
             generated_trajectory_adapter_local_residual_top_k
+        )
+    if generated_trajectory_adapter_local_residual_temperature is not None:
+        base_cfg.handoff.generated_trajectory_adapter.local_residual.temperature = float(
+            generated_trajectory_adapter_local_residual_temperature
         )
     if generated_trajectory_adapter_local_residual_blend is not None:
         base_cfg.handoff.generated_trajectory_adapter.local_residual.blend = float(
@@ -4733,6 +4868,7 @@ def run_benchmark(
     generated_trajectory_adapter_enabled: Optional[bool] = None,
     generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
     generated_trajectory_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
@@ -4740,6 +4876,7 @@ def run_benchmark(
     generated_trajectory_adapter_target_mode: Optional[str] = None,
     generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
     generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     embedding_manifold_enabled: Optional[bool] = None,
@@ -4776,6 +4913,7 @@ def run_benchmark(
         generated_trajectory_adapter_enabled=generated_trajectory_adapter_enabled,
         generated_trajectory_adapter_train_on_missing=generated_trajectory_adapter_train_on_missing,
         generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
+        generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
@@ -4786,6 +4924,9 @@ def run_benchmark(
         ),
         generated_trajectory_adapter_local_residual_top_k=(
             generated_trajectory_adapter_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_temperature=(
+            generated_trajectory_adapter_local_residual_temperature
         ),
         generated_trajectory_adapter_local_residual_blend=(
             generated_trajectory_adapter_local_residual_blend
@@ -4866,6 +5007,12 @@ def run_benchmark(
         reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
         torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
         device_map=str(getattr(suite_cfg, "device_map", "")),
+        generated_trajectory_adapter_identity=(
+            _generated_trajectory_adapter_identity_manifest(suite_cfg)
+            if any(name in GENERATED_LATENT_METHODS for name in report_method_names)
+            else None
+        ),
+        handoff_identity=_handoff_identity_manifest(suite_cfg),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -5472,6 +5619,7 @@ def run_benchmark(
                 )
             ),
             "train_on_missing": _generated_trajectory_adapter_train_on_missing(base_cfg),
+            "train_split": _generated_trajectory_adapter_train_split(base_cfg),
             "training_rows_cache_dir": str(
                 _generated_trajectory_adapter_training_rows_cache_dir(base_cfg)
             ),
@@ -5516,6 +5664,7 @@ def run_benchmark(
             "local_residual": {
                 "enabled": _generated_trajectory_adapter_local_residual_enabled(base_cfg),
                 "top_k": _generated_trajectory_adapter_local_residual_top_k(base_cfg),
+                "temperature": _generated_trajectory_adapter_local_residual_temperature(base_cfg),
                 "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
                 "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
             },
@@ -5567,6 +5716,7 @@ def prepare_generated_trajectory_adapter_cache(
     prompt_calibration_max_norm_ratio: Optional[float] = None,
     generated_trajectory_adapter_train_on_missing: Optional[bool] = None,
     generated_trajectory_adapter_train_limit: Optional[int] = None,
+    generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
@@ -5574,6 +5724,7 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_target_mode: Optional[str] = None,
     generated_trajectory_adapter_local_residual_enabled: Optional[bool] = None,
     generated_trajectory_adapter_local_residual_top_k: Optional[int] = None,
+    generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
     sender_revision_enabled: Optional[bool] = None,
@@ -5605,6 +5756,7 @@ def prepare_generated_trajectory_adapter_cache(
         generated_trajectory_adapter_enabled=True,
         generated_trajectory_adapter_train_on_missing=generated_trajectory_adapter_train_on_missing,
         generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
+        generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
@@ -5615,6 +5767,9 @@ def prepare_generated_trajectory_adapter_cache(
         ),
         generated_trajectory_adapter_local_residual_top_k=(
             generated_trajectory_adapter_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_temperature=(
+            generated_trajectory_adapter_local_residual_temperature
         ),
         generated_trajectory_adapter_local_residual_blend=(
             generated_trajectory_adapter_local_residual_blend
@@ -5681,6 +5836,12 @@ def prepare_generated_trajectory_adapter_cache(
         reasoner_max_new_tokens=_reasoner_generation_max_new_tokens(suite_cfg),
         torch_dtype=str(getattr(suite_cfg, "torch_dtype", "")),
         device_map=str(getattr(suite_cfg, "device_map", "")),
+        generated_trajectory_adapter_identity=(
+            _generated_trajectory_adapter_identity_manifest(suite_cfg)
+            if any(name in GENERATED_LATENT_METHODS for name in report_method_names)
+            else None
+        ),
+        handoff_identity=_handoff_identity_manifest(suite_cfg),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -5793,6 +5954,7 @@ def prepare_generated_trajectory_adapter_cache(
             "enabled": _generated_trajectory_adapter_enabled(base_cfg),
             "train_on_missing": _generated_trajectory_adapter_train_on_missing(base_cfg),
             "train_limit": _generated_trajectory_adapter_train_limit(base_cfg),
+            "train_split": _generated_trajectory_adapter_train_split(base_cfg),
             "cache_dir": str(_generated_trajectory_adapter_cache_dir(base_cfg)),
             "training_rows_cache_dir": str(
                 _generated_trajectory_adapter_training_rows_cache_dir(base_cfg)
@@ -5806,6 +5968,7 @@ def prepare_generated_trajectory_adapter_cache(
             "local_residual": {
                 "enabled": _generated_trajectory_adapter_local_residual_enabled(base_cfg),
                 "top_k": _generated_trajectory_adapter_local_residual_top_k(base_cfg),
+                "temperature": _generated_trajectory_adapter_local_residual_temperature(base_cfg),
                 "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
                 "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
             },
@@ -6028,6 +6191,11 @@ def main() -> None:
         help="Optional override for handoff.generated_trajectory_adapter.train_limit.",
     )
     parser.add_argument(
+        "--generated-trajectory-adapter-train-split",
+        default=None,
+        help="Optional override for handoff.generated_trajectory_adapter.train_split.",
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-input-space",
         choices=tuple(sorted(GENERATED_TRAJECTORY_ADAPTER_INPUT_SPACES)),
         default=None,
@@ -6078,6 +6246,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Optional override for handoff.generated_trajectory_adapter.local_residual.top_k.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-local-residual-temperature",
+        type=float,
+        default=None,
+        help="Optional override for handoff.generated_trajectory_adapter.local_residual.temperature.",
     )
     parser.add_argument(
         "--generated-trajectory-local-residual-blend",
@@ -6314,6 +6488,7 @@ def main() -> None:
                 else None
             ),
             generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
+            generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
             generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
             generated_trajectory_adapter_target_alignment=(
                 args.generated_trajectory_adapter_target_alignment
@@ -6332,6 +6507,9 @@ def main() -> None:
             ),
             generated_trajectory_adapter_local_residual_top_k=(
                 args.generated_trajectory_local_residual_top_k
+            ),
+            generated_trajectory_adapter_local_residual_temperature=(
+                args.generated_trajectory_local_residual_temperature
             ),
             generated_trajectory_adapter_local_residual_blend=(
                 args.generated_trajectory_local_residual_blend
@@ -6428,6 +6606,7 @@ def main() -> None:
             else None
         ),
         generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
+        generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_target_alignment=args.generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=args.generated_trajectory_adapter_source_mode,
@@ -6444,6 +6623,9 @@ def main() -> None:
         ),
         generated_trajectory_adapter_local_residual_top_k=(
             args.generated_trajectory_local_residual_top_k
+        ),
+        generated_trajectory_adapter_local_residual_temperature=(
+            args.generated_trajectory_local_residual_temperature
         ),
         generated_trajectory_adapter_local_residual_blend=(
             args.generated_trajectory_local_residual_blend
