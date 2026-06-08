@@ -2739,10 +2739,12 @@ def _load_or_train_generated_trajectory_adapter_state(
         print(f"Wrote generated trajectory adapter cache: {cache_path}", flush=True)
     if adapter_state is None:
         info = {
-            "enabled": False,
+            "enabled": True,
             "status": "missing",
             "cache_hit": False,
             "cache_path": str(cache_path),
+            "adapter_cache_key": _cache_key_metadata(cache_key),
+            "adapter_cache_key_digest": _cache_key_digest(cache_key),
             "state": None,
         }
     else:
@@ -4025,6 +4027,143 @@ def _run_generated_latent_variant(
         include_prompt=include_prompt,
     )
     generated_adapter_state = generated_adapter_info.get("state")
+    generated_adapter_input_space = _generated_trajectory_adapter_input_space(variant_cfg)
+    generated_adapter_report = bool(
+        generated_adapter_info.get("enabled") or generated_adapter_info.get("status") != "disabled"
+    )
+    if _generated_trajectory_adapter_enabled(variant_cfg) and generated_adapter_state is None:
+        latent_trajectory_steps = int(handoff_source.shape[1])
+        return {
+            "decoded_text": "",
+            "generated_tokens": 0,
+            "receiver_input_token_count": latent_trajectory_steps,
+            "decode_status": "generated_trajectory_adapter_missing",
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+            "alignment_mode": method_alignment_mode,
+            "alignment_strategy": "hybrid_affine",
+            "handoff_status": "generated_trajectory_adapter_missing",
+            "handoff_surface": "generated_hidden_sequence_input_embedding",
+            "kv_cache_transferred": False,
+            "kv_cache_status": "not_provided",
+            "kv_cache_reason": "no_cache_provided",
+            "active_kv_cache_transferred": False,
+            "active_kv_cache_status": "not_provided",
+            "active_kv_cache_reason": "no_cache_provided",
+            "active_kv_cache_source": "none",
+            "receiver_context_status": "not_used",
+            "receiver_context_reason": "latent_only",
+            "receiver_context_token_count": 0,
+            "receiver_context_latent_position": "not_applicable",
+            "alignment_residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+            "alignment_bias_norm": alignment_state.get("bias_norm"),
+            "anchor_reconstruction_mse": variant_state.get(
+                "handoff_anchor_reconstruction_mse",
+                variant_state.get("anchor_reconstruction_mse"),
+            ),
+            "anchor_pairwise_distance_distortion": variant_state.get(
+                "handoff_anchor_pairwise_distance_distortion",
+                variant_state.get("anchor_pairwise_distance_distortion"),
+            ),
+            "anchor_cosine_structure_error": variant_state.get(
+                "handoff_anchor_cosine_structure_error",
+                variant_state.get("anchor_cosine_structure_error"),
+            ),
+            "pre_alignment_l2_distance": None,
+            "pre_alignment_cosine_distance": None,
+            "post_alignment_l2_distance": None,
+            "post_alignment_cosine_distance": None,
+            "prompt_calibration_enabled": False,
+            "prompt_calibration_bias_norm": None,
+            "handoff_adapter_enabled": True,
+            "handoff_adapter_status": (
+                f"generated_trajectory_{generated_adapter_info.get('status')}_"
+                f"{generated_adapter_input_space}"
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_status")
+            ),
+            "handoff_adapter_applied": False,
+            "handoff_adapter_delta_norm": None,
+            "handoff_adapter_cache_hit": generated_adapter_info.get("cache_hit"),
+            "handoff_adapter_cache_path": generated_adapter_info.get("cache_path"),
+            "handoff_adapter_cache_key_digest": generated_adapter_info.get(
+                "adapter_cache_key_digest"
+            ),
+            "handoff_adapter_training_prompt_count": generated_adapter_info.get(
+                "training_prompt_count"
+            ),
+            "handoff_adapter_training_token_count": generated_adapter_info.get(
+                "training_token_count"
+            ),
+            "handoff_adapter_training_row_cache_hit": generated_adapter_info.get(
+                "training_row_cache_hit"
+            ),
+            "handoff_adapter_training_row_cache_path": generated_adapter_info.get(
+                "training_row_cache_path"
+            ),
+            "handoff_adapter_training_rows_cache_key_digest": generated_adapter_info.get(
+                "training_rows_cache_key_digest"
+            ),
+            "handoff_adapter_training_trace_cache_hit_count": generated_adapter_info.get(
+                "training_trace_cache_hit_count"
+            ),
+            "handoff_adapter_training_trace_cache_miss_count": generated_adapter_info.get(
+                "training_trace_cache_miss_count"
+            ),
+            "handoff_adapter_training_trace_cache_hit_rate_percentage": generated_adapter_info.get(
+                "training_trace_cache_hit_rate_percentage"
+            ),
+            "handoff_adapter_training_reconstruction_mse": generated_adapter_info.get(
+                "training_reconstruction_mse"
+            ),
+            "handoff_adapter_training_mean_cosine_similarity": generated_adapter_info.get(
+                "training_mean_cosine_similarity"
+            ),
+            "generated_adapter_local_residual_applied": False,
+            "generated_adapter_local_residual_delta_norm": None,
+            "generated_adapter_local_residual_mean_top_similarity": None,
+            "generated_adapter_local_residual_memory_rows": None,
+            "embedding_manifold_enabled": bool(
+                getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
+            ),
+            "embedding_manifold_applied": False,
+            "embedding_manifold_delta_norm": None,
+            "embedding_manifold_mean_top_similarity": None,
+            "embedding_manifold_unique_token_count": None,
+            "raw_handoff_entropy": None,
+            "handoff_uncertainty": None,
+            "confidence_gate_triggered": False,
+            "fallback_discrete_reasoning_steps": 0,
+            "latent_trajectory_steps": latent_trajectory_steps,
+            "total_reasoning_steps": latent_trajectory_steps,
+            "continuous_integration_seconds": 0.0,
+            "global_alignment_cache_hit": variant_state["global_alignment_cache_hit"],
+            "_row_cfg": variant_cfg,
+            "_row_state": variant_state,
+            "sender_reasoning_text": sender_state["generated_reasoning_text"],
+            "sender_reasoning_token_count": sender_state["generated_reasoning_token_count"],
+            "sender_reasoning_status": sender_state["generated_reasoning_status"],
+            "sender_trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
+            "sender_trace_cache_path": sender_state.get("generated_trace_cache_path"),
+            "sender_final_answer_marker": sender_state[
+                "generated_reasoning_final_answer_marker"
+            ],
+            "sender_revision_enabled": sender_state.get("sender_revision_enabled"),
+            "sender_revision_applied": sender_state.get("sender_revision_applied"),
+            "sender_initial_predicted_answer": sender_state.get(
+                "sender_initial_predicted_answer"
+            ),
+            "sender_revision_predicted_answer": sender_state.get(
+                "sender_revision_predicted_answer"
+            ),
+            "sender_revision_decision_applied": sender_state.get(
+                "sender_revision_decision_applied"
+            ),
+            "sender_revision_decision_predicted_answer": sender_state.get(
+                "sender_revision_decision_predicted_answer"
+            ),
+        }
     generated_adapter_delta_norm: Optional[float] = None
     generated_adapter_local_residual_metrics = {
         "generated_adapter_local_residual_applied": False,
@@ -4032,7 +4171,6 @@ def _run_generated_latent_variant(
         "generated_adapter_local_residual_mean_top_similarity": None,
         "generated_adapter_local_residual_memory_rows": None,
     }
-    generated_adapter_input_space = _generated_trajectory_adapter_input_space(variant_cfg)
     if generated_adapter_state is not None:
         adapter_input = (
             handoff_source
@@ -4068,9 +4206,6 @@ def _run_generated_latent_variant(
     if generic_adapter_metrics["handoff_adapter_applied"]:
         handoff_step = generic_handoff_step
     generated_adapter_applied = generated_adapter_state is not None
-    generated_adapter_report = bool(
-        generated_adapter_info.get("enabled") or generated_adapter_info.get("status") != "disabled"
-    )
     adapter_metrics = {
         "handoff_adapter_applied": bool(
             generated_adapter_applied or generic_adapter_metrics["handoff_adapter_applied"]
@@ -6547,6 +6682,22 @@ def main() -> None:
                 f"adapter_cache_hit={prepared['cache_hit']} "
                 f"row_cache_hit={prepared['training_row_cache_hit']} "
                 f"trace_hit_rate={prepared['training_trace_cache_hit_rate_percentage']}"
+            )
+        missing_adapters = [
+            prepared
+            for prepared in report_payload["prepared_adapters"]
+            if prepared.get("status") not in ("loaded", "trained")
+        ]
+        if args.prepare_generated_trajectory_adapter and missing_adapters:
+            missing_summary = ", ".join(
+                f"include_prompt={prepared.get('include_prompt')} "
+                f"status={prepared.get('status')} "
+                f"path={prepared.get('cache_path')}"
+                for prepared in missing_adapters
+            )
+            raise SystemExit(
+                "Generated trajectory adapter preparation failed: "
+                f"{missing_summary}"
             )
         prepared_eval_traces = report_payload.get("prepared_eval_traces")
         if prepared_eval_traces is not None:

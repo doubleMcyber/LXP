@@ -34,7 +34,10 @@ def test_production_validation_builds_locked_eval_and_replay_commands() -> None:
 
     assert commands[0] == ["venv/bin/python", "-B", "-m", "pytest", "-q"]
     assert any("--prepare-generated-trajectory-eval-traces" in command for command in commands)
-    assert any("--prepare-generated-trajectory-adapter" in command for command in commands)
+    prepare_adapter_command = next(
+        command for command in commands if "--prepare-generated-trajectory-adapter" in command
+    )
+    assert "--generated-trajectory-adapter-train-on-missing" in prepare_adapter_command
     benchmark_command = commands[-2]
     replay_command = commands[-1]
     assert "--generated-trajectory-adapter-no-train-on-missing" in benchmark_command

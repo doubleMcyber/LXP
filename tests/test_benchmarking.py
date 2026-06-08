@@ -43,6 +43,7 @@ from benchmark_all import (
     _load_generated_trajectory_trace_from_disk,
     _load_eval_manifest,
     _load_generated_trajectory_adapter_from_disk,
+    _load_or_train_generated_trajectory_adapter_state,
     _methods_for_suite,
     _predicted_answer,
     _sample_fingerprints,
@@ -1323,6 +1324,61 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
         state,
         include_prompt=False,
     ) != first_key
+
+
+def test_missing_generated_trajectory_adapter_reports_enabled(tmp_path) -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "agent-a",
+            "agent_b_model": "agent-b",
+            "torch_dtype": "float32",
+            "max_new_tokens": 32,
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 64,
+            },
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "enabled": True,
+                    "train_on_missing": False,
+                    "train_limit": 8,
+                    "train_split": "test",
+                    "dataset_name": "long_context_handoff",
+                    "cache_dir": str(tmp_path / "generated_adapter"),
+                    "input_space": "raw",
+                    "source_mode": "final_answer_tail",
+                    "source_tail_tokens": 12,
+                    "target_mode": "final_answer_line",
+                    "target_alignment": "linear",
+                    "strategy": "hybrid_affine",
+                    "regularization": 1e-3,
+                    "residual_alpha": 1.0,
+                    "residual_max_norm_ratio": 0.5,
+                    "center": True,
+                    "use_bias": True,
+                    "local_residual": {
+                        "enabled": True,
+                        "top_k": 8,
+                        "temperature": 0.05,
+                        "blend": 1.0,
+                        "max_memory_rows": 4096,
+                    },
+                }
+            },
+        }
+    )
+
+    info = _load_or_train_generated_trajectory_adapter_state(
+        cfg,
+        {"global_alignment_cache_key": ("alignment", 1)},
+        {},
+        include_prompt=False,
+    )
+
+    assert info["enabled"] is True
+    assert info["status"] == "missing"
+    assert info["cache_hit"] is False
+    assert info["state"] is None
 
 
 def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) -> None:

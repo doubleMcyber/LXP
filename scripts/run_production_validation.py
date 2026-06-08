@@ -231,6 +231,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
                 "--methods",
                 generated_methods_csv,
                 "--prepare-generated-trajectory-adapter",
+                "--generated-trajectory-adapter-train-on-missing",
                 "--report-output",
                 _with_output_dir(
                     args,
