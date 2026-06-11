@@ -38,6 +38,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
     },
     "mps": {
         "dataset": "gsm8k",
@@ -54,6 +57,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
     },
     "long_context_mps": {
         "dataset": "long_context_handoff",
@@ -70,6 +76,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": "final_answer_line",
         "generated_trajectory_adapter_target_alignment": "linear",
         "generated_trajectory_local_residual_temperature": 0.05,
+        "generated_trajectory_semantic_memory_enabled": True,
+        "generated_trajectory_semantic_memory_min_similarity": 0.98,
+        "generated_trajectory_semantic_memory_max_entries": 2048,
     },
     "gpu": {
         "dataset": "gsm8k",
@@ -86,6 +95,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
     },
     "scale": {
         "dataset": "gsm8k",
@@ -102,6 +114,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
     },
 }
 
@@ -178,6 +193,22 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
             [
                 "--generated-trajectory-local-residual-temperature",
                 str(args.generated_trajectory_local_residual_temperature),
+            ]
+        )
+    if getattr(args, "generated_trajectory_semantic_memory_enabled", False):
+        command.append("--enable-generated-trajectory-semantic-memory")
+    if getattr(args, "generated_trajectory_semantic_memory_min_similarity", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-semantic-memory-min-similarity",
+                str(args.generated_trajectory_semantic_memory_min_similarity),
+            ]
+        )
+    if getattr(args, "generated_trajectory_semantic_memory_max_entries", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-semantic-memory-max-entries",
+                str(args.generated_trajectory_semantic_memory_max_entries),
             ]
         )
     if args.max_new_tokens is not None:
@@ -381,6 +412,26 @@ def main() -> int:
         default=None,
     )
     parser.add_argument("--generated-trajectory-local-residual-temperature", type=float, default=None)
+    parser.add_argument(
+        "--enable-generated-trajectory-semantic-memory",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-semantic-memory",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-min-similarity",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-max-entries",
+        type=int,
+        default=None,
+    )
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--replay", action="store_true")
@@ -433,6 +484,22 @@ def main() -> int:
     if args.generated_trajectory_local_residual_temperature is None:
         args.generated_trajectory_local_residual_temperature = defaults[
             "generated_trajectory_local_residual_temperature"
+        ]
+    if args.enable_generated_trajectory_semantic_memory:
+        args.generated_trajectory_semantic_memory_enabled = True
+    elif args.disable_generated_trajectory_semantic_memory:
+        args.generated_trajectory_semantic_memory_enabled = False
+    else:
+        args.generated_trajectory_semantic_memory_enabled = defaults[
+            "generated_trajectory_semantic_memory_enabled"
+        ]
+    if args.generated_trajectory_semantic_memory_min_similarity is None:
+        args.generated_trajectory_semantic_memory_min_similarity = defaults[
+            "generated_trajectory_semantic_memory_min_similarity"
+        ]
+    if args.generated_trajectory_semantic_memory_max_entries is None:
+        args.generated_trajectory_semantic_memory_max_entries = defaults[
+            "generated_trajectory_semantic_memory_max_entries"
         ]
     args.include_tests = not args.skip_tests
     args.prepare = not args.skip_prepare

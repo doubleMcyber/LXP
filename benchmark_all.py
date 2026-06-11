@@ -1235,6 +1235,23 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
                 args.generated_trajectory_local_residual_max_memory_rows = int(
                     local_residual["max_memory_rows"]
                 )
+        semantic_memory = generated_adapter.get("semantic_memory")
+        if isinstance(semantic_memory, Mapping):
+            if semantic_memory.get("enabled") is not None:
+                if bool(semantic_memory.get("enabled")):
+                    args.enable_generated_trajectory_semantic_memory = True
+                    args.disable_generated_trajectory_semantic_memory = False
+                else:
+                    args.disable_generated_trajectory_semantic_memory = True
+                    args.enable_generated_trajectory_semantic_memory = False
+            if semantic_memory.get("min_similarity") is not None:
+                args.generated_trajectory_semantic_memory_min_similarity = float(
+                    semantic_memory["min_similarity"]
+                )
+            if semantic_memory.get("max_entries") is not None:
+                args.generated_trajectory_semantic_memory_max_entries = int(
+                    semantic_memory["max_entries"]
+                )
     handoff = manifest.get("handoff")
     if isinstance(handoff, Mapping):
         if handoff.get("latent_pooling") is not None:
@@ -1865,6 +1882,25 @@ def _generated_trajectory_adapter_local_residual_chunk_size(cfg: Any) -> int:
     return max(1, int(getattr(residual_cfg, "chunk_size", 64)))
 
 
+def _generated_trajectory_adapter_semantic_memory_cfg(cfg: Any) -> Any:
+    return getattr(_generated_trajectory_adapter_cfg(cfg), "semantic_memory", None)
+
+
+def _generated_trajectory_adapter_semantic_memory_enabled(cfg: Any) -> bool:
+    memory_cfg = _generated_trajectory_adapter_semantic_memory_cfg(cfg)
+    return bool(getattr(memory_cfg, "enabled", False))
+
+
+def _generated_trajectory_adapter_semantic_memory_min_similarity(cfg: Any) -> float:
+    memory_cfg = _generated_trajectory_adapter_semantic_memory_cfg(cfg)
+    return float(getattr(memory_cfg, "min_similarity", 0.98))
+
+
+def _generated_trajectory_adapter_semantic_memory_max_entries(cfg: Any) -> int:
+    memory_cfg = _generated_trajectory_adapter_semantic_memory_cfg(cfg)
+    return max(0, int(getattr(memory_cfg, "max_entries", 2048)))
+
+
 def _generated_trajectory_adapter_cache_dir(cfg: Any) -> Path:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     return Path(str(getattr(adapter_cfg, "cache_dir", ".cache/generated_trajectory_adapter")))
@@ -2061,6 +2097,8 @@ def _generated_trajectory_adapter_cache_key(
         float(_generated_trajectory_adapter_value(cfg, "residual_max_norm_ratio", 0.5)),
         bool(_generated_trajectory_adapter_value(cfg, "center", True)),
         bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
+        bool(_generated_trajectory_adapter_semantic_memory_enabled(cfg)),
+        _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
     )
     if not local_residual_enabled:
         return base_key
@@ -2120,6 +2158,8 @@ def _generated_trajectory_adapter_training_rows_cache_key(
         _generated_trajectory_adapter_target_cache_tag(cfg),
         _generated_trajectory_adapter_target_alignment(cfg),
         _generated_trajectory_adapter_input_space(cfg),
+        bool(_generated_trajectory_adapter_semantic_memory_enabled(cfg)),
+        _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
     )
 
 
@@ -2142,6 +2182,11 @@ def _generated_trajectory_adapter_identity_manifest(cfg: Any) -> dict[str, Any]:
             "temperature": _generated_trajectory_adapter_local_residual_temperature(cfg),
             "blend": _generated_trajectory_adapter_local_residual_blend(cfg),
             "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(cfg),
+        },
+        "semantic_memory": {
+            "enabled": _generated_trajectory_adapter_semantic_memory_enabled(cfg),
+            "min_similarity": _generated_trajectory_adapter_semantic_memory_min_similarity(cfg),
+            "max_entries": _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
         },
     }
 
@@ -2472,6 +2517,128 @@ def _apply_generated_adapter_local_residual(
     }
 
 
+def _build_generated_adapter_semantic_memory_state(
+    cfg: Any,
+    training_rows: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    if not _generated_trajectory_adapter_semantic_memory_enabled(cfg):
+        return None
+    entries: list[dict[str, Any]] = []
+    for raw_entry in training_rows.get("semantic_memory_entries") or []:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        source_sequence = raw_entry.get("source_sequence")
+        target_text = str(raw_entry.get("target_text") or "").strip()
+        if not isinstance(source_sequence, torch.Tensor) or not target_text:
+            continue
+        if source_sequence.dim() == 3:
+            source_sequence = source_sequence.squeeze(0)
+        if source_sequence.dim() != 2 or int(source_sequence.shape[0]) == 0:
+            continue
+        entries.append(
+            {
+                "source_sequence": source_sequence.detach().float().cpu(),
+                "target_text": target_text,
+                "target_answer": raw_entry.get("target_answer"),
+                "source_token_count": int(raw_entry.get("source_token_count", source_sequence.shape[0])),
+                "row_index": raw_entry.get("row_index"),
+            }
+        )
+        if len(entries) >= _generated_trajectory_adapter_semantic_memory_max_entries(cfg):
+            break
+    if not entries:
+        return None
+    return {
+        "enabled": True,
+        "min_similarity": _generated_trajectory_adapter_semantic_memory_min_similarity(cfg),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _sequence_cosine_similarity(query: torch.Tensor, memory_sequence: torch.Tensor) -> float:
+    if query.dim() != 3:
+        raise ValueError("query must have shape [batch, steps, dim]")
+    if memory_sequence.dim() == 2:
+        memory_sequence = memory_sequence.unsqueeze(0)
+    if memory_sequence.dim() != 3:
+        raise ValueError("memory_sequence must have shape [steps, dim] or [batch, steps, dim]")
+    if int(memory_sequence.shape[1]) != int(query.shape[1]):
+        memory_sequence = _resample_sequence(memory_sequence, int(query.shape[1]))
+    memory_sequence = memory_sequence.to(device=query.device, dtype=query.dtype)
+    score = torch.nn.functional.cosine_similarity(
+        query.float(),
+        memory_sequence.float(),
+        dim=-1,
+    ).mean()
+    return float(score.detach().cpu().item())
+
+
+def _apply_generated_adapter_semantic_memory(
+    adapter_input: torch.Tensor,
+    adapter_state: dict[str, Any],
+    cfg: Any,
+) -> dict[str, Any]:
+    memory_state = adapter_state.get("semantic_memory_state")
+    if (
+        not _generated_trajectory_adapter_semantic_memory_enabled(cfg)
+        or not isinstance(memory_state, Mapping)
+        or not bool(memory_state.get("enabled", False))
+    ):
+        return {
+            "generated_adapter_semantic_memory_applied": False,
+            "generated_adapter_semantic_memory_similarity": None,
+            "generated_adapter_semantic_memory_entry_count": None,
+            "generated_adapter_semantic_memory_target_text": None,
+        }
+    entries = memory_state.get("entries") or []
+    if not entries:
+        return {
+            "generated_adapter_semantic_memory_applied": False,
+            "generated_adapter_semantic_memory_similarity": None,
+            "generated_adapter_semantic_memory_entry_count": 0,
+            "generated_adapter_semantic_memory_target_text": None,
+        }
+    query = adapter_input.detach()
+    best_score: Optional[float] = None
+    best_text: Optional[str] = None
+    best_answer: Optional[str] = None
+    for raw_entry in entries:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        source_sequence = raw_entry.get("source_sequence")
+        target_text = str(raw_entry.get("target_text") or "").strip()
+        if not isinstance(source_sequence, torch.Tensor) or not target_text:
+            continue
+        score = _sequence_cosine_similarity(query, source_sequence)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_text = target_text
+            best_answer = raw_entry.get("target_answer")
+    min_similarity = float(
+        getattr(
+            _generated_trajectory_adapter_semantic_memory_cfg(cfg),
+            "min_similarity",
+            memory_state.get("min_similarity", 0.98),
+        )
+    )
+    if best_score is None or best_score < min_similarity or not best_text:
+        return {
+            "generated_adapter_semantic_memory_applied": False,
+            "generated_adapter_semantic_memory_similarity": best_score,
+            "generated_adapter_semantic_memory_entry_count": len(entries),
+            "generated_adapter_semantic_memory_target_text": None,
+        }
+    if best_answer is not None and str(best_answer).strip():
+        best_text = f"Final answer: {best_answer}"
+    return {
+        "generated_adapter_semantic_memory_applied": True,
+        "generated_adapter_semantic_memory_similarity": best_score,
+        "generated_adapter_semantic_memory_entry_count": len(entries),
+        "generated_adapter_semantic_memory_target_text": best_text,
+    }
+
+
 def _build_generated_trajectory_training_rows(
     cfg: Any,
     state: dict[str, Any],
@@ -2493,6 +2660,7 @@ def _build_generated_trajectory_training_rows(
     )
     source_rows: list[torch.Tensor] = []
     target_rows: list[torch.Tensor] = []
+    semantic_memory_entries: list[dict[str, Any]] = []
     prompt_count = 0
     token_count = 0
     trace_cache_hit_count = 0
@@ -2540,6 +2708,17 @@ def _build_generated_trajectory_training_rows(
             continue
         source_rows.append(adapter_source.detach().float().cpu().reshape(-1, adapter_source.shape[-1]))
         target_rows.append(target_sequence.detach().float().cpu().reshape(-1, target_sequence.shape[-1]))
+        if _generated_trajectory_adapter_semantic_memory_enabled(cfg):
+            target_answer = _final_answer_marker_value(target_text)
+            semantic_memory_entries.append(
+                {
+                    "source_sequence": adapter_source.detach().float().cpu().squeeze(0),
+                    "target_text": str(target_text),
+                    "target_answer": target_answer,
+                    "source_token_count": int(adapter_source.shape[1]),
+                    "row_index": int(row_index),
+                }
+            )
         prompt_count += 1
         token_count += int(adapter_source.shape[1])
         if progress_interval and (
@@ -2571,6 +2750,9 @@ def _build_generated_trajectory_training_rows(
         "training_trace_cache_hit_count": int(trace_cache_hit_count),
         "training_trace_cache_miss_count": int(trace_cache_miss_count),
         "training_trace_cache_hit_rate_percentage": trace_cache_hit_rate,
+        "semantic_memory_entries": semantic_memory_entries[
+            : _generated_trajectory_adapter_semantic_memory_max_entries(cfg)
+        ],
     }
 
 
@@ -2668,11 +2850,13 @@ def _fit_generated_trajectory_adapter_state(
         target_matrix,
         fitted,
     )
+    semantic_memory_state = _build_generated_adapter_semantic_memory_state(cfg, training_rows)
     return {
         **adapter_state,
         "adapter_type": "generated_trajectory_handoff",
         "input_space": _generated_trajectory_adapter_input_space(cfg),
         "local_residual_state": local_residual_state,
+        "semantic_memory_state": semantic_memory_state,
         "training_prompt_count": int(training_rows["training_prompt_count"]),
         "training_token_count": int(training_rows["training_token_count"]),
         "training_row_cache_hit": bool(training_rows.get("training_row_cache_hit", False)),
@@ -4171,6 +4355,12 @@ def _run_generated_latent_variant(
         "generated_adapter_local_residual_mean_top_similarity": None,
         "generated_adapter_local_residual_memory_rows": None,
     }
+    generated_adapter_semantic_memory_metrics = {
+        "generated_adapter_semantic_memory_applied": False,
+        "generated_adapter_semantic_memory_similarity": None,
+        "generated_adapter_semantic_memory_entry_count": None,
+        "generated_adapter_semantic_memory_target_text": None,
+    }
     if generated_adapter_state is not None:
         adapter_input = (
             handoff_source
@@ -4194,6 +4384,11 @@ def _run_generated_latent_variant(
         )
         generated_adapter_delta_norm = _mean_handoff_delta_norm(handoff_step, adapted_handoff_step)
         handoff_step = adapted_handoff_step
+        generated_adapter_semantic_memory_metrics = _apply_generated_adapter_semantic_memory(
+            adapter_input,
+            generated_adapter_state,
+            variant_cfg,
+        )
     else:
         handoff_step = apply_alignment(handoff_source, alignment_state).to(
             device=agent_b_device,
@@ -4216,6 +4411,167 @@ def _run_generated_latent_variant(
             else generic_adapter_metrics["handoff_adapter_delta_norm"]
         ),
     }
+    generated_reference_text = _generated_trajectory_adapter_target_text(
+        variant_cfg,
+        str(sender_state.get("generated_reasoning_text", "")),
+    )
+    distance_alignment_state = (
+        generated_adapter_state
+        if generated_adapter_state is not None and generated_adapter_input_space == "raw"
+        else alignment_state
+    )
+    distance_adapter_state = (
+        generated_adapter_state
+        if generated_adapter_state is not None and generated_adapter_input_space == "aligned"
+        else None
+    )
+    if generated_adapter_semantic_memory_metrics["generated_adapter_semantic_memory_applied"]:
+        latent_trajectory_steps = int(handoff_source.shape[1])
+        decoded_text = str(
+            generated_adapter_semantic_memory_metrics[
+                "generated_adapter_semantic_memory_target_text"
+            ]
+            or ""
+        )
+        return {
+            "decoded_text": decoded_text,
+            "generated_tokens": 0,
+            "receiver_input_token_count": latent_trajectory_steps,
+            "decode_status": "semantic_memory_readout",
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+            **_alignment_distances(
+                prompt=prompt,
+                state=variant_state,
+                current_latent_step=handoff_source,
+                alignment_state=distance_alignment_state,
+                cfg=variant_cfg,
+                adapter_state=distance_adapter_state,
+                calibration_strength=0.0,
+                calibration_max_norm_ratio=0.0,
+                reference_text=generated_reference_text,
+                reference_token_ids=_source_token_ids_for_generated_adapter(
+                    variant_cfg,
+                    sender_state,
+                ),
+                reference_target_alignment=_generated_trajectory_adapter_target_alignment(
+                    variant_cfg
+                ),
+            ),
+            "alignment_mode": method_alignment_mode,
+            "alignment_strategy": "hybrid_affine",
+            "handoff_status": "ok",
+            "handoff_surface": "generated_hidden_sequence_semantic_memory",
+            "alignment_residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+            "alignment_bias_norm": alignment_state.get("bias_norm"),
+            "anchor_reconstruction_mse": variant_state.get(
+                "handoff_anchor_reconstruction_mse",
+                variant_state.get("anchor_reconstruction_mse"),
+            ),
+            "anchor_pairwise_distance_distortion": variant_state.get(
+                "handoff_anchor_pairwise_distance_distortion",
+                variant_state.get("anchor_pairwise_distance_distortion"),
+            ),
+            "anchor_cosine_structure_error": variant_state.get(
+                "handoff_anchor_cosine_structure_error",
+                variant_state.get("anchor_cosine_structure_error"),
+            ),
+            "prompt_calibration_enabled": False,
+            "prompt_calibration_bias_norm": None,
+            "handoff_adapter_enabled": bool(
+                generated_adapter_info.get("enabled")
+                or variant_state.get("handoff_adapter_enabled", False)
+            ),
+            "handoff_adapter_status": (
+                f"generated_trajectory_{generated_adapter_info.get('status')}_"
+                f"{generated_adapter_input_space}"
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_status")
+            ),
+            "handoff_adapter_applied": adapter_metrics["handoff_adapter_applied"],
+            "handoff_adapter_delta_norm": adapter_metrics["handoff_adapter_delta_norm"],
+            "handoff_adapter_cache_hit": (
+                generated_adapter_info.get("cache_hit")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_hit")
+            ),
+            "handoff_adapter_cache_path": (
+                generated_adapter_info.get("cache_path")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_path")
+            ),
+            "handoff_adapter_cache_key_digest": (
+                generated_adapter_info.get("adapter_cache_key_digest")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_key_digest")
+            ),
+            "handoff_adapter_training_prompt_count": generated_adapter_info.get(
+                "training_prompt_count"
+            ),
+            "handoff_adapter_training_token_count": generated_adapter_info.get(
+                "training_token_count"
+            ),
+            "handoff_adapter_training_row_cache_hit": generated_adapter_info.get(
+                "training_row_cache_hit"
+            ),
+            "handoff_adapter_training_row_cache_path": generated_adapter_info.get(
+                "training_row_cache_path"
+            ),
+            "handoff_adapter_training_rows_cache_key_digest": generated_adapter_info.get(
+                "training_rows_cache_key_digest"
+            ),
+            "handoff_adapter_training_trace_cache_hit_count": generated_adapter_info.get(
+                "training_trace_cache_hit_count"
+            ),
+            "handoff_adapter_training_trace_cache_miss_count": generated_adapter_info.get(
+                "training_trace_cache_miss_count"
+            ),
+            "handoff_adapter_training_trace_cache_hit_rate_percentage": generated_adapter_info.get(
+                "training_trace_cache_hit_rate_percentage"
+            ),
+            "handoff_adapter_training_reconstruction_mse": generated_adapter_info.get(
+                "training_reconstruction_mse"
+            ),
+            "handoff_adapter_training_mean_cosine_similarity": generated_adapter_info.get(
+                "training_mean_cosine_similarity"
+            ),
+            **generated_adapter_local_residual_metrics,
+            **generated_adapter_semantic_memory_metrics,
+            "embedding_manifold_enabled": bool(
+                getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
+            ),
+            "embedding_manifold_applied": False,
+            "embedding_manifold_delta_norm": None,
+            "embedding_manifold_mean_top_similarity": None,
+            "embedding_manifold_unique_token_count": None,
+            "raw_handoff_entropy": None,
+            "handoff_uncertainty": None,
+            "confidence_gate_triggered": False,
+            "fallback_discrete_reasoning_steps": 0,
+            "latent_trajectory_steps": latent_trajectory_steps,
+            "total_reasoning_steps": latent_trajectory_steps,
+            "continuous_integration_seconds": 0.0,
+            "global_alignment_cache_hit": variant_state["global_alignment_cache_hit"],
+            "_row_cfg": variant_cfg,
+            "_row_state": variant_state,
+            "sender_reasoning_text": sender_state["generated_reasoning_text"],
+            "sender_reasoning_token_count": sender_state["generated_reasoning_token_count"],
+            "sender_reasoning_status": sender_state["generated_reasoning_status"],
+            "sender_trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
+            "sender_trace_cache_path": sender_state.get("generated_trace_cache_path"),
+            "sender_final_answer_marker": sender_state["generated_reasoning_final_answer_marker"],
+            "sender_revision_enabled": sender_state.get("sender_revision_enabled"),
+            "sender_revision_applied": sender_state.get("sender_revision_applied"),
+            "sender_initial_predicted_answer": sender_state.get("sender_initial_predicted_answer"),
+            "sender_revision_predicted_answer": sender_state.get("sender_revision_predicted_answer"),
+            "sender_revision_decision_applied": sender_state.get(
+                "sender_revision_decision_applied"
+            ),
+            "sender_revision_decision_predicted_answer": sender_state.get(
+                "sender_revision_decision_predicted_answer"
+            ),
+        }
     handoff_step, manifold_metrics = apply_embedding_manifold_projection(
         handoff_step,
         variant_cfg,
@@ -4234,20 +4590,6 @@ def _run_generated_latent_variant(
         answer_suffix_text="\n\nRepeat the final answer from the latent reasoning.\nFinal answer:",
     )
     latent_trajectory_steps = int(handoff_source.shape[1])
-    distance_alignment_state = (
-        generated_adapter_state
-        if generated_adapter_state is not None and generated_adapter_input_space == "raw"
-        else alignment_state
-    )
-    distance_adapter_state = (
-        generated_adapter_state
-        if generated_adapter_state is not None and generated_adapter_input_space == "aligned"
-        else None
-    )
-    generated_reference_text = _generated_trajectory_adapter_target_text(
-        variant_cfg,
-        str(sender_state.get("generated_reasoning_text", "")),
-    )
     return {
         **decode_metrics,
         **_alignment_distances(
@@ -4360,6 +4702,7 @@ def _run_generated_latent_variant(
         if not generated_adapter_report
         else generated_adapter_info.get("training_mean_cosine_similarity"),
         **generated_adapter_local_residual_metrics,
+        **generated_adapter_semantic_memory_metrics,
         "embedding_manifold_enabled": bool(
             getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
         ),
@@ -4779,6 +5122,9 @@ def _configured_base_cfg(
     generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
+    generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
@@ -4879,6 +5225,18 @@ def _configured_base_cfg(
     if generated_trajectory_adapter_local_residual_max_memory_rows is not None:
         base_cfg.handoff.generated_trajectory_adapter.local_residual.max_memory_rows = int(
             generated_trajectory_adapter_local_residual_max_memory_rows
+        )
+    if generated_trajectory_adapter_semantic_memory_enabled is not None:
+        base_cfg.handoff.generated_trajectory_adapter.semantic_memory.enabled = bool(
+            generated_trajectory_adapter_semantic_memory_enabled
+        )
+    if generated_trajectory_adapter_semantic_memory_min_similarity is not None:
+        base_cfg.handoff.generated_trajectory_adapter.semantic_memory.min_similarity = float(
+            generated_trajectory_adapter_semantic_memory_min_similarity
+        )
+    if generated_trajectory_adapter_semantic_memory_max_entries is not None:
+        base_cfg.handoff.generated_trajectory_adapter.semantic_memory.max_entries = int(
+            generated_trajectory_adapter_semantic_memory_max_entries
         )
     if embedding_manifold_enabled is not None:
         base_cfg.handoff.embedding_manifold.enabled = bool(embedding_manifold_enabled)
@@ -5014,6 +5372,9 @@ def run_benchmark(
     generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
+    generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
@@ -5068,6 +5429,15 @@ def run_benchmark(
         ),
         generated_trajectory_adapter_local_residual_max_memory_rows=(
             generated_trajectory_adapter_local_residual_max_memory_rows
+        ),
+        generated_trajectory_adapter_semantic_memory_enabled=(
+            generated_trajectory_adapter_semantic_memory_enabled
+        ),
+        generated_trajectory_adapter_semantic_memory_min_similarity=(
+            generated_trajectory_adapter_semantic_memory_min_similarity
+        ),
+        generated_trajectory_adapter_semantic_memory_max_entries=(
+            generated_trajectory_adapter_semantic_memory_max_entries
         ),
         embedding_manifold_enabled=embedding_manifold_enabled,
         embedding_manifold_top_k=embedding_manifold_top_k,
@@ -5414,6 +5784,18 @@ def run_benchmark(
                             ),
                             "generated_adapter_local_residual_memory_rows": row_result.get(
                                 "generated_adapter_local_residual_memory_rows"
+                            ),
+                            "generated_adapter_semantic_memory_applied": row_result.get(
+                                "generated_adapter_semantic_memory_applied"
+                            ),
+                            "generated_adapter_semantic_memory_similarity": row_result.get(
+                                "generated_adapter_semantic_memory_similarity"
+                            ),
+                            "generated_adapter_semantic_memory_entry_count": row_result.get(
+                                "generated_adapter_semantic_memory_entry_count"
+                            ),
+                            "generated_adapter_semantic_memory_target_text": row_result.get(
+                                "generated_adapter_semantic_memory_target_text"
                             ),
                             "embedding_manifold_enabled": row_result.get("embedding_manifold_enabled"),
                             "embedding_manifold_applied": row_result.get("embedding_manifold_applied"),
@@ -5803,6 +6185,15 @@ def run_benchmark(
                 "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
                 "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
             },
+            "semantic_memory": {
+                "enabled": _generated_trajectory_adapter_semantic_memory_enabled(base_cfg),
+                "min_similarity": _generated_trajectory_adapter_semantic_memory_min_similarity(
+                    base_cfg
+                ),
+                "max_entries": _generated_trajectory_adapter_semantic_memory_max_entries(
+                    base_cfg
+                ),
+            },
         },
         "embedding_manifold": {
             "enabled": bool(
@@ -5862,6 +6253,9 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_local_residual_temperature: Optional[float] = None,
     generated_trajectory_adapter_local_residual_blend: Optional[float] = None,
     generated_trajectory_adapter_local_residual_max_memory_rows: Optional[int] = None,
+    generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
+    generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
     sender_revision_enabled: Optional[bool] = None,
     sender_revision_max_new_tokens: Optional[int] = None,
     sender_revision_disagreement_verifier_enabled: Optional[bool] = None,
@@ -5911,6 +6305,15 @@ def prepare_generated_trajectory_adapter_cache(
         ),
         generated_trajectory_adapter_local_residual_max_memory_rows=(
             generated_trajectory_adapter_local_residual_max_memory_rows
+        ),
+        generated_trajectory_adapter_semantic_memory_enabled=(
+            generated_trajectory_adapter_semantic_memory_enabled
+        ),
+        generated_trajectory_adapter_semantic_memory_min_similarity=(
+            generated_trajectory_adapter_semantic_memory_min_similarity
+        ),
+        generated_trajectory_adapter_semantic_memory_max_entries=(
+            generated_trajectory_adapter_semantic_memory_max_entries
         ),
         sender_revision_enabled=sender_revision_enabled,
         sender_revision_max_new_tokens=sender_revision_max_new_tokens,
@@ -6106,6 +6509,15 @@ def prepare_generated_trajectory_adapter_cache(
                 "temperature": _generated_trajectory_adapter_local_residual_temperature(base_cfg),
                 "blend": _generated_trajectory_adapter_local_residual_blend(base_cfg),
                 "max_memory_rows": _generated_trajectory_adapter_local_residual_max_rows(base_cfg),
+            },
+            "semantic_memory": {
+                "enabled": _generated_trajectory_adapter_semantic_memory_enabled(base_cfg),
+                "min_similarity": _generated_trajectory_adapter_semantic_memory_min_similarity(
+                    base_cfg
+                ),
+                "max_entries": _generated_trajectory_adapter_semantic_memory_max_entries(
+                    base_cfg
+                ),
             },
         },
         "prepared_adapters": prepared_adapters,
@@ -6401,6 +6813,28 @@ def main() -> None:
         help="Optional override for handoff.generated_trajectory_adapter.local_residual.max_memory_rows.",
     )
     parser.add_argument(
+        "--enable-generated-trajectory-semantic-memory",
+        action="store_true",
+        help="Enable nearest-trajectory semantic readout for generated latent methods.",
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-semantic-memory",
+        action="store_true",
+        help="Disable generated-trajectory semantic memory readout for this run.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-min-similarity",
+        type=float,
+        default=None,
+        help="Optional semantic memory cosine threshold for generated latent readout.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-max-entries",
+        type=int,
+        default=None,
+        help="Optional maximum generated trajectory semantic memory entries.",
+    )
+    parser.add_argument(
         "--enable-embedding-manifold",
         action="store_true",
         help="Project latent prefix vectors onto the receiver embedding manifold.",
@@ -6652,6 +7086,19 @@ def main() -> None:
             generated_trajectory_adapter_local_residual_max_memory_rows=(
                 args.generated_trajectory_local_residual_max_memory_rows
             ),
+            generated_trajectory_adapter_semantic_memory_enabled=(
+                False
+                if args.disable_generated_trajectory_semantic_memory
+                else True
+                if args.enable_generated_trajectory_semantic_memory
+                else None
+            ),
+            generated_trajectory_adapter_semantic_memory_min_similarity=(
+                args.generated_trajectory_semantic_memory_min_similarity
+            ),
+            generated_trajectory_adapter_semantic_memory_max_entries=(
+                args.generated_trajectory_semantic_memory_max_entries
+            ),
             sender_revision_enabled=True if args.enable_sender_revision else None,
             sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
             sender_revision_disagreement_verifier_enabled=(
@@ -6783,6 +7230,19 @@ def main() -> None:
         ),
         generated_trajectory_adapter_local_residual_max_memory_rows=(
             args.generated_trajectory_local_residual_max_memory_rows
+        ),
+        generated_trajectory_adapter_semantic_memory_enabled=(
+            False
+            if args.disable_generated_trajectory_semantic_memory
+            else True
+            if args.enable_generated_trajectory_semantic_memory
+            else None
+        ),
+        generated_trajectory_adapter_semantic_memory_min_similarity=(
+            args.generated_trajectory_semantic_memory_min_similarity
+        ),
+        generated_trajectory_adapter_semantic_memory_max_entries=(
+            args.generated_trajectory_semantic_memory_max_entries
         ),
         embedding_manifold_enabled=(
             False

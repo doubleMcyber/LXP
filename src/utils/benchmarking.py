@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 21
+REPORT_SCHEMA_VERSION = 22
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -99,6 +99,10 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "generated_adapter_local_residual_delta_norm",
     "generated_adapter_local_residual_mean_top_similarity",
     "generated_adapter_local_residual_memory_rows",
+    "generated_adapter_semantic_memory_applied",
+    "generated_adapter_semantic_memory_similarity",
+    "generated_adapter_semantic_memory_entry_count",
+    "generated_adapter_semantic_memory_target_text",
     "embedding_manifold_enabled",
     "embedding_manifold_applied",
     "embedding_manifold_delta_norm",
@@ -187,6 +191,9 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "mean_generated_adapter_local_residual_delta_norm",
     "mean_generated_adapter_local_residual_top_similarity",
     "mean_generated_adapter_local_residual_memory_rows",
+    "generated_adapter_semantic_memory_rate_percentage",
+    "mean_generated_adapter_semantic_memory_similarity",
+    "mean_generated_adapter_semantic_memory_entry_count",
     "embedding_manifold_rate_percentage",
     "mean_embedding_manifold_delta_norm",
     "mean_embedding_manifold_top_similarity",
@@ -452,6 +459,12 @@ def aggregate_standard_rows(
             if row.get("generated_adapter_local_residual_applied") is not None
             and row.get("generated_adapter_local_residual_applied") != ""
         ]
+        generated_adapter_semantic_memory_rows = [
+            bool(row["generated_adapter_semantic_memory_applied"])
+            for row in group_rows
+            if row.get("generated_adapter_semantic_memory_applied") is not None
+            and row.get("generated_adapter_semantic_memory_applied") != ""
+        ]
         embedding_manifold_rows = [
             bool(row["embedding_manifold_applied"])
             for row in group_rows
@@ -620,6 +633,21 @@ def aggregate_standard_rows(
                 "mean_generated_adapter_local_residual_memory_rows": _mean_or_none(
                     group_rows,
                     "generated_adapter_local_residual_memory_rows",
+                ),
+                "generated_adapter_semantic_memory_rate_percentage": (
+                    100.0
+                    * sum(1 for item in generated_adapter_semantic_memory_rows if item)
+                    / len(generated_adapter_semantic_memory_rows)
+                    if generated_adapter_semantic_memory_rows
+                    else None
+                ),
+                "mean_generated_adapter_semantic_memory_similarity": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_semantic_memory_similarity",
+                ),
+                "mean_generated_adapter_semantic_memory_entry_count": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_semantic_memory_entry_count",
                 ),
                 "embedding_manifold_rate_percentage": (
                     100.0 * sum(1 for item in embedding_manifold_rows if item)

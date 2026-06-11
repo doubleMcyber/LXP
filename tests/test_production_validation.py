@@ -25,6 +25,9 @@ def test_production_validation_builds_locked_eval_and_replay_commands() -> None:
         generated_trajectory_adapter_target_mode=None,
         generated_trajectory_adapter_target_alignment=None,
         generated_trajectory_local_residual_temperature=None,
+        generated_trajectory_semantic_memory_enabled=False,
+        generated_trajectory_semantic_memory_min_similarity=None,
+        generated_trajectory_semantic_memory_max_entries=None,
         include_tests=True,
         prepare=True,
         replay=True,
@@ -79,6 +82,15 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
         generated_trajectory_local_residual_temperature=defaults[
             "generated_trajectory_local_residual_temperature"
         ],
+        generated_trajectory_semantic_memory_enabled=defaults[
+            "generated_trajectory_semantic_memory_enabled"
+        ],
+        generated_trajectory_semantic_memory_min_similarity=defaults[
+            "generated_trajectory_semantic_memory_min_similarity"
+        ],
+        generated_trajectory_semantic_memory_max_entries=defaults[
+            "generated_trajectory_semantic_memory_max_entries"
+        ],
         include_tests=False,
         prepare=False,
         replay=True,
@@ -108,6 +120,11 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "linear" in benchmark_command
     assert "--generated-trajectory-local-residual-temperature" in benchmark_command
     assert "0.05" in benchmark_command
+    assert "--enable-generated-trajectory-semantic-memory" in benchmark_command
+    assert "--generated-trajectory-semantic-memory-min-similarity" in benchmark_command
+    assert "0.98" in benchmark_command
+    assert "--generated-trajectory-semantic-memory-max-entries" in benchmark_command
+    assert "2048" in benchmark_command
     assert "outputs/prod/production_context_vs_latent_3_manifest.json" in replay_command
     assert "--generated-trajectory-adapter-train-limit" in replay_command
     assert "8" in replay_command

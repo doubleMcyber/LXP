@@ -20,7 +20,9 @@ from benchmark_all import (
     _apply_eval_manifest_to_args,
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
+    _apply_generated_adapter_semantic_memory,
     _build_generated_adapter_local_residual_state,
+    _build_generated_adapter_semantic_memory_state,
     _build_eval_manifest,
     _answers_match,
     _cache_key_digest,
@@ -797,6 +799,11 @@ def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
             "blend": 1.0,
             "max_memory_rows": 4096,
         },
+        "semantic_memory": {
+            "enabled": True,
+            "min_similarity": 0.98,
+            "max_entries": 2048,
+        },
     }
     handoff_identity = {
         "latent_pooling": "last_token",
@@ -873,6 +880,11 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
                 "blend": 1.0,
                 "max_memory_rows": 4096,
             },
+            "semantic_memory": {
+                "enabled": True,
+                "min_similarity": 0.98,
+                "max_entries": 2048,
+            },
         },
         handoff_identity={
             "latent_pooling": "last_token",
@@ -900,6 +912,10 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
         generated_trajectory_local_residual_temperature=None,
         generated_trajectory_local_residual_blend=None,
         generated_trajectory_local_residual_max_memory_rows=None,
+        enable_generated_trajectory_semantic_memory=False,
+        disable_generated_trajectory_semantic_memory=False,
+        generated_trajectory_semantic_memory_min_similarity=None,
+        generated_trajectory_semantic_memory_max_entries=None,
         latent_pooling=None,
         receiver_context_mode=None,
         receiver_context_latent_position=None,
@@ -924,6 +940,9 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
     assert args.generated_trajectory_local_residual_top_k == 8
     assert args.generated_trajectory_local_residual_temperature == 0.05
     assert args.generated_trajectory_local_residual_max_memory_rows == 4096
+    assert args.enable_generated_trajectory_semantic_memory is True
+    assert args.generated_trajectory_semantic_memory_min_similarity == 0.98
+    assert args.generated_trajectory_semantic_memory_max_entries == 2048
     assert args.receiver_context_mode == "prompt_prefix"
     assert args.enable_embedding_manifold is True
     assert args.embedding_manifold_top_k == 4
@@ -1665,6 +1684,52 @@ def test_generated_trajectory_local_residual_corrects_nearest_training_error() -
     assert metrics["generated_adapter_local_residual_applied"] is True
     assert metrics["generated_adapter_local_residual_memory_rows"] == 2
     assert torch.allclose(corrected.reshape(2, 2), target)
+
+
+def test_generated_trajectory_semantic_memory_reads_nearest_latent_answer() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "semantic_memory": {
+                        "enabled": True,
+                        "min_similarity": 0.95,
+                        "max_entries": 8,
+                    }
+                }
+            }
+        }
+    )
+    source_sequence = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    training_rows = {
+        "semantic_memory_entries": [
+            {
+                "source_sequence": source_sequence.squeeze(0),
+                "target_text": "Final answer: 3037",
+                "target_answer": "3037",
+                "source_token_count": 2,
+            }
+        ]
+    }
+    memory_state = _build_generated_adapter_semantic_memory_state(cfg, training_rows)
+
+    metrics = _apply_generated_adapter_semantic_memory(
+        source_sequence,
+        {"semantic_memory_state": memory_state},
+        cfg,
+    )
+
+    assert metrics["generated_adapter_semantic_memory_applied"] is True
+    assert metrics["generated_adapter_semantic_memory_target_text"] == "Final answer: 3037"
+    assert metrics["generated_adapter_semantic_memory_similarity"] == pytest.approx(1.0)
+
+    cfg.handoff.generated_trajectory_adapter.semantic_memory.min_similarity = 1.01
+    rejected = _apply_generated_adapter_semantic_memory(
+        source_sequence,
+        {"semantic_memory_state": memory_state},
+        cfg,
+    )
+    assert rejected["generated_adapter_semantic_memory_applied"] is False
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:
