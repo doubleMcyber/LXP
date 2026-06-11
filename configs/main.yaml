@@ -111,6 +111,9 @@ handoff:
       enabled: false
       min_similarity: 0.98
       max_entries: 2048
+    token_readout:
+      enabled: false
+      min_similarity: 0.80
   embedding_manifold:
     enabled: false
     top_k: 4

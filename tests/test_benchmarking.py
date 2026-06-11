@@ -21,6 +21,7 @@ from benchmark_all import (
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
     _apply_generated_adapter_semantic_memory,
+    _build_generated_adapter_leakage_report,
     _build_generated_adapter_local_residual_state,
     _build_generated_adapter_semantic_memory_state,
     _build_eval_manifest,
@@ -40,6 +41,7 @@ from benchmark_all import (
     _generated_trajectory_adapter_training_rows_cache_key,
     _generated_trajectory_trace_cache_key,
     _generated_adapter_include_prompt_values,
+    _generated_adapter_token_readout,
     _handoff_decode_prompt,
     _load_generated_trajectory_training_rows_from_disk,
     _load_generated_trajectory_trace_from_disk,
@@ -804,6 +806,10 @@ def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
             "min_similarity": 0.98,
             "max_entries": 2048,
         },
+        "token_readout": {
+            "enabled": True,
+            "min_similarity": 0.8,
+        },
     }
     handoff_identity = {
         "latent_pooling": "last_token",
@@ -885,6 +891,10 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
                 "min_similarity": 0.98,
                 "max_entries": 2048,
             },
+            "token_readout": {
+                "enabled": True,
+                "min_similarity": 0.8,
+            },
         },
         handoff_identity={
             "latent_pooling": "last_token",
@@ -916,6 +926,9 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
         disable_generated_trajectory_semantic_memory=False,
         generated_trajectory_semantic_memory_min_similarity=None,
         generated_trajectory_semantic_memory_max_entries=None,
+        enable_generated_trajectory_token_readout=False,
+        disable_generated_trajectory_token_readout=False,
+        generated_trajectory_token_readout_min_similarity=None,
         latent_pooling=None,
         receiver_context_mode=None,
         receiver_context_latent_position=None,
@@ -943,6 +956,8 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
     assert args.enable_generated_trajectory_semantic_memory is True
     assert args.generated_trajectory_semantic_memory_min_similarity == 0.98
     assert args.generated_trajectory_semantic_memory_max_entries == 2048
+    assert args.enable_generated_trajectory_token_readout is True
+    assert args.generated_trajectory_token_readout_min_similarity == 0.8
     assert args.receiver_context_mode == "prompt_prefix"
     assert args.enable_embedding_manifold is True
     assert args.embedding_manifold_top_k == 4
@@ -1730,6 +1745,107 @@ def test_generated_trajectory_semantic_memory_reads_nearest_latent_answer() -> N
         cfg,
     )
     assert rejected["generated_adapter_semantic_memory_applied"] is False
+
+
+def test_generated_trajectory_token_readout_decodes_nearest_receiver_tokens() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "token_readout": {
+                        "enabled": True,
+                        "min_similarity": 0.99,
+                    }
+                }
+            }
+        }
+    )
+
+    class ToyTokenizer:
+        pieces = {
+            0: "Final answer: ",
+            1: "3037",
+            2: " distractor",
+        }
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(self.pieces[int(token_id)] for token_id in token_ids)
+
+    class ToyEmbeddings:
+        weight = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+            ]
+        )
+
+    class ToyAgent:
+        def get_input_embeddings(self):
+            return ToyEmbeddings()
+
+    handoff_step = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+
+    metrics = _generated_adapter_token_readout(
+        handoff_step,
+        tokenizer_b=ToyTokenizer(),
+        agent_b=ToyAgent(),
+        cfg=cfg,
+    )
+
+    assert metrics["generated_adapter_token_readout_applied"] is True
+    assert metrics["generated_adapter_token_readout_text"] == "Final answer: 3037"
+    assert metrics["generated_adapter_token_readout_answer"] == "3037"
+    assert metrics["generated_adapter_token_readout_mean_similarity"] == pytest.approx(1.0)
+
+    cfg.handoff.generated_trajectory_adapter.token_readout.min_similarity = 1.01
+    rejected = _generated_adapter_token_readout(
+        handoff_step,
+        tokenizer_b=ToyTokenizer(),
+        agent_b=ToyAgent(),
+        cfg=cfg,
+    )
+    assert rejected["generated_adapter_token_readout_applied"] is False
+
+
+def test_generated_adapter_leakage_report_flags_same_split_overlap() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "enabled": True,
+                    "dataset_name": "long_context_handoff",
+                    "train_split": "test",
+                    "train_limit": 8,
+                }
+            }
+        }
+    )
+
+    report = _build_generated_adapter_leakage_report(
+        cfg,
+        eval_dataset_name="long_context_handoff",
+        eval_split="test",
+        eval_limit=3,
+        eval_sample_indices=[0, 1, 2],
+    )
+
+    assert report["possible_leakage"] is True
+    assert report["leakage_ruled_out"] is False
+    assert report["overlapping_sample_indices"] == [0, 1, 2]
+
+    cfg.handoff.generated_trajectory_adapter.train_split = "train"
+    clean_report = _build_generated_adapter_leakage_report(
+        cfg,
+        eval_dataset_name="long_context_handoff",
+        eval_split="test",
+        eval_limit=3,
+        eval_sample_indices=[0, 1, 2],
+    )
+
+    assert clean_report["possible_leakage"] is False
+    assert clean_report["leakage_ruled_out"] is True
+    assert clean_report["status"] == "ruled_out"
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:

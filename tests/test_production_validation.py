@@ -28,6 +28,8 @@ def test_production_validation_builds_locked_eval_and_replay_commands() -> None:
         generated_trajectory_semantic_memory_enabled=False,
         generated_trajectory_semantic_memory_min_similarity=None,
         generated_trajectory_semantic_memory_max_entries=None,
+        generated_trajectory_token_readout_enabled=False,
+        generated_trajectory_token_readout_min_similarity=None,
         include_tests=True,
         prepare=True,
         replay=True,
@@ -91,6 +93,12 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
         generated_trajectory_semantic_memory_max_entries=defaults[
             "generated_trajectory_semantic_memory_max_entries"
         ],
+        generated_trajectory_token_readout_enabled=defaults[
+            "generated_trajectory_token_readout_enabled"
+        ],
+        generated_trajectory_token_readout_min_similarity=defaults[
+            "generated_trajectory_token_readout_min_similarity"
+        ],
         include_tests=False,
         prepare=False,
         replay=True,
@@ -111,7 +119,7 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "generated_latent_handoff" in benchmark_text
     assert "generated_context_latent_handoff" not in benchmark_text
     assert "--generated-trajectory-adapter-train-split" in benchmark_command
-    assert "test" in benchmark_command
+    assert "train" in benchmark_command
     assert "--generated-trajectory-adapter-source-mode" in benchmark_command
     assert "final_answer_tail" in benchmark_command
     assert "--generated-trajectory-adapter-target-mode" in benchmark_command
@@ -120,14 +128,17 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "linear" in benchmark_command
     assert "--generated-trajectory-local-residual-temperature" in benchmark_command
     assert "0.05" in benchmark_command
-    assert "--enable-generated-trajectory-semantic-memory" in benchmark_command
+    assert "--enable-generated-trajectory-semantic-memory" not in benchmark_command
     assert "--generated-trajectory-semantic-memory-min-similarity" in benchmark_command
     assert "0.98" in benchmark_command
     assert "--generated-trajectory-semantic-memory-max-entries" in benchmark_command
     assert "2048" in benchmark_command
-    assert "outputs/prod/production_context_vs_latent_3_manifest.json" in replay_command
+    assert "--enable-generated-trajectory-token-readout" in benchmark_command
+    assert "--generated-trajectory-token-readout-min-similarity" in benchmark_command
+    assert "0.8" in benchmark_command
+    assert "outputs/prod/production_context_vs_latent_8_manifest.json" in replay_command
     assert "--generated-trajectory-adapter-train-limit" in replay_command
-    assert "8" in replay_command
+    assert "64" in replay_command
     assert "--generated-trajectory-adapter-train-split" in replay_command
     assert "final_answer_tail" in replay_text
     assert "final_answer_line" in replay_text

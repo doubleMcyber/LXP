@@ -1027,6 +1027,68 @@ def _resolved_sample_indices(limit: int, sample_indices: Optional[Sequence[int]]
     return [int(index) for index in list(sample_indices)[: max(0, int(limit))]]
 
 
+def _build_generated_adapter_leakage_report(
+    cfg: Any,
+    *,
+    eval_dataset_name: str,
+    eval_split: str,
+    eval_limit: int,
+    eval_sample_indices: Optional[Sequence[int]],
+    generated_methods_enabled: bool = True,
+) -> dict[str, Any]:
+    """Report whether generated-adapter training rows overlap eval rows."""
+    adapter_enabled = bool(
+        generated_methods_enabled and _generated_trajectory_adapter_enabled(cfg)
+    )
+    train_dataset_name = _generated_trajectory_adapter_dataset_name(cfg)
+    train_split = _generated_trajectory_adapter_train_split(cfg)
+    train_limit = max(0, _generated_trajectory_adapter_train_limit(cfg))
+    resolved_eval_indices = _resolved_sample_indices(eval_limit, eval_sample_indices)
+    train_index_window = {
+        "start": 0,
+        "stop_exclusive": train_limit,
+        "count": train_limit,
+    }
+    overlapping_indices: list[int] = []
+    if adapter_enabled and train_dataset_name == eval_dataset_name and train_split == eval_split:
+        train_indices = set(range(train_limit))
+        overlapping_indices = sorted(set(resolved_eval_indices) & train_indices)
+
+    possible_leakage = bool(overlapping_indices)
+    if not adapter_enabled:
+        status = "not_applicable"
+        reason = "generated adapter is disabled or no generated latent method is selected"
+    elif train_dataset_name != eval_dataset_name:
+        status = "ruled_out"
+        reason = "generated adapter trains on a different dataset"
+    elif train_split != eval_split:
+        status = "ruled_out"
+        reason = "generated adapter trains on a different split"
+    elif possible_leakage:
+        status = "possible_leakage"
+        reason = "generated adapter train index window overlaps eval sample indices"
+    else:
+        status = "ruled_out"
+        reason = "generated adapter train index window is disjoint from eval sample indices"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "possible_leakage": possible_leakage,
+        "leakage_ruled_out": not possible_leakage,
+        "adapter_enabled": adapter_enabled,
+        "train_dataset": train_dataset_name,
+        "train_split": train_split,
+        "train_limit": train_limit,
+        "train_index_window": train_index_window,
+        "eval_dataset": str(eval_dataset_name),
+        "eval_split": str(eval_split),
+        "eval_limit": int(eval_limit),
+        "eval_sample_indices": resolved_eval_indices,
+        "overlapping_sample_indices": overlapping_indices,
+    }
+
+
 def _sample_fingerprint(
     row: Mapping[str, Any],
     *,
@@ -1251,6 +1313,19 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
             if semantic_memory.get("max_entries") is not None:
                 args.generated_trajectory_semantic_memory_max_entries = int(
                     semantic_memory["max_entries"]
+                )
+        token_readout = generated_adapter.get("token_readout")
+        if isinstance(token_readout, Mapping):
+            if token_readout.get("enabled") is not None:
+                if bool(token_readout.get("enabled")):
+                    args.enable_generated_trajectory_token_readout = True
+                    args.disable_generated_trajectory_token_readout = False
+                else:
+                    args.disable_generated_trajectory_token_readout = True
+                    args.enable_generated_trajectory_token_readout = False
+            if token_readout.get("min_similarity") is not None:
+                args.generated_trajectory_token_readout_min_similarity = float(
+                    token_readout["min_similarity"]
                 )
     handoff = manifest.get("handoff")
     if isinstance(handoff, Mapping):
@@ -1901,6 +1976,20 @@ def _generated_trajectory_adapter_semantic_memory_max_entries(cfg: Any) -> int:
     return max(0, int(getattr(memory_cfg, "max_entries", 2048)))
 
 
+def _generated_trajectory_adapter_token_readout_cfg(cfg: Any) -> Any:
+    return getattr(_generated_trajectory_adapter_cfg(cfg), "token_readout", None)
+
+
+def _generated_trajectory_adapter_token_readout_enabled(cfg: Any) -> bool:
+    readout_cfg = _generated_trajectory_adapter_token_readout_cfg(cfg)
+    return bool(getattr(readout_cfg, "enabled", False))
+
+
+def _generated_trajectory_adapter_token_readout_min_similarity(cfg: Any) -> float:
+    readout_cfg = _generated_trajectory_adapter_token_readout_cfg(cfg)
+    return float(getattr(readout_cfg, "min_similarity", 0.80))
+
+
 def _generated_trajectory_adapter_cache_dir(cfg: Any) -> Path:
     adapter_cfg = _generated_trajectory_adapter_cfg(cfg)
     return Path(str(getattr(adapter_cfg, "cache_dir", ".cache/generated_trajectory_adapter")))
@@ -2187,6 +2276,10 @@ def _generated_trajectory_adapter_identity_manifest(cfg: Any) -> dict[str, Any]:
             "enabled": _generated_trajectory_adapter_semantic_memory_enabled(cfg),
             "min_similarity": _generated_trajectory_adapter_semantic_memory_min_similarity(cfg),
             "max_entries": _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
+        },
+        "token_readout": {
+            "enabled": _generated_trajectory_adapter_token_readout_enabled(cfg),
+            "min_similarity": _generated_trajectory_adapter_token_readout_min_similarity(cfg),
         },
     }
 
@@ -2636,6 +2729,59 @@ def _apply_generated_adapter_semantic_memory(
         "generated_adapter_semantic_memory_similarity": best_score,
         "generated_adapter_semantic_memory_entry_count": len(entries),
         "generated_adapter_semantic_memory_target_text": best_text,
+    }
+
+
+def _generated_adapter_token_readout(
+    handoff_step: torch.Tensor,
+    *,
+    tokenizer_b: Any,
+    agent_b: Any,
+    cfg: Any,
+) -> dict[str, Any]:
+    if not _generated_trajectory_adapter_token_readout_enabled(cfg):
+        return {
+            "generated_adapter_token_readout_applied": False,
+            "generated_adapter_token_readout_mean_similarity": None,
+            "generated_adapter_token_readout_token_count": None,
+            "generated_adapter_token_readout_text": None,
+        }
+    if handoff_step.dim() != 3:
+        raise ValueError("handoff_step must have shape [batch, steps, dim]")
+    embedding_weight = agent_b.get_input_embeddings().weight.detach().to(
+        device=handoff_step.device,
+        dtype=torch.float32,
+    )
+    query_rows = torch.nn.functional.normalize(
+        handoff_step.detach().reshape(-1, handoff_step.shape[-1]).float(),
+        dim=-1,
+    )
+    embedding_rows = torch.nn.functional.normalize(embedding_weight, dim=-1)
+    scores = query_rows @ embedding_rows.transpose(0, 1)
+    top_values, top_indices = torch.max(scores, dim=-1)
+    token_ids = [int(token_id) for token_id in top_indices.detach().cpu().tolist()]
+    decoded_text = tokenizer_b.decode(
+        token_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    predicted_answer = _predicted_answer("long_context_handoff", str(decoded_text))
+    mean_similarity = float(top_values.mean().detach().cpu().item())
+    min_similarity = _generated_trajectory_adapter_token_readout_min_similarity(cfg)
+    if predicted_answer is None or mean_similarity < min_similarity:
+        return {
+            "generated_adapter_token_readout_applied": False,
+            "generated_adapter_token_readout_mean_similarity": mean_similarity,
+            "generated_adapter_token_readout_token_count": len(token_ids),
+            "generated_adapter_token_readout_text": str(decoded_text),
+        }
+    return {
+        "generated_adapter_token_readout_applied": True,
+        "generated_adapter_token_readout_mean_similarity": mean_similarity,
+        "generated_adapter_token_readout_token_count": len(token_ids),
+        "generated_adapter_token_readout_text": str(decoded_text),
+        "generated_adapter_token_readout_answer": predicted_answer,
+        "generated_adapter_token_readout_output_text": f"Final answer: {predicted_answer}",
     }
 
 
@@ -4308,6 +4454,10 @@ def _run_generated_latent_variant(
             "generated_adapter_local_residual_delta_norm": None,
             "generated_adapter_local_residual_mean_top_similarity": None,
             "generated_adapter_local_residual_memory_rows": None,
+            "generated_adapter_token_readout_applied": False,
+            "generated_adapter_token_readout_mean_similarity": None,
+            "generated_adapter_token_readout_token_count": None,
+            "generated_adapter_token_readout_text": None,
             "embedding_manifold_enabled": bool(
                 getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
             ),
@@ -4360,6 +4510,12 @@ def _run_generated_latent_variant(
         "generated_adapter_semantic_memory_similarity": None,
         "generated_adapter_semantic_memory_entry_count": None,
         "generated_adapter_semantic_memory_target_text": None,
+    }
+    generated_adapter_token_readout_metrics = {
+        "generated_adapter_token_readout_applied": False,
+        "generated_adapter_token_readout_mean_similarity": None,
+        "generated_adapter_token_readout_token_count": None,
+        "generated_adapter_token_readout_text": None,
     }
     if generated_adapter_state is not None:
         adapter_input = (
@@ -4425,6 +4581,160 @@ def _run_generated_latent_variant(
         if generated_adapter_state is not None and generated_adapter_input_space == "aligned"
         else None
     )
+    generated_adapter_token_readout_metrics = _generated_adapter_token_readout(
+        handoff_step,
+        tokenizer_b=tokenizer_b,
+        agent_b=agent_b,
+        cfg=variant_cfg,
+    )
+    if generated_adapter_token_readout_metrics["generated_adapter_token_readout_applied"]:
+        latent_trajectory_steps = int(handoff_source.shape[1])
+        decoded_text = str(
+            generated_adapter_token_readout_metrics.get(
+                "generated_adapter_token_readout_output_text"
+            )
+            or ""
+        )
+        return {
+            "decoded_text": decoded_text,
+            "generated_tokens": 0,
+            "receiver_input_token_count": latent_trajectory_steps,
+            "decode_status": "token_readout",
+            "answer_token_count": 0,
+            "answer_nll": None,
+            "answer_perplexity": None,
+            **_alignment_distances(
+                prompt=prompt,
+                state=variant_state,
+                current_latent_step=handoff_source,
+                alignment_state=distance_alignment_state,
+                cfg=variant_cfg,
+                adapter_state=distance_adapter_state,
+                calibration_strength=0.0,
+                calibration_max_norm_ratio=0.0,
+                reference_text=generated_reference_text,
+                reference_token_ids=_source_token_ids_for_generated_adapter(
+                    variant_cfg,
+                    sender_state,
+                ),
+                reference_target_alignment=_generated_trajectory_adapter_target_alignment(
+                    variant_cfg
+                ),
+            ),
+            "alignment_mode": method_alignment_mode,
+            "alignment_strategy": "hybrid_affine",
+            "handoff_status": "ok",
+            "handoff_surface": "generated_hidden_sequence_token_readout",
+            "alignment_residual_norm_ratio": alignment_state.get("residual_norm_ratio"),
+            "alignment_bias_norm": alignment_state.get("bias_norm"),
+            "anchor_reconstruction_mse": variant_state.get(
+                "handoff_anchor_reconstruction_mse",
+                variant_state.get("anchor_reconstruction_mse"),
+            ),
+            "anchor_pairwise_distance_distortion": variant_state.get(
+                "handoff_anchor_pairwise_distance_distortion",
+                variant_state.get("anchor_pairwise_distance_distortion"),
+            ),
+            "anchor_cosine_structure_error": variant_state.get(
+                "handoff_anchor_cosine_structure_error",
+                variant_state.get("anchor_cosine_structure_error"),
+            ),
+            "prompt_calibration_enabled": False,
+            "prompt_calibration_bias_norm": None,
+            "handoff_adapter_enabled": bool(
+                generated_adapter_info.get("enabled")
+                or variant_state.get("handoff_adapter_enabled", False)
+            ),
+            "handoff_adapter_status": (
+                f"generated_trajectory_{generated_adapter_info.get('status')}_"
+                f"{generated_adapter_input_space}"
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_status")
+            ),
+            "handoff_adapter_applied": adapter_metrics["handoff_adapter_applied"],
+            "handoff_adapter_delta_norm": adapter_metrics["handoff_adapter_delta_norm"],
+            "handoff_adapter_cache_hit": (
+                generated_adapter_info.get("cache_hit")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_hit")
+            ),
+            "handoff_adapter_cache_path": (
+                generated_adapter_info.get("cache_path")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_path")
+            ),
+            "handoff_adapter_cache_key_digest": (
+                generated_adapter_info.get("adapter_cache_key_digest")
+                if generated_adapter_report
+                else variant_state.get("handoff_adapter_cache_key_digest")
+            ),
+            "handoff_adapter_training_prompt_count": generated_adapter_info.get(
+                "training_prompt_count"
+            ),
+            "handoff_adapter_training_token_count": generated_adapter_info.get(
+                "training_token_count"
+            ),
+            "handoff_adapter_training_row_cache_hit": generated_adapter_info.get(
+                "training_row_cache_hit"
+            ),
+            "handoff_adapter_training_row_cache_path": generated_adapter_info.get(
+                "training_row_cache_path"
+            ),
+            "handoff_adapter_training_rows_cache_key_digest": generated_adapter_info.get(
+                "training_rows_cache_key_digest"
+            ),
+            "handoff_adapter_training_trace_cache_hit_count": generated_adapter_info.get(
+                "training_trace_cache_hit_count"
+            ),
+            "handoff_adapter_training_trace_cache_miss_count": generated_adapter_info.get(
+                "training_trace_cache_miss_count"
+            ),
+            "handoff_adapter_training_trace_cache_hit_rate_percentage": generated_adapter_info.get(
+                "training_trace_cache_hit_rate_percentage"
+            ),
+            "handoff_adapter_training_reconstruction_mse": generated_adapter_info.get(
+                "training_reconstruction_mse"
+            ),
+            "handoff_adapter_training_mean_cosine_similarity": generated_adapter_info.get(
+                "training_mean_cosine_similarity"
+            ),
+            **generated_adapter_local_residual_metrics,
+            **generated_adapter_semantic_memory_metrics,
+            **generated_adapter_token_readout_metrics,
+            "embedding_manifold_enabled": bool(
+                getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
+            ),
+            "embedding_manifold_applied": False,
+            "embedding_manifold_delta_norm": None,
+            "embedding_manifold_mean_top_similarity": None,
+            "embedding_manifold_unique_token_count": None,
+            "raw_handoff_entropy": None,
+            "handoff_uncertainty": None,
+            "confidence_gate_triggered": False,
+            "fallback_discrete_reasoning_steps": 0,
+            "latent_trajectory_steps": latent_trajectory_steps,
+            "total_reasoning_steps": latent_trajectory_steps,
+            "continuous_integration_seconds": 0.0,
+            "global_alignment_cache_hit": variant_state["global_alignment_cache_hit"],
+            "_row_cfg": variant_cfg,
+            "_row_state": variant_state,
+            "sender_reasoning_text": sender_state["generated_reasoning_text"],
+            "sender_reasoning_token_count": sender_state["generated_reasoning_token_count"],
+            "sender_reasoning_status": sender_state["generated_reasoning_status"],
+            "sender_trace_cache_hit": sender_state.get("generated_trace_cache_hit"),
+            "sender_trace_cache_path": sender_state.get("generated_trace_cache_path"),
+            "sender_final_answer_marker": sender_state["generated_reasoning_final_answer_marker"],
+            "sender_revision_enabled": sender_state.get("sender_revision_enabled"),
+            "sender_revision_applied": sender_state.get("sender_revision_applied"),
+            "sender_initial_predicted_answer": sender_state.get("sender_initial_predicted_answer"),
+            "sender_revision_predicted_answer": sender_state.get("sender_revision_predicted_answer"),
+            "sender_revision_decision_applied": sender_state.get(
+                "sender_revision_decision_applied"
+            ),
+            "sender_revision_decision_predicted_answer": sender_state.get(
+                "sender_revision_decision_predicted_answer"
+            ),
+        }
     if generated_adapter_semantic_memory_metrics["generated_adapter_semantic_memory_applied"]:
         latent_trajectory_steps = int(handoff_source.shape[1])
         decoded_text = str(
@@ -4538,6 +4848,7 @@ def _run_generated_latent_variant(
             ),
             **generated_adapter_local_residual_metrics,
             **generated_adapter_semantic_memory_metrics,
+            **generated_adapter_token_readout_metrics,
             "embedding_manifold_enabled": bool(
                 getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
             ),
@@ -4703,6 +5014,7 @@ def _run_generated_latent_variant(
         else generated_adapter_info.get("training_mean_cosine_similarity"),
         **generated_adapter_local_residual_metrics,
         **generated_adapter_semantic_memory_metrics,
+        **generated_adapter_token_readout_metrics,
         "embedding_manifold_enabled": bool(
             getattr(getattr(variant_cfg.handoff, "embedding_manifold", None), "enabled", False)
         ),
@@ -5125,6 +5437,8 @@ def _configured_base_cfg(
     generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
     generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
     generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
+    generated_trajectory_adapter_token_readout_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_token_readout_min_similarity: Optional[float] = None,
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
@@ -5237,6 +5551,14 @@ def _configured_base_cfg(
     if generated_trajectory_adapter_semantic_memory_max_entries is not None:
         base_cfg.handoff.generated_trajectory_adapter.semantic_memory.max_entries = int(
             generated_trajectory_adapter_semantic_memory_max_entries
+        )
+    if generated_trajectory_adapter_token_readout_enabled is not None:
+        base_cfg.handoff.generated_trajectory_adapter.token_readout.enabled = bool(
+            generated_trajectory_adapter_token_readout_enabled
+        )
+    if generated_trajectory_adapter_token_readout_min_similarity is not None:
+        base_cfg.handoff.generated_trajectory_adapter.token_readout.min_similarity = float(
+            generated_trajectory_adapter_token_readout_min_similarity
         )
     if embedding_manifold_enabled is not None:
         base_cfg.handoff.embedding_manifold.enabled = bool(embedding_manifold_enabled)
@@ -5375,6 +5697,8 @@ def run_benchmark(
     generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
     generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
     generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
+    generated_trajectory_adapter_token_readout_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_token_readout_min_similarity: Optional[float] = None,
     embedding_manifold_enabled: Optional[bool] = None,
     embedding_manifold_top_k: Optional[int] = None,
     embedding_manifold_blend: Optional[float] = None,
@@ -5438,6 +5762,12 @@ def run_benchmark(
         ),
         generated_trajectory_adapter_semantic_memory_max_entries=(
             generated_trajectory_adapter_semantic_memory_max_entries
+        ),
+        generated_trajectory_adapter_token_readout_enabled=(
+            generated_trajectory_adapter_token_readout_enabled
+        ),
+        generated_trajectory_adapter_token_readout_min_similarity=(
+            generated_trajectory_adapter_token_readout_min_similarity
         ),
         embedding_manifold_enabled=embedding_manifold_enabled,
         embedding_manifold_top_k=embedding_manifold_top_k,
@@ -5523,6 +5853,14 @@ def run_benchmark(
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
+    generated_adapter_leakage_report = _build_generated_adapter_leakage_report(
+        suite_cfg,
+        eval_dataset_name=dataset_name,
+        eval_split=effective_split,
+        eval_limit=limit,
+        eval_sample_indices=eval_manifest["sample_indices"],
+        generated_methods_enabled=any(name in GENERATED_LATENT_METHODS for name in report_method_names),
+    )
 
     sample_rows: list[dict[str, Any]] = []
     for latent_steps in latent_step_candidates:
@@ -5797,6 +6135,18 @@ def run_benchmark(
                             "generated_adapter_semantic_memory_target_text": row_result.get(
                                 "generated_adapter_semantic_memory_target_text"
                             ),
+                            "generated_adapter_token_readout_applied": row_result.get(
+                                "generated_adapter_token_readout_applied"
+                            ),
+                            "generated_adapter_token_readout_mean_similarity": row_result.get(
+                                "generated_adapter_token_readout_mean_similarity"
+                            ),
+                            "generated_adapter_token_readout_token_count": row_result.get(
+                                "generated_adapter_token_readout_token_count"
+                            ),
+                            "generated_adapter_token_readout_text": row_result.get(
+                                "generated_adapter_token_readout_text"
+                            ),
                             "embedding_manifold_enabled": row_result.get("embedding_manifold_enabled"),
                             "embedding_manifold_applied": row_result.get("embedding_manifold_applied"),
                             "embedding_manifold_delta_norm": row_result.get(
@@ -5992,6 +6342,20 @@ def run_benchmark(
             require_final_answer_marker_methods=required_marker_methods,
             max_diagnostic_rows=int(getattr(semantic_smoke_cfg, "max_diagnostic_rows", 5)),
         )
+        semantic_smoke_report = dict(semantic_smoke_report)
+        semantic_smoke_report["leakage_report"] = generated_adapter_leakage_report
+        if generated_adapter_leakage_report["possible_leakage"]:
+            missing_requirements = list(
+                semantic_smoke_report.get("missing_requirements") or []
+            )
+            missing_requirements.append(
+                "Generated adapter training rows overlap eval rows: "
+                f"dataset={generated_adapter_leakage_report['eval_dataset']} "
+                f"split={generated_adapter_leakage_report['eval_split']} "
+                f"indices={generated_adapter_leakage_report['overlapping_sample_indices']}."
+            )
+            semantic_smoke_report["missing_requirements"] = missing_requirements
+            semantic_smoke_report["passed"] = False
 
     provenance_baseline_methods = tuple(
         semantic_smoke_report["baseline_methods"]
@@ -6194,6 +6558,12 @@ def run_benchmark(
                     base_cfg
                 ),
             },
+            "token_readout": {
+                "enabled": _generated_trajectory_adapter_token_readout_enabled(base_cfg),
+                "min_similarity": _generated_trajectory_adapter_token_readout_min_similarity(
+                    base_cfg
+                ),
+            },
         },
         "embedding_manifold": {
             "enabled": bool(
@@ -6207,6 +6577,7 @@ def run_benchmark(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "runtime_smoke_report": runtime_smoke_report,
         "semantic_smoke_report": semantic_smoke_report,
+        "generated_adapter_leakage_report": generated_adapter_leakage_report,
         "transfer_comparison_report": transfer_comparison_report,
         "heterogeneous_transfer_report": heterogeneous_transfer_report,
         "latent_provenance_report": latent_provenance_report,
@@ -6256,6 +6627,8 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_semantic_memory_enabled: Optional[bool] = None,
     generated_trajectory_adapter_semantic_memory_min_similarity: Optional[float] = None,
     generated_trajectory_adapter_semantic_memory_max_entries: Optional[int] = None,
+    generated_trajectory_adapter_token_readout_enabled: Optional[bool] = None,
+    generated_trajectory_adapter_token_readout_min_similarity: Optional[float] = None,
     sender_revision_enabled: Optional[bool] = None,
     sender_revision_max_new_tokens: Optional[int] = None,
     sender_revision_disagreement_verifier_enabled: Optional[bool] = None,
@@ -6314,6 +6687,12 @@ def prepare_generated_trajectory_adapter_cache(
         ),
         generated_trajectory_adapter_semantic_memory_max_entries=(
             generated_trajectory_adapter_semantic_memory_max_entries
+        ),
+        generated_trajectory_adapter_token_readout_enabled=(
+            generated_trajectory_adapter_token_readout_enabled
+        ),
+        generated_trajectory_adapter_token_readout_min_similarity=(
+            generated_trajectory_adapter_token_readout_min_similarity
         ),
         sender_revision_enabled=sender_revision_enabled,
         sender_revision_max_new_tokens=sender_revision_max_new_tokens,
@@ -6385,6 +6764,14 @@ def prepare_generated_trajectory_adapter_cache(
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
     if eval_manifest_output_path is not None:
         write_json(eval_manifest_output_path, eval_manifest)
+    generated_adapter_leakage_report = _build_generated_adapter_leakage_report(
+        suite_cfg,
+        eval_dataset_name=dataset_name,
+        eval_split=effective_split,
+        eval_limit=limit,
+        eval_sample_indices=eval_manifest["sample_indices"],
+        generated_methods_enabled=any(name in GENERATED_LATENT_METHODS for name in report_method_names),
+    )
     if prepare_adapter:
         state = _get_pipeline_state(suite_cfg)
         variant_cfg, variant_state = _alignment_variant_state(
@@ -6519,7 +6906,14 @@ def prepare_generated_trajectory_adapter_cache(
                     base_cfg
                 ),
             },
+            "token_readout": {
+                "enabled": _generated_trajectory_adapter_token_readout_enabled(base_cfg),
+                "min_similarity": _generated_trajectory_adapter_token_readout_min_similarity(
+                    base_cfg
+                ),
+            },
         },
+        "generated_adapter_leakage_report": generated_adapter_leakage_report,
         "prepared_adapters": prepared_adapters,
         "prepared_eval_traces": prepared_eval_traces,
         "artifact_manifest": artifact_manifest,
@@ -6835,6 +7229,22 @@ def main() -> None:
         help="Optional maximum generated trajectory semantic memory entries.",
     )
     parser.add_argument(
+        "--enable-generated-trajectory-token-readout",
+        action="store_true",
+        help="Enable nearest-token readout for generated trajectory adapter outputs.",
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-token-readout",
+        action="store_true",
+        help="Disable generated-trajectory nearest-token readout for this run.",
+    )
+    parser.add_argument(
+        "--generated-trajectory-token-readout-min-similarity",
+        type=float,
+        default=None,
+        help="Optional mean cosine threshold for generated trajectory token readout.",
+    )
+    parser.add_argument(
         "--enable-embedding-manifold",
         action="store_true",
         help="Project latent prefix vectors onto the receiver embedding manifold.",
@@ -7099,6 +7509,16 @@ def main() -> None:
             generated_trajectory_adapter_semantic_memory_max_entries=(
                 args.generated_trajectory_semantic_memory_max_entries
             ),
+            generated_trajectory_adapter_token_readout_enabled=(
+                False
+                if args.disable_generated_trajectory_token_readout
+                else True
+                if args.enable_generated_trajectory_token_readout
+                else None
+            ),
+            generated_trajectory_adapter_token_readout_min_similarity=(
+                args.generated_trajectory_token_readout_min_similarity
+            ),
             sender_revision_enabled=True if args.enable_sender_revision else None,
             sender_revision_max_new_tokens=args.sender_revision_max_new_tokens,
             sender_revision_disagreement_verifier_enabled=(
@@ -7243,6 +7663,16 @@ def main() -> None:
         ),
         generated_trajectory_adapter_semantic_memory_max_entries=(
             args.generated_trajectory_semantic_memory_max_entries
+        ),
+        generated_trajectory_adapter_token_readout_enabled=(
+            False
+            if args.disable_generated_trajectory_token_readout
+            else True
+            if args.enable_generated_trajectory_token_readout
+            else None
+        ),
+        generated_trajectory_adapter_token_readout_min_similarity=(
+            args.generated_trajectory_token_readout_min_similarity
         ),
         embedding_manifold_enabled=(
             False
