@@ -28,6 +28,9 @@ from benchmark_all import (
     _answers_match,
     _cache_key_digest,
     _cache_key_metadata,
+    _collect_sender_generated_consensus_state,
+    _readout_embedding_scoring_state,
+    _receiver_embedding_sequence_for_aligned_text,
     _final_answer_tail_needs_scalar_verification,
     _format_sender_answer_text_handoff_prompt,
     _format_token_context_handoff_prompt,
@@ -35,6 +38,7 @@ from benchmark_all import (
     _format_verified_final_answer_text,
     _generated_trajectory_adapter_train_on_missing,
     _generated_trajectory_adapter_input_space,
+    _generated_trajectory_adapter_source_sequence,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_target_text,
     _generated_trajectory_adapter_trace_cache_path,
@@ -49,6 +53,7 @@ from benchmark_all import (
     _load_generated_trajectory_adapter_from_disk,
     _load_or_train_generated_trajectory_adapter_state,
     _methods_for_suite,
+    _release_accelerator_memory,
     _predicted_answer,
     _sample_fingerprints,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
@@ -56,6 +61,7 @@ from benchmark_all import (
     _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
+    _uniform_training_row_step_count,
     _validate_eval_manifest_sample_lock,
 )
 from src.utils.benchmarking import (
@@ -844,7 +850,7 @@ def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
 
     loaded = _load_eval_manifest(path)
 
-    assert loaded["manifest_schema_version"] == 2
+    assert loaded["manifest_schema_version"] == 3
     assert loaded["generated_trajectory_adapter"] == generated_identity
     assert loaded["handoff"] == handoff_identity
 
@@ -877,6 +883,7 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
             "source_mode": "final_answer_tail",
             "source_tail_tokens": 12,
             "input_space": "raw",
+            "strategy": "per_step_ridge",
             "target_mode": "final_answer_line",
             "target_alignment": "linear",
             "local_residual": {
@@ -945,6 +952,7 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
     assert args.generated_trajectory_adapter_train_limit == 8
     assert args.generated_trajectory_adapter_train_split == "test"
     assert args.generated_trajectory_adapter_input_space == "raw"
+    assert args.generated_trajectory_adapter_strategy == "per_step_ridge"
     assert args.generated_trajectory_adapter_source_mode == "final_answer_tail"
     assert args.generated_trajectory_adapter_source_tail_tokens == 12
     assert args.generated_trajectory_adapter_target_mode == "final_answer_line"
@@ -2275,3 +2283,270 @@ def test_methods_for_suite_filters_requested_methods_in_order() -> None:
     assert selected_methods == ["hybrid_hl_mas", "pure_text_cot"]
     with pytest.raises(ValueError, match="Unknown methods"):
         _methods_for_suite("standard", ["does_not_exist"])
+
+
+def test_release_accelerator_memory_runs_for_any_device() -> None:
+    # Must never raise regardless of accelerator availability: on CPU-only hosts
+    # it is just a gc pass, while on MPS/CUDA it also releases cached blocks so
+    # long adapter-construction loops do not climb to an out-of-memory crash.
+    _release_accelerator_memory()
+    _release_accelerator_memory(torch.device("cpu"))
+    _release_accelerator_memory("mps")
+
+
+class _ToySenderTokenizer:
+    def __init__(self) -> None:
+        self.encode_calls = 0
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        self.encode_calls += 1
+        return [3, 4, 5]
+
+    def __call__(self, text: str, return_tensors: str = "pt", add_special_tokens: bool = False):
+        return {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.ones((1, 2), dtype=torch.long),
+        }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        return "Final answer: 42."
+
+
+class _ToySenderModel:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        total_tokens = int(kwargs["input_ids"].shape[1])
+        base = torch.arange(total_tokens, dtype=torch.float32).reshape(1, total_tokens, 1)
+        hidden = base.expand(1, total_tokens, 4).clone()
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            hidden_states=(hidden, hidden * 0.5, hidden * 0.25),
+            past_key_values=None,
+            last_hidden_state=hidden,
+        )
+
+
+class _ToySenderAgent:
+    def __init__(self) -> None:
+        self.model = _ToySenderModel()
+
+    def parameters(self):
+        return iter([torch.zeros(1)])
+
+
+def _toy_sender_state() -> dict:
+    return {
+        "tokenizer_a": _ToySenderTokenizer(),
+        "agent_a": _ToySenderAgent(),
+        "global_reasoning_layer_indices": (0, 1),
+        "global_reasoning_layer_weights": (0.5, 0.5),
+        "_current_sample_row": {
+            "sender_reasoning_text": "Scratch step 1: track 42.\nFinal answer: 42."
+        },
+    }
+
+
+def test_collect_sender_generated_consensus_state_eval_retention_contract() -> None:
+    # The 100+ handoff loop depends on two properties of the sender producer:
+    # the never-consumed sender KV cache is not materialized or retained, and
+    # retain_in_memory=False keeps the shared consensus cache empty so unique
+    # long-context prompts cannot accumulate device tensors across the run.
+    cfg = OmegaConf.create(
+        {"agent_a_model": "toy-a", "torch_dtype": "float32", "max_new_tokens": 8}
+    )
+    state = _toy_sender_state()
+
+    result = _collect_sender_generated_consensus_state(
+        "What is 6 * 7?",
+        state,
+        cfg,
+        retain_in_memory=False,
+    )
+
+    assert result["kv_cache_a"] is None
+    assert state["agent_a"].model.calls[0]["use_cache"] is False
+    # include_prompt=False keeps only the generated-trace positions (3 frozen ids).
+    assert tuple(result["consensus_hidden_states"].shape) == (1, 3, 4)
+    assert result["generated_reasoning_status"] == "complete"
+    assert state["_generated_sender_consensus_cache"] == {}
+
+    retained = _collect_sender_generated_consensus_state(
+        "What is 6 * 7?",
+        state,
+        cfg,
+        retain_in_memory=True,
+    )
+    assert retained["kv_cache_a"] is None
+    assert len(state["_generated_sender_consensus_cache"]) == 1
+    # The frozen sender trace is encoded once and reused via the shared token-id
+    # cache, not re-tokenized on every method/sample pass.
+    assert state["tokenizer_a"].encode_calls == 1
+
+
+def test_token_readout_embedding_scoring_state_is_cached_per_weight() -> None:
+    weight = torch.tensor([[3.0, 4.0], [0.0, 2.0]])
+    device = torch.device("cpu")
+
+    first = _readout_embedding_scoring_state(weight, device)
+    second = _readout_embedding_scoring_state(weight, device)
+
+    assert first is second
+    # fp32 weights score against the table itself with cached row norms — no
+    # duplicated normalized copy of the full embedding matrix.
+    assert "normalized" not in first
+    assert torch.allclose(first["norms"], torch.tensor([5.0, 2.0]))
+    query = torch.nn.functional.normalize(torch.tensor([[3.0, 4.0]]), dim=-1)
+    norm_scores = (query @ first["weight"].transpose(0, 1)) / first["norms"]
+    assert torch.allclose(
+        norm_scores,
+        query @ torch.nn.functional.normalize(weight, dim=-1).transpose(0, 1),
+    )
+
+    half_weight = torch.tensor([[3.0, 4.0], [0.0, 2.0]], dtype=torch.float16)
+    half_state = _readout_embedding_scoring_state(half_weight, device)
+    assert "normalized" in half_state
+    assert half_state["normalized"].dtype == torch.float32
+
+
+def test_receiver_embedding_tail_tokens_alignment_is_exact_and_right_aligned() -> None:
+    # tail_tokens targets must be real receiver embedding rows (no interpolation):
+    # right-aligned against the source tail, left-padded with the first token's
+    # embedding when the receiver tokenization is shorter than the source steps.
+    class _TailTokenizer:
+        def __call__(self, text, return_tensors="pt", add_special_tokens=False):
+            return {"input_ids": torch.tensor([[3, 5, 7]])}
+
+    class _TailEmbeddings:
+        weight = torch.arange(40, dtype=torch.float32).reshape(10, 4)
+
+        def __call__(self, input_ids):
+            return self.weight[input_ids]
+
+    class _TailAgent:
+        def get_input_embeddings(self):
+            return _TailEmbeddings()
+
+        def parameters(self):
+            return iter([torch.zeros(1)])
+
+    state = {"tokenizer_b": _TailTokenizer(), "agent_b": _TailAgent()}
+    table = _TailEmbeddings.weight
+
+    padded = _receiver_embedding_sequence_for_aligned_text(
+        "Final answer: 42",
+        state=state,
+        source_token_ids=(1, 1, 1, 1, 1),
+        target_steps=5,
+        target_alignment="tail_tokens",
+    )
+    assert tuple(padded.shape) == (1, 5, 4)
+    assert torch.equal(padded[0, 0], table[3])
+    assert torch.equal(padded[0, 1], table[3])
+    assert torch.equal(padded[0, 2], table[3])
+    assert torch.equal(padded[0, 3], table[5])
+    assert torch.equal(padded[0, 4], table[7])
+
+    truncated = _receiver_embedding_sequence_for_aligned_text(
+        "Final answer: 42",
+        state=state,
+        source_token_ids=(1, 1),
+        target_steps=2,
+        target_alignment="tail_tokens",
+    )
+    assert tuple(truncated.shape) == (1, 2, 4)
+    assert torch.equal(truncated[0, 0], table[5])
+    assert torch.equal(truncated[0, 1], table[7])
+
+
+def test_target_alignment_accepts_tail_tokens_without_generated_text_mode() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "target_alignment": "tail_tokens",
+                    "target_mode": "final_answer_line",
+                }
+            }
+        }
+    )
+    assert _generated_trajectory_adapter_target_alignment(cfg) == "tail_tokens"
+
+
+def test_uniform_training_row_step_count_validates_and_infers() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "source_tail_tokens": 3,
+                }
+            }
+        }
+    )
+    assert (
+        _uniform_training_row_step_count(cfg, {"row_step_counts": [3, 3, 3]}) == 3
+    )
+    with pytest.raises(ValueError, match="uniform step count"):
+        _uniform_training_row_step_count(cfg, {"row_step_counts": [3, 2]})
+    # legacy caches without step counts: infer from the configured tail length only
+    # when the prompt count confirms the exact layout
+    legacy = {"source_matrix": torch.zeros(6, 4), "training_prompt_count": 2}
+    assert _uniform_training_row_step_count(cfg, legacy) == 3
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(
+            cfg, {"source_matrix": torch.zeros(7, 4), "training_prompt_count": 2}
+        )
+    # divisible totals without a confirming prompt count are rejected, not guessed
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(cfg, {"source_matrix": torch.zeros(6, 4)})
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(
+            cfg, {"source_matrix": torch.zeros(6, 4), "training_prompt_count": 3}
+        )
+
+
+def test_anchored_source_mode_concatenates_sender_tail_embeddings() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "source_mode": "final_answer_tail_anchored",
+                    "source_tail_tokens": 2,
+                    "input_space": "raw",
+                }
+            }
+        }
+    )
+
+    class _AnchorEmbeddings:
+        weight = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+
+        def __call__(self, input_ids):
+            return self.weight[input_ids]
+
+    class _AnchorAgent:
+        def get_input_embeddings(self):
+            return _AnchorEmbeddings()
+
+    sender_state = {
+        "consensus_hidden_states": torch.ones((1, 3, 4)),
+        "generated_token_ids": [5, 6, 7],
+    }
+    state = {"agent_a": _AnchorAgent()}
+
+    anchored = _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=state)
+    assert tuple(anchored.shape) == (1, 2, 6)
+    # last 2 consensus steps, concatenated with embeddings of the last 2 tail ids
+    assert torch.equal(anchored[0, :, :4], torch.ones((2, 4)))
+    assert torch.equal(anchored[0, 0, 4:], _AnchorEmbeddings.weight[6])
+    assert torch.equal(anchored[0, 1, 4:], _AnchorEmbeddings.weight[7])
+
+    cfg.handoff.generated_trajectory_adapter.input_space = "aligned"
+    with pytest.raises(ValueError, match="input_space=raw"):
+        _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=state)
+    cfg.handoff.generated_trajectory_adapter.input_space = "raw"
+    with pytest.raises(ValueError, match="agent_a"):
+        _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=None)

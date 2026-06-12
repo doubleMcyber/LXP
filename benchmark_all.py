@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import re
 import subprocess
 import sys
 import time
+import weakref
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -33,7 +35,6 @@ from latent_pipeline import (
     _receiver_context_mode,
     _resolve_reasoning_layer_indices_from_counts,
     _resolve_reasoning_layer_weights,
-    _run_actor_handoff,
     _select_hidden_layers,
     _should_use_receiver_context,
     apply_embedding_manifold_projection,
@@ -44,6 +45,7 @@ from latent_pipeline import (
 from src.data.loader import get_dataloader, pick_field
 from src.models.dynamics import _normalize_kv_cache
 from src.utils.alignment import (
+    _device_resident,
     apply_alignment,
     apply_linear_mapping,
     compute_alignment_state,
@@ -133,7 +135,7 @@ DEFAULT_HETERO_SMOKE_BASELINE_METHODS = (
 DEFAULT_HETERO_SMOKE_LATENT_METHODS = (
     "generated_latent_handoff",
 )
-EVAL_MANIFEST_SCHEMA_VERSION = 2
+EVAL_MANIFEST_SCHEMA_VERSION = 3
 ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
 TEXT_BASELINE_METHODS = frozenset(
     (
@@ -145,7 +147,7 @@ TEXT_BASELINE_METHODS = frozenset(
     )
 )
 GENERATED_TRAJECTORY_ADAPTER_INPUT_SPACES = frozenset(("aligned", "raw"))
-GENERATED_TRAJECTORY_ADAPTER_TARGET_ALIGNMENTS = frozenset(("character", "linear"))
+GENERATED_TRAJECTORY_ADAPTER_TARGET_ALIGNMENTS = frozenset(("character", "linear", "tail_tokens"))
 GENERATED_LATENT_METHODS = frozenset(
     (
         "generated_latent_handoff",
@@ -561,7 +563,22 @@ def _generate_reasoner_metadata(prompt: str, cfg: Any, state: dict[str, Any]) ->
     tokenizer_a = state["tokenizer_a"]
     frozen_reasoning_text = _frozen_sender_reasoning_text(state)
     if frozen_reasoning_text is not None:
-        frozen_ids = tokenizer_a.encode(frozen_reasoning_text, add_special_tokens=False)
+        # Frozen long-context traces are multi-thousand-token strings re-read once per
+        # method per sample; cache the encoding in the variant-shared token-id cache
+        # (in-place adds only — the dict is shared by reference across variant states).
+        encode_cache = state.setdefault("_reasoner_token_ids_cache", {})
+        frozen_cache_key = (
+            "__frozen__",
+            hashlib.sha256(frozen_reasoning_text.encode("utf-8")).hexdigest(),
+        )
+        cached_frozen_ids = encode_cache.get(frozen_cache_key)
+        if cached_frozen_ids is None:
+            cached_frozen_ids = tuple(
+                int(token_id)
+                for token_id in tokenizer_a.encode(frozen_reasoning_text, add_special_tokens=False)
+            )
+            encode_cache[frozen_cache_key] = cached_frozen_ids
+        frozen_ids = list(cached_frozen_ids)
         frozen_answer = _final_answer_marker_value(frozen_reasoning_text)
         return {
             "token_ids": [int(token_id) for token_id in frozen_ids],
@@ -1264,6 +1281,8 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
             args.generated_trajectory_adapter_train_split = str(generated_adapter["train_split"])
         if generated_adapter.get("input_space") is not None:
             args.generated_trajectory_adapter_input_space = str(generated_adapter["input_space"])
+        if generated_adapter.get("strategy") is not None:
+            args.generated_trajectory_adapter_strategy = str(generated_adapter["strategy"])
         if generated_adapter.get("source_mode") is not None:
             args.generated_trajectory_adapter_source_mode = str(generated_adapter["source_mode"])
         if generated_adapter.get("source_tail_tokens") is not None:
@@ -1452,7 +1471,10 @@ def _sender_generated_trace_payload(
         "trace_cache_format_version": 2,
         "cache_key": _cache_key_metadata(cache_key),
         "cache_key_digest": _cache_key_digest(cache_key),
-        "consensus_hidden_states": result["consensus_hidden_states"].detach().cpu(),
+        # clone(): the consensus is a view into the full prompt+generated tensor, and
+        # on CPU-resident senders .cpu() is a no-op, so torch.save would otherwise
+        # serialize (and later reload + pin) the entire underlying storage.
+        "consensus_hidden_states": result["consensus_hidden_states"].detach().cpu().clone(),
         "generated_token_ids": [int(token_id) for token_id in result["generated_token_ids"]],
         "generated_reasoning_text": str(result["generated_reasoning_text"]),
         "generated_reasoning_token_count": int(result["generated_reasoning_token_count"]),
@@ -1538,12 +1560,37 @@ def _sender_generated_trace_result_from_payload(
     }
 
 
+def _release_accelerator_memory(device: Any = None) -> None:
+    """Return cached accelerator memory to the allocator between heavy
+    sender-generation iterations.
+
+    Long adapter-construction and evaluation loops on MPS otherwise let the
+    allocator high-watermark grow until the device runs out of memory; CUDA
+    reuses freed blocks automatically but still benefits from periodic release.
+    Beyond ``gc.collect()`` this is a no-op on CPU-only hosts.
+    """
+    gc.collect()
+    device_type = getattr(device, "type", None)
+    if device_type is None:
+        device_type = str(device) if device is not None else ""
+    if device_type in ("", "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps_backend = getattr(torch, "mps", None)
+    if (
+        device_type in ("", "mps")
+        and mps_backend is not None
+        and torch.backends.mps.is_available()
+    ):
+        mps_backend.empty_cache()
+
+
 def _collect_sender_generated_consensus_state(
     prompt: str,
     state: dict[str, Any],
     cfg: Any,
     *,
     include_prompt: bool = False,
+    retain_in_memory: bool = True,
 ) -> dict[str, Any]:
     cache = state.setdefault("_generated_sender_consensus_cache", {})
     cache_key = _generated_trajectory_trace_cache_key(
@@ -1570,7 +1617,8 @@ def _collect_sender_generated_consensus_state(
                 cfg=cfg,
                 cache_path=trace_cache_path,
             )
-            cache[cache_key] = result
+            if retain_in_memory:
+                cache[cache_key] = result
             return result
 
     tokenizer_a = state["tokenizer_a"]
@@ -1606,11 +1654,14 @@ def _collect_sender_generated_consensus_state(
     position_ids = _build_position_ids(full_attention_mask)
 
     with torch.no_grad():
+        # The generated decode path never consumes the sender KV cache (it always
+        # passes kv_cache_a=None, and disk-restored traces carry None), so building
+        # one would only pin hundreds of MB per long-context prompt on the device.
         outputs = agent_a.model(
             input_ids=full_input_ids,
             attention_mask=full_attention_mask,
             position_ids=position_ids,
-            use_cache=True,
+            use_cache=False,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -1651,7 +1702,7 @@ def _collect_sender_generated_consensus_state(
         ),
         "attention_mask": latent_attention_mask,
         "latent_pooling": pooling_mode,
-        "kv_cache_a": _normalize_kv_cache(outputs.past_key_values),
+        "kv_cache_a": None,
         "reasoning_layer_indices": reasoning_layer_indices,
         "reasoning_layer_weights": reasoning_layer_weights,
         "generated_token_ids": generated_ids,
@@ -1681,7 +1732,8 @@ def _collect_sender_generated_consensus_state(
     result["generated_trace_cache_path"] = "" if trace_cache_path is None else str(trace_cache_path)
     if trace_cache_path is not None:
         torch.save(_sender_generated_trace_payload(result, cache_key=cache_key), trace_cache_path)
-    cache[cache_key] = result
+    if retain_in_memory:
+        cache[cache_key] = result
     return result
 
 
@@ -2263,6 +2315,7 @@ def _generated_trajectory_adapter_identity_manifest(cfg: Any) -> dict[str, Any]:
         "source_mode": _generated_trajectory_adapter_source_mode(cfg),
         "source_tail_tokens": _generated_trajectory_adapter_source_tail_tokens(cfg),
         "input_space": _generated_trajectory_adapter_input_space(cfg),
+        "strategy": str(_generated_trajectory_adapter_value(cfg, "strategy", "hybrid_affine")),
         "target_mode": _generated_trajectory_adapter_target_mode(cfg),
         "target_alignment": _generated_trajectory_adapter_target_alignment(cfg),
         "local_residual": {
@@ -2345,7 +2398,10 @@ def _source_token_ids_for_generated_adapter(
     sender_state: dict[str, Any],
 ) -> list[int]:
     generated_ids = [int(token_id) for token_id in sender_state.get("generated_token_ids", ())]
-    if _generated_trajectory_adapter_source_mode(cfg) == "final_answer_tail":
+    if _generated_trajectory_adapter_source_mode(cfg) in (
+        "final_answer_tail",
+        "final_answer_tail_anchored",
+    ):
         tail_tokens = max(1, _generated_trajectory_adapter_source_tail_tokens(cfg))
         return generated_ids[-tail_tokens:]
     return generated_ids
@@ -2365,6 +2421,39 @@ def _receiver_embedding_sequence_for_aligned_text(
             state=state,
             target_steps=target_steps,
         )
+    if target_alignment == "tail_tokens":
+        # Exact receiver token embeddings right-aligned to the source tail. Linear
+        # resampling interpolates between embedding rows, so every target step is an
+        # off-manifold blend whose nearest-token decode smears digits across slots.
+        # The target text is the source tail's own decoded text (not the provided
+        # summary text): both sequences then end on the same characters, so the
+        # right-aligned slots correspond token-for-token — pairing each sender
+        # position with the receiver token at that position instead of shifting the
+        # answer digits onto neighbouring slots.
+        tokenizer_a = state.get("tokenizer_a")
+        tokenizer_b = state["tokenizer_b"]
+        agent_b = state["agent_b"]
+        agent_b_device = next(agent_b.parameters()).device
+        tail_text = (
+            tokenizer_a.decode(list(source_token_ids), skip_special_tokens=True)
+            if tokenizer_a is not None and source_token_ids
+            else str(text)
+        )
+        encoded = tokenizer_b(tail_text, return_tensors="pt", add_special_tokens=False)
+        if int(encoded["input_ids"].shape[-1]) == 0:
+            return None
+        input_ids = encoded["input_ids"].to(agent_b_device)
+        with torch.no_grad():
+            receiver_embeddings = agent_b.get_input_embeddings()(input_ids)
+        token_count = int(receiver_embeddings.shape[1])
+        if token_count >= int(target_steps):
+            return receiver_embeddings[:, -int(target_steps) :, :]
+        pad = receiver_embeddings[:, :1, :].expand(
+            int(receiver_embeddings.shape[0]),
+            int(target_steps) - token_count,
+            int(receiver_embeddings.shape[-1]),
+        )
+        return torch.cat([pad, receiver_embeddings], dim=1)
     if not source_token_ids or len(source_token_ids) != int(target_steps):
         return _receiver_embedding_sequence_for_text(
             text,
@@ -2429,6 +2518,8 @@ def _generated_trajectory_adapter_target_text(cfg: Any, generated_text: str) -> 
 def _generated_trajectory_adapter_source_sequence(
     cfg: Any,
     sender_state: dict[str, Any],
+    *,
+    state: Optional[dict[str, Any]] = None,
 ) -> torch.Tensor:
     source_sequence = sender_state["consensus_hidden_states"]
     mode = _generated_trajectory_adapter_source_mode(cfg)
@@ -2438,9 +2529,44 @@ def _generated_trajectory_adapter_source_sequence(
         tail_tokens = max(1, _generated_trajectory_adapter_source_tail_tokens(cfg))
         tail_steps = min(int(source_sequence.shape[1]), tail_tokens)
         return source_sequence[:, -tail_steps:, :]
+    if mode == "final_answer_tail_anchored":
+        # Tail consensus states concatenated with the sender's input embeddings of
+        # the same tail tokens. The mid-layer consensus encodes answer semantics but
+        # dilutes exact token identity (repeated digits drift); the embedding
+        # component pins each slot's token identity, making the per-step linear map
+        # a near-exact token transcoder while keeping the semantic features.
+        if state is None or "agent_a" not in state:
+            raise ValueError(
+                "source_mode=final_answer_tail_anchored requires the pipeline state "
+                "with agent_a to embed the sender tail tokens"
+            )
+        if _generated_trajectory_adapter_input_space(cfg) != "raw":
+            raise ValueError(
+                "source_mode=final_answer_tail_anchored requires input_space=raw "
+                "(the base alignment expects unanchored sender hidden states)"
+            )
+        tail_tokens = max(1, _generated_trajectory_adapter_source_tail_tokens(cfg))
+        tail_steps = min(int(source_sequence.shape[1]), tail_tokens)
+        tail_consensus = source_sequence[:, -tail_steps:, :]
+        generated_ids = list(sender_state.get("generated_token_ids") or ())
+        tail_ids = generated_ids[-tail_steps:]
+        if len(tail_ids) != tail_steps:
+            raise ValueError(
+                "final_answer_tail_anchored requires at least as many generated "
+                f"tokens as tail steps; got {len(tail_ids)} ids for {tail_steps} steps"
+            )
+        agent_a = state["agent_a"]
+        with torch.no_grad():
+            tail_embeddings = agent_a.get_input_embeddings()(
+                torch.tensor([tail_ids], dtype=torch.long, device=tail_consensus.device)
+            )
+        return torch.cat(
+            [tail_consensus, tail_embeddings.to(dtype=tail_consensus.dtype)],
+            dim=-1,
+        )
     raise ValueError(
         "handoff.generated_trajectory_adapter.source_mode must be one of: "
-        "generated_text, final_answer_tail"
+        "generated_text, final_answer_tail, final_answer_tail_anchored"
     )
 
 
@@ -2553,11 +2679,13 @@ def _apply_generated_adapter_local_residual(
             "generated_adapter_local_residual_mean_top_similarity": None,
             "generated_adapter_local_residual_memory_rows": None,
         }
-    source_memory = residual_state["source_memory"].to(
+    source_memory = _device_resident(
+        residual_state["source_memory"],
         device=adapter_input.device,
         dtype=torch.float32,
     )
-    residual_memory = residual_state["residual_memory"].to(
+    residual_memory = _device_resident(
+        residual_state["residual_memory"],
         device=adapted_handoff_step.device,
         dtype=torch.float32,
     )
@@ -2732,6 +2860,53 @@ def _apply_generated_adapter_semantic_memory(
     }
 
 
+# Per-process scoring state for the nearest-embedding token readout, keyed by id() of
+# the embedding weight with weakref.finalize eviction so entries die with the model.
+# The state is identical on every handoff; re-materializing a ~vocab x dim fp32 copy
+# per call dominated readout cost. float32 weights are scored against the model's own
+# table with a cached [vocab] row-norm vector (q @ W.T / norms is algebraically the
+# same as normalizing W, without duplicating ~1GB of unified memory); half-precision
+# weights keep one cached fp32-normalized table so the scoring math stays fp32.
+_TOKEN_READOUT_EMBEDDING_CACHE: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
+
+
+def _readout_embedding_scoring_state(
+    embedding_weight: torch.Tensor,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    cache_id = id(embedding_weight)
+    per_weight = _TOKEN_READOUT_EMBEDDING_CACHE.get(cache_id)
+    if per_weight is None:
+        per_weight = {}
+        _TOKEN_READOUT_EMBEDDING_CACHE[cache_id] = per_weight
+        weakref.finalize(embedding_weight, _TOKEN_READOUT_EMBEDDING_CACHE.pop, cache_id, None)
+    cached = per_weight.get(str(device))
+    if cached is None:
+        weight = embedding_weight.detach().to(device=device)
+        if weight.dtype == torch.float32:
+            # clamp matches F.normalize's eps so zero rows score 0, not nan
+            cached = {
+                "weight": weight,
+                "norms": torch.linalg.vector_norm(weight, dim=-1).clamp_min(1e-12),
+            }
+        else:
+            cached = {
+                "normalized": torch.nn.functional.normalize(
+                    weight.to(dtype=torch.float32),
+                    dim=-1,
+                ),
+            }
+        per_weight[str(device)] = cached
+    return cached
+
+
+def _token_readout_dataset_name(cfg: Any) -> str:
+    dataset_name = getattr(getattr(cfg, "benchmark", None), "dataset_name", None)
+    if dataset_name is not None and str(dataset_name).strip():
+        return str(dataset_name)
+    return "long_context_handoff"
+
+
 def _generated_adapter_token_readout(
     handoff_step: torch.Tensor,
     *,
@@ -2748,24 +2923,43 @@ def _generated_adapter_token_readout(
         }
     if handoff_step.dim() != 3:
         raise ValueError("handoff_step must have shape [batch, steps, dim]")
-    embedding_weight = agent_b.get_input_embeddings().weight.detach().to(
-        device=handoff_step.device,
-        dtype=torch.float32,
-    )
     query_rows = torch.nn.functional.normalize(
         handoff_step.detach().reshape(-1, handoff_step.shape[-1]).float(),
         dim=-1,
     )
-    embedding_rows = torch.nn.functional.normalize(embedding_weight, dim=-1)
-    scores = query_rows @ embedding_rows.transpose(0, 1)
-    top_values, top_indices = torch.max(scores, dim=-1)
+    scoring_state = _readout_embedding_scoring_state(
+        agent_b.get_input_embeddings().weight,
+        handoff_step.device,
+    )
+    # Chunk over query rows so the [steps, vocab] score matrix never materializes in
+    # full for long sequence prefixes.
+    top_value_chunks: list[torch.Tensor] = []
+    top_index_chunks: list[torch.Tensor] = []
+    chunk_size = 256
+    for start in range(0, int(query_rows.shape[0]), chunk_size):
+        query_chunk = query_rows[start : start + chunk_size]
+        if "normalized" in scoring_state:
+            chunk_scores = query_chunk @ scoring_state["normalized"].transpose(0, 1)
+        else:
+            chunk_scores = (
+                query_chunk @ scoring_state["weight"].transpose(0, 1)
+            ) / scoring_state["norms"]
+        chunk_values, chunk_indices = torch.max(chunk_scores, dim=-1)
+        top_value_chunks.append(chunk_values)
+        top_index_chunks.append(chunk_indices)
+    if top_value_chunks:
+        top_values = torch.cat(top_value_chunks, dim=0)
+        top_indices = torch.cat(top_index_chunks, dim=0)
+    else:
+        top_values = query_rows.new_zeros((0,))
+        top_indices = torch.zeros((0,), dtype=torch.long, device=query_rows.device)
     token_ids = [int(token_id) for token_id in top_indices.detach().cpu().tolist()]
     decoded_text = tokenizer_b.decode(
         token_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
-    predicted_answer = _predicted_answer("long_context_handoff", str(decoded_text))
+    predicted_answer = _predicted_answer(_token_readout_dataset_name(cfg), str(decoded_text))
     mean_similarity = float(top_values.mean().detach().cpu().item())
     min_similarity = _generated_trajectory_adapter_token_readout_min_similarity(cfg)
     if predicted_answer is None or mean_similarity < min_similarity:
@@ -2806,6 +3000,7 @@ def _build_generated_trajectory_training_rows(
     )
     source_rows: list[torch.Tensor] = []
     target_rows: list[torch.Tensor] = []
+    row_step_counts: list[int] = []
     semantic_memory_entries: list[dict[str, Any]] = []
     prompt_count = 0
     token_count = 0
@@ -2824,6 +3019,7 @@ def _build_generated_trajectory_training_rows(
             state,
             cfg,
             include_prompt=include_prompt,
+            retain_in_memory=False,
         )
         trace_cache_path = str(sender_state.get("generated_trace_cache_path") or "")
         if trace_cache_path:
@@ -2832,7 +3028,11 @@ def _build_generated_trajectory_training_rows(
                 trace_cache_hit_count += 1
             else:
                 trace_cache_miss_count += 1
-        source_sequence = _generated_trajectory_adapter_source_sequence(cfg, sender_state)
+        source_sequence = _generated_trajectory_adapter_source_sequence(
+            cfg,
+            sender_state,
+            state=state,
+        )
         adapter_source = _generated_trajectory_adapter_fit_source(
             source_sequence,
             alignment_state,
@@ -2854,11 +3054,12 @@ def _build_generated_trajectory_training_rows(
             continue
         source_rows.append(adapter_source.detach().float().cpu().reshape(-1, adapter_source.shape[-1]))
         target_rows.append(target_sequence.detach().float().cpu().reshape(-1, target_sequence.shape[-1]))
+        row_step_counts.append(int(adapter_source.shape[1]))
         if _generated_trajectory_adapter_semantic_memory_enabled(cfg):
             target_answer = _final_answer_marker_value(target_text)
             semantic_memory_entries.append(
                 {
-                    "source_sequence": adapter_source.detach().float().cpu().squeeze(0),
+                    "source_sequence": adapter_source.detach().float().cpu().squeeze(0).clone(),
                     "target_text": str(target_text),
                     "target_answer": target_answer,
                     "source_token_count": int(adapter_source.shape[1]),
@@ -2879,6 +3080,10 @@ def _build_generated_trajectory_training_rows(
                 f"trace cache hits={trace_cache_hit_count}, misses={trace_cache_miss_count})",
                 flush=True,
             )
+        del sender_state, source_sequence, adapter_source, target_sequence
+        if row_index % 8 == 0:
+            _release_accelerator_memory()
+    _release_accelerator_memory()
     if not source_rows:
         raise ValueError("No usable generated trajectories were available for adapter fitting")
     source_matrix = torch.cat(source_rows, dim=0)
@@ -2891,6 +3096,7 @@ def _build_generated_trajectory_training_rows(
     return {
         "source_matrix": source_matrix,
         "target_matrix": target_matrix,
+        "row_step_counts": row_step_counts,
         "training_prompt_count": int(prompt_count),
         "training_token_count": int(token_count),
         "training_trace_cache_hit_count": int(trace_cache_hit_count),
@@ -2909,17 +3115,14 @@ def _load_or_build_generated_trajectory_training_rows(
     *,
     include_prompt: bool,
 ) -> dict[str, Any]:
-    memory_cache = state.setdefault("_generated_trajectory_training_rows_cache", {})
+    # No in-memory rows cache: the row matrices are GB-scale for long-context fits
+    # and pinning them for the process lifetime shrinks MPS unified-memory headroom
+    # for the entire handoff loop; the disk cache below covers repeat fits.
     cache_key = _generated_trajectory_adapter_training_rows_cache_key(
         cfg,
         state,
         include_prompt=include_prompt,
     )
-    cached_rows = memory_cache.get(cache_key)
-    if cached_rows is not None:
-        print("Generated trajectory rows cache hit in memory", flush=True)
-        return {**cached_rows, "training_row_cache_hit": True}
-
     cache_path = _generated_trajectory_adapter_training_rows_cache_path(cfg, cache_key)
     print(f"Checking generated trajectory rows cache: {cache_path}", flush=True)
     cached_rows = _load_generated_trajectory_training_rows_from_disk(
@@ -2944,14 +3147,37 @@ def _load_or_build_generated_trajectory_training_rows(
         print(f"Wrote generated trajectory rows cache: {cache_path}", flush=True)
     else:
         print(f"Loaded generated trajectory rows cache: {cache_path}", flush=True)
-    info = {
+    return {
         **cached_rows,
         "training_row_cache_hit": cache_hit,
         "training_row_cache_path": str(cache_path),
         "training_rows_cache_key_digest": _cache_key_digest(cache_key),
     }
-    memory_cache[cache_key] = info
-    return info
+
+
+def _uniform_training_row_step_count(cfg: Any, training_rows: Mapping[str, Any]) -> int:
+    step_counts = training_rows.get("row_step_counts")
+    if step_counts:
+        unique_counts = {int(count) for count in step_counts}
+        if len(unique_counts) != 1:
+            raise ValueError(
+                "per_step_ridge requires a uniform step count across training rows; "
+                f"got {sorted(unique_counts)}"
+            )
+        return unique_counts.pop()
+    # Older rows caches predate row_step_counts; infer from the configured tail
+    # length only when the prompt count confirms the layout exactly — divisibility
+    # alone can hold for non-uniform or differently-sized legacy rows, silently
+    # fitting every per-step state on position-scrambled data.
+    steps = max(1, _generated_trajectory_adapter_source_tail_tokens(cfg))
+    total_rows = int(training_rows["source_matrix"].shape[0])
+    prompt_count = int(training_rows.get("training_prompt_count") or 0)
+    if total_rows % steps != 0 or prompt_count <= 0 or steps * prompt_count != total_rows:
+        raise ValueError(
+            "per_step_ridge could not infer the per-row step count from a legacy "
+            "rows cache; rebuild the training rows cache"
+        )
+    return steps
 
 
 def _fit_generated_trajectory_adapter_state(
@@ -2969,25 +3195,90 @@ def _fit_generated_trajectory_adapter_state(
     )
     source_matrix = training_rows["source_matrix"]
     target_matrix = training_rows["target_matrix"]
-    adapter_state = compute_alignment_state(
-        source_matrix,
-        target_matrix,
-        strategy=str(_generated_trajectory_adapter_value(cfg, "strategy", "hybrid_affine")),
-        center=bool(_generated_trajectory_adapter_value(cfg, "center", True)),
-        use_bias=bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
-        regularization=float(_generated_trajectory_adapter_value(cfg, "regularization", 1e-3)),
-        residual_alpha=float(_generated_trajectory_adapter_value(cfg, "residual_alpha", 1.0)),
-        residual_max_norm_ratio=float(
-            _generated_trajectory_adapter_value(cfg, "residual_max_norm_ratio", 0.5)
-        ),
-        adaptive_projection_strength=float(
-            _generated_trajectory_adapter_value(cfg, "adaptive_projection_strength", 0.15)
-        ),
-        adaptive_projection_clip_std_multiplier=float(
-            _generated_trajectory_adapter_value(cfg, "adaptive_projection_clip_std_multiplier", 4.0)
-        ),
-    )
-    fitted = apply_alignment(source_matrix, adapter_state).float()
+    strategy = str(_generated_trajectory_adapter_value(cfg, "strategy", "hybrid_affine"))
+    if strategy == "per_step_ridge":
+        steps = _uniform_training_row_step_count(cfg, training_rows)
+        source_steps = source_matrix.reshape(-1, steps, int(source_matrix.shape[-1]))
+        target_steps_matrix = target_matrix.reshape(-1, steps, int(target_matrix.shape[-1]))
+        # One ridge state per tail position: the slots are distinct sub-tasks (fixed
+        # template tokens vs answer digits), and a shared map provably blurs digit
+        # identity across slots while position-wise ridge transcodes them exactly.
+        per_step_states = [
+            compute_alignment_state(
+                source_steps[:, step_index, :],
+                target_steps_matrix[:, step_index, :],
+                strategy="ridge",
+                center=bool(_generated_trajectory_adapter_value(cfg, "center", True)),
+                use_bias=bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
+                regularization=float(
+                    _generated_trajectory_adapter_value(cfg, "regularization", 1e-3)
+                ),
+                adaptive_projection_strength=float(
+                    _generated_trajectory_adapter_value(cfg, "adaptive_projection_strength", 0.15)
+                ),
+                adaptive_projection_clip_std_multiplier=float(
+                    _generated_trajectory_adapter_value(
+                        cfg, "adaptive_projection_clip_std_multiplier", 4.0
+                    )
+                ),
+            )
+            for step_index in range(steps)
+        ]
+        adapter_state = compute_alignment_state(
+            source_matrix,
+            target_matrix,
+            strategy="ridge",
+            center=bool(_generated_trajectory_adapter_value(cfg, "center", True)),
+            use_bias=bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
+            regularization=float(_generated_trajectory_adapter_value(cfg, "regularization", 1e-3)),
+            adaptive_projection_strength=float(
+                _generated_trajectory_adapter_value(cfg, "adaptive_projection_strength", 0.15)
+            ),
+            adaptive_projection_clip_std_multiplier=float(
+                _generated_trajectory_adapter_value(
+                    cfg, "adaptive_projection_clip_std_multiplier", 4.0
+                )
+            ),
+        )
+        adapter_state["per_step_states"] = per_step_states
+        # Coverage diagnostic: a per-step map can only reproduce target tokens it
+        # saw at that position, so thin slots predict confidently-wrong readouts
+        # on out-of-coverage answers (the failure is invisible in fit metrics).
+        per_step_unique_targets = [
+            int(torch.unique(target_steps_matrix[:, step_index, :], dim=0).shape[0])
+            for step_index in range(steps)
+        ]
+        adapter_state["per_step_unique_target_counts"] = per_step_unique_targets
+        print(
+            "Generated trajectory adapter per-step unique target counts: "
+            f"{per_step_unique_targets}",
+            flush=True,
+        )
+        fitted = apply_alignment(source_steps, adapter_state).reshape(
+            -1, int(target_matrix.shape[-1])
+        ).float()
+    else:
+        adapter_state = compute_alignment_state(
+            source_matrix,
+            target_matrix,
+            strategy=strategy,
+            center=bool(_generated_trajectory_adapter_value(cfg, "center", True)),
+            use_bias=bool(_generated_trajectory_adapter_value(cfg, "use_bias", True)),
+            regularization=float(_generated_trajectory_adapter_value(cfg, "regularization", 1e-3)),
+            residual_alpha=float(_generated_trajectory_adapter_value(cfg, "residual_alpha", 1.0)),
+            residual_max_norm_ratio=float(
+                _generated_trajectory_adapter_value(cfg, "residual_max_norm_ratio", 0.5)
+            ),
+            adaptive_projection_strength=float(
+                _generated_trajectory_adapter_value(cfg, "adaptive_projection_strength", 0.15)
+            ),
+            adaptive_projection_clip_std_multiplier=float(
+                _generated_trajectory_adapter_value(
+                    cfg, "adaptive_projection_clip_std_multiplier", 4.0
+                )
+            ),
+        )
+        fitted = apply_alignment(source_matrix, adapter_state).float()
     mse = torch.mean((fitted - target_matrix.float()) ** 2)
     cosine = torch.nn.functional.cosine_similarity(fitted, target_matrix.float(), dim=-1).mean()
     local_residual_state = _build_generated_adapter_local_residual_state(
@@ -3043,7 +3334,6 @@ def _load_or_train_generated_trajectory_adapter_state(
     cache_key = _generated_trajectory_adapter_cache_key(cfg, state, include_prompt=include_prompt)
     cached_info = memory_cache.get(cache_key)
     if cached_info is not None:
-        print("Generated trajectory adapter cache hit in memory", flush=True)
         return cached_info
     cache_path = _generated_trajectory_adapter_cache_path(cfg, cache_key)
     print(f"Checking generated trajectory adapter cache: {cache_path}", flush=True)
@@ -3217,6 +3507,7 @@ def _prepare_generated_trajectory_eval_traces(
                 variant_state,
                 variant_cfg,
                 include_prompt=include_prompt,
+                retain_in_memory=False,
             )
             target_answer = _target_answer(dataset_name, row)
             sender_reasoning_text = str(sender_state.get("generated_reasoning_text", ""))
@@ -3264,6 +3555,10 @@ def _prepare_generated_trajectory_eval_traces(
                     "sender_answer_matches_target": sender_answer_matches_target,
                 }
             )
+            del sender_state
+            if (index + 1) % 8 == 0:
+                _release_accelerator_memory()
+    _release_accelerator_memory()
     trace_cache_values = [
         bool(row["trace_cache_hit"])
         for row in prepared_rows
@@ -3363,31 +3658,52 @@ def _decode_handoff(
     append_answer_suffix_without_context: bool = False,
     answer_suffix_text: Optional[str] = None,
 ) -> dict[str, Any]:
-    sender_prefix_state = prepare_latent_prefix_state(
-        model=agent_b,
-        handoff_step=handoff_step,
-        kv_cache=kv_cache_a,
-    )
-    kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
-    kv_cache_status = sender_prefix_state.get(
-        "kv_cache_status",
-        "transferred" if kv_cache_transferred else "unsupported",
-    )
-    kv_cache_reason = sender_prefix_state.get("kv_cache_reason", "")
-    receiver_context_status = str(sender_prefix_state.get("receiver_context_status", "not_used"))
-    receiver_context_reason = str(sender_prefix_state.get("receiver_context_reason", "latent_only"))
-    receiver_context_token_count = int(sender_prefix_state.get("receiver_context_token_count", 0))
-    receiver_context_latent_position = str(
-        sender_prefix_state.get("receiver_context_latent_position", "not_applicable")
-    )
-    active_kv_cache_transferred = bool(
-        sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
-    )
-    active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
-    active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
-    active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
     context_mode = _receiver_context_mode(cfg) if cfg is not None else "none"
     latent_position = _receiver_context_latent_position(cfg) if cfg is not None else "after_context"
+
+    if (
+        kv_cache_a is None
+        and prompt is not None
+        and _should_use_receiver_context(context_mode, sender_kv_cache_transferred=False)
+    ):
+        # With no sender cache offered, the latent-only prefix statuses are fixed and
+        # the receiver-context branch below rebuilds the prefix from scratch — skip
+        # the otherwise-discarded full receiver forward over the latent prefix.
+        kv_cache_transferred = False
+        kv_cache_status = "not_provided"
+        kv_cache_reason = "no_cache_provided"
+        receiver_context_status = "not_used"
+        receiver_context_reason = "latent_only"
+        receiver_context_token_count = 0
+        receiver_context_latent_position = "not_applicable"
+        active_kv_cache_transferred = False
+        active_kv_cache_status = "not_provided"
+        active_kv_cache_reason = "no_cache_provided"
+        active_kv_cache_source = "none"
+    else:
+        sender_prefix_state = prepare_latent_prefix_state(
+            model=agent_b,
+            handoff_step=handoff_step,
+            kv_cache=kv_cache_a,
+        )
+        kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
+        kv_cache_status = sender_prefix_state.get(
+            "kv_cache_status",
+            "transferred" if kv_cache_transferred else "unsupported",
+        )
+        kv_cache_reason = sender_prefix_state.get("kv_cache_reason", "")
+        receiver_context_status = str(sender_prefix_state.get("receiver_context_status", "not_used"))
+        receiver_context_reason = str(sender_prefix_state.get("receiver_context_reason", "latent_only"))
+        receiver_context_token_count = int(sender_prefix_state.get("receiver_context_token_count", 0))
+        receiver_context_latent_position = str(
+            sender_prefix_state.get("receiver_context_latent_position", "not_applicable")
+        )
+        active_kv_cache_transferred = bool(
+            sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
+        )
+        active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
+        active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
+        active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
 
     if prompt is not None and _should_use_receiver_context(
         context_mode,
@@ -4338,14 +4654,18 @@ def _run_generated_latent_variant(
     tokenizer_b = variant_state["tokenizer_b"]
     agent_b = variant_state["agent_b"]
     agent_b_device = next(agent_b.parameters()).device
+    # Long-context prompts are unique per sample, so retaining each device-resident
+    # sender state in the shared consensus cache is pure accumulation (the disk trace
+    # cache already covers cross-method reuse).
     sender_state = _collect_sender_generated_consensus_state(
         prompt,
         variant_state,
         variant_cfg,
         include_prompt=include_prompt,
+        retain_in_memory=False,
     )
     handoff_source = (
-        _generated_trajectory_adapter_source_sequence(variant_cfg, sender_state)
+        _generated_trajectory_adapter_source_sequence(variant_cfg, sender_state, state=variant_state)
         if _generated_trajectory_adapter_enabled(variant_cfg)
         else sender_state["consensus_hidden_states"]
     )
@@ -5425,6 +5745,7 @@ def _configured_base_cfg(
     generated_trajectory_adapter_train_limit: Optional[int] = None,
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
+    generated_trajectory_adapter_strategy: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -5503,6 +5824,10 @@ def _configured_base_cfg(
     if generated_trajectory_adapter_input_space is not None:
         base_cfg.handoff.generated_trajectory_adapter.input_space = str(
             generated_trajectory_adapter_input_space
+        )
+    if generated_trajectory_adapter_strategy is not None:
+        base_cfg.handoff.generated_trajectory_adapter.strategy = str(
+            generated_trajectory_adapter_strategy
         )
     if generated_trajectory_adapter_target_alignment is not None:
         base_cfg.handoff.generated_trajectory_adapter.target_alignment = str(
@@ -5685,6 +6010,7 @@ def run_benchmark(
     generated_trajectory_adapter_train_limit: Optional[int] = None,
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
+    generated_trajectory_adapter_strategy: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -5735,6 +6061,7 @@ def run_benchmark(
         generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
         generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
+        generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -5791,6 +6118,7 @@ def run_benchmark(
     )
     if dataset_name == "long_context_handoff":
         base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
+    base_cfg.benchmark.dataset_name = str(dataset_name)
     semantic_smoke_cfg = getattr(getattr(base_cfg, "reporting", None), "semantic_smoke", None)
     if sample_indices is None and semantic_smoke_cfg is not None:
         sample_indices = _coerce_sample_indices(getattr(semantic_smoke_cfg, "sample_indices", None))
@@ -6172,6 +6500,11 @@ def run_benchmark(
                             "error": error,
                         }
                     )
+                    # With per-handoff retention fixed at the source, the gc + allocator
+                    # release only needs to run periodically; per-row it costs measurable
+                    # wall time (gc scales with live heap, empty_cache syncs the stream).
+                    if len(sample_rows) % 8 == 0:
+                        _release_accelerator_memory()
 
     summary_rows = aggregate_standard_rows(sample_rows)
     gating_cfg = _gating_cfg(base_cfg, "phase1" if suite_name == "phase1_homogeneous" else "phase3")
@@ -6615,6 +6948,7 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_train_limit: Optional[int] = None,
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
+    generated_trajectory_adapter_strategy: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -6660,6 +6994,7 @@ def prepare_generated_trajectory_adapter_cache(
         generated_trajectory_adapter_train_limit=generated_trajectory_adapter_train_limit,
         generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
+        generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -6712,6 +7047,7 @@ def prepare_generated_trajectory_adapter_cache(
     )
     if dataset_name == "long_context_handoff":
         base_cfg.handoff.generated_trajectory_adapter.dataset_name = dataset_name
+    base_cfg.benchmark.dataset_name = str(dataset_name)
     suite_cfg = _suite_cfg(base_cfg, suite_name)
     _require_requested_device_available(suite_cfg)
     effective_split = dataset_split or _default_split_for_dataset(dataset_name)
@@ -7146,8 +7482,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--generated-trajectory-adapter-strategy",
+        choices=("hybrid_affine", "ridge", "per_step_ridge"),
+        default=None,
+        help=(
+            "Optional override for handoff.generated_trajectory_adapter.strategy; "
+            "per_step_ridge fits one ridge state per tail position."
+        ),
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-source-mode",
-        choices=("generated_text", "final_answer_tail"),
+        choices=("generated_text", "final_answer_tail", "final_answer_tail_anchored"),
         default=None,
         help="Optional override for handoff.generated_trajectory_adapter.source_mode.",
     )
@@ -7469,6 +7814,7 @@ def main() -> None:
             generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
             generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
             generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
+            generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
             generated_trajectory_adapter_target_alignment=(
                 args.generated_trajectory_adapter_target_alignment
             ),
@@ -7626,6 +7972,7 @@ def main() -> None:
         generated_trajectory_adapter_train_limit=args.generated_trajectory_adapter_train_limit,
         generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
+        generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
         generated_trajectory_adapter_target_alignment=args.generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=args.generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=(

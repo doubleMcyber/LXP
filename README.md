@@ -1,6 +1,17 @@
 # LXP
 LXP (Latent Exchange Protocol) is a machine-native communication layer for AI agents. Instead of passing text, agents exchange structured embeddings, belief states, and uncertainty directly in latent space—enabling higher bandwidth coordination, distributed reasoning, and post-linguistic multi-agent intelligence.
 
+## Current Validation Snapshot
+
+Recent validation runs exercise generated sender reasoning, adapter-fitted latent prefixes, token-context controls, heterogeneous model pairs, leakage checks, and digest-locked replay.
+
+- GSM8K now has a generated-reasoning latent handoff path: the sender produces novel reasoning traces, the receiver consumes a 12-step latent prefix, and the Qwen/Qwen3.5-2B -> Qwen/Qwen3.5-0.8B bfloat16 run reaches 100% (8/8). The fast readout run uses `final_answer_tail_anchored`, `tail_tokens`, and one global `ridge` adapter; the receiver-forward decode path with token readout disabled has also been validated at 100% (8/8) with answer perplexity about 1.65.
+- The adapter bias is task-dependent. Fixed-template long-context tails use `per_step_ridge` over pure consensus tail latents because each slot is a stable sub-task. Diverse GSM8K generated text uses one global `ridge` over token-anchored tail features because per-slot maps are underdetermined and can confidently emit training-set digits.
+- The validation profiles encode that law directly: `--profile mps` is the GSM8K global-ridge profile, while `--profile long_context_mps` is the long-context per-step-ridge profile.
+- The current Pareto frontier is against token handoff at equal accuracy. GSM8K hits 100% with about 0.17s latent latency versus 3.1s token-context latency. Long-context replay hits 100% with 0.099s latent latency versus 40.9s token-context latency and 99.78% receiver-token savings.
+- Scaling over `train_limit` 8, 16, 32, 64, 128, and 256 over 32 handoffs behaves like a coverage phase transition rather than a smooth power law: accuracy stays at 0% while eval digits are unseen in the relevant slots, rises at partial coverage, then reaches 100% once the payload alphabet is covered. High readout similarity alone is not enough; per-slot coverage diagnostics are the safety signal for out-of-coverage errors.
+- The full validation ladder now reports semantic gates, transfer comparisons, heterogeneous readiness, leakage status, manifest digests, sender trace cache hit rates, adapter row cache hit rates, receiver-token pressure, and replay readiness in JSON.
+
 ## Local Checks
 
 Run the unit suite from the repo root with:
@@ -69,11 +80,13 @@ recommended order:
 ```bash
 venv/bin/python -B scripts/run_production_validation.py
 venv/bin/python -B scripts/run_production_validation.py --execute --profile local --replay
+venv/bin/python -B scripts/run_production_validation.py --execute --profile mps --replay
 ```
 
-Use `--profile gpu` or `--profile scale` only after the local profile passes and
-the report's semantic, comparison, and heterogeneous transfer sections are
-interpretable.
+Use `--profile mps` for the local GSM8K generated-reasoning gate on Apple
+Silicon. Use `--profile gpu` or `--profile scale` only after the local profile
+passes and the report's semantic, comparison, and heterogeneous transfer
+sections are interpretable.
 
 ### Long-Context And MPS Validation
 
@@ -97,11 +110,15 @@ venv/bin/python -B scripts/run_production_validation.py --profile long_context_m
 ```
 
 This profile uses `--dataset long_context_handoff`, `--torch-dtype float32`,
-`--device-map mps`, and short decode budgets appropriate for local iteration.
-If MPS is unavailable, the benchmark now fails before loading weights instead
-of silently falling back or producing misleading timings. The report summary
-prints best latent accuracy, latency ratio, receiver-token ratio, and
-receiver-token savings percentage.
+`--device-map mps`, `--generated-trajectory-adapter-strategy per_step_ridge`,
+`--generated-trajectory-adapter-target-alignment tail_tokens`, a 128-row
+training adapter, and short decode budgets appropriate for local iteration. It
+keeps generated local residuals off, enables token readout for the fixed
+12-token latent prefix, and compares against token-context and verified
+token-context controls. If MPS is unavailable, the benchmark now fails before
+loading weights instead of silently falling back or producing misleading
+timings. The report summary prints best latent accuracy, latency ratio,
+receiver-token ratio, and receiver-token savings percentage.
 
 For a bounded DigitalOcean pilot, inspect the planned commands locally first:
 

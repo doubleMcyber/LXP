@@ -1,8 +1,21 @@
+"""
+LXP Geometric Alignment Utilities
+---------------------------------
+This module handles the mathematical transformations required to make the latent space
+of one model (e.g., Qwen-2B) intelligible to another model (e.g., Qwen-0.8B).
+
+Key Concepts:
+- Orthogonal Procrustes: Finding the optimal rotation matrix (Q) that aligns two vector spaces without distorting their internal geometric relationships.
+- Semantic Anchors: Using specific tokens (math symbols, numbers) as reference points to compute the cross-covariance matrix via Singular Value Decomposition (SVD).
+- Adaptive Projection: Dynamically scaling and clipping transferred tensors to prevent representation drift and out-of-distribution values in the receiver model.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
 import math
 import re
+import weakref
 from typing import Any, Optional
 
 import torch
@@ -11,6 +24,38 @@ import torch
 HiddenStateInput = torch.Tensor | Sequence[torch.Tensor]
 LayerWeightInput = Sequence[float] | torch.Tensor | None
 AlignmentState = dict[str, Any]
+
+# Alignment-state tensors live on CPU (for disk caching) while activations live on the
+# accelerator; without memoization every apply_alignment call re-uploads the same static
+# matrices host->device. Keyed by id() with weakref.finalize eviction (tensors cannot be
+# WeakKeyDictionary keys — weakref equality dereferences into elementwise ==), and kept
+# outside the state dicts themselves because those are shared by reference across
+# benchmark variant states.
+_DEVICE_RESIDENT_TENSORS: dict[int, dict[tuple[str, torch.dtype], torch.Tensor]] = {}
+
+
+def _device_resident(
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if tensor.device == device and tensor.dtype == dtype:
+        return tensor
+    if tensor.requires_grad:
+        return tensor.to(device=device, dtype=dtype)
+    cache_id = id(tensor)
+    per_tensor = _DEVICE_RESIDENT_TENSORS.get(cache_id)
+    if per_tensor is None:
+        per_tensor = {}
+        _DEVICE_RESIDENT_TENSORS[cache_id] = per_tensor
+        weakref.finalize(tensor, _DEVICE_RESIDENT_TENSORS.pop, cache_id, None)
+    key = (str(device), dtype)
+    cached = per_tensor.get(key)
+    if cached is None:
+        cached = tensor.to(device=device, dtype=dtype)
+        per_tensor[key] = cached
+    return cached
 _ALNUM_ANCHOR_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 _SIMPLE_SYMBOL_ANCHOR_PATTERN = re.compile(r"^[+\-*/=<>()[\]{}.,:;?!%^_]+$")
 _MIXED_SEMANTIC_ANCHOR_PATTERN = re.compile(r"^[A-Za-z0-9+\-*/=<>()[\]{}.,:;?!%^_]+$")
@@ -482,19 +527,23 @@ def apply_adaptive_projection(
     if not projection_state or not bool(projection_state.get("enabled", False)):
         return hidden_states
 
-    source_mean = projection_state["source_mean"].to(
+    source_mean = _device_resident(
+        projection_state["source_mean"],
         device=hidden_states.device,
         dtype=torch.float32,
     )
-    target_mean = projection_state["target_mean"].to(
+    target_mean = _device_resident(
+        projection_state["target_mean"],
         device=hidden_states.device,
         dtype=torch.float32,
     )
-    target_std = projection_state["target_std"].to(
+    target_std = _device_resident(
+        projection_state["target_std"],
         device=hidden_states.device,
         dtype=torch.float32,
     )
-    scale = projection_state["scale"].to(
+    scale = _device_resident(
+        projection_state["scale"],
         device=hidden_states.device,
         dtype=torch.float32,
     )
@@ -575,6 +624,22 @@ def compute_alignment_state(
     adaptive_projection_strength: float = 0.0,
     adaptive_projection_clip_std_multiplier: float = 4.0,
 ) -> AlignmentState:
+    """
+    Calculates the full mathematical transformation mapping required to bridge two distinct models.
+
+    This is the core of the Heterogeneous Latent Handoff. It takes a set of matching semantic anchor
+    tensors from both models and calculates the optimal transformation matrix `Q`.
+
+    Args:
+        sender_hidden_states: Tensors from Agent A (e.g., Qwen-2B).
+        receiver_hidden_states: Corresponding ground-truth tensors from Agent B (e.g., Qwen-0.8B).
+        strategy: "orthogonal" (Procrustes - preserves geometry) or "ridge" (Linear regression).
+        center: Whether to center the vectors at the origin before alignment.
+        adaptive_projection_strength: How aggressively to clip standard deviation on the receiver end to prevent OOM drift.
+
+    Returns:
+        An AlignmentState dictionary containing the transformation matrix `mapping_matrix` (Q) and optional bias parameters.
+    """
     normalized_strategy = str(strategy).strip().lower()
     if normalized_strategy not in {"orthogonal", "ridge", "hybrid_affine"}:
         raise ValueError(
@@ -651,7 +716,6 @@ def compute_alignment_state(
         )
         bias_vector = receiver_anchor_mean - (sender_anchor_mean @ mapping_matrix)
 
-    mapped_sender_rows = (sender_rows @ mapping_matrix) + bias_vector
     sender_unweighted_rows, receiver_unweighted_rows = _stack_weighted_alignment_rows(
         _prepare_alignment_layers(
             sender_hidden_states,
@@ -819,7 +883,8 @@ def score_anchor_stability(
 
 
 def apply_linear_mapping(hidden_states: torch.Tensor, mapping_matrix: torch.Tensor) -> torch.Tensor:
-    return hidden_states @ mapping_matrix.to(
+    return hidden_states @ _device_resident(
+        mapping_matrix,
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -836,6 +901,23 @@ def apply_alignment(
     if isinstance(alignment, torch.Tensor):
         return apply_linear_mapping(hidden_states, alignment)
 
+    per_step_states = alignment.get("per_step_states")
+    if (
+        per_step_states
+        and hidden_states.dim() == 3
+        and int(hidden_states.shape[1]) == len(per_step_states)
+    ):
+        # Position-wise alignment: each sequence step has its own fitted state.
+        # Inputs whose step count does not match fall through to the shared
+        # mapping below, so mismatched sequences degrade gracefully.
+        return torch.stack(
+            [
+                apply_alignment(hidden_states[:, step_index, :], per_step_states[step_index])
+                for step_index in range(len(per_step_states))
+            ],
+            dim=1,
+        )
+
     pre_projection_state = alignment.get("pre_projection_state")
     post_projection_state = alignment.get("post_projection_state")
     mapping_matrix = alignment.get("mapping_matrix", alignment.get("global_alignment_q"))
@@ -845,7 +927,8 @@ def apply_alignment(
     mapped = apply_linear_mapping(mapped, mapping_matrix)
     mapping_bias = alignment.get("mapping_bias", alignment.get("global_alignment_bias"))
     if mapping_bias is not None:
-        mapped = mapped + mapping_bias.to(
+        mapped = mapped + _device_resident(
+            mapping_bias,
             device=mapped.device,
             dtype=mapped.dtype,
         )

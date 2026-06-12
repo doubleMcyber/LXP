@@ -53,11 +53,15 @@ PROFILE_DEFAULTS = {
         "torch_dtype": "float32",
         "device_map": "mps",
         "methods": DEFAULT_METHODS,
-        "generated_trajectory_adapter_train_split": None,
-        "generated_trajectory_adapter_source_mode": None,
-        "generated_trajectory_adapter_source_tail_tokens": None,
-        "generated_trajectory_adapter_target_mode": None,
-        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_adapter_train_split": "train",
+        # Diverse-text tasks: one global ridge over token-anchored tail features
+        # (per-step maps are the right bias only for fixed-template tails).
+        "generated_trajectory_adapter_source_mode": "final_answer_tail_anchored",
+        "generated_trajectory_adapter_source_tail_tokens": 12,
+        "generated_trajectory_adapter_target_mode": "final_answer_line",
+        "generated_trajectory_adapter_target_alignment": "tail_tokens",
+        "generated_trajectory_adapter_strategy": "ridge",
+        "generated_trajectory_local_residual_enabled": False,
         "generated_trajectory_local_residual_temperature": None,
         "generated_trajectory_semantic_memory_enabled": False,
         "generated_trajectory_semantic_memory_min_similarity": None,
@@ -68,7 +72,7 @@ PROFILE_DEFAULTS = {
     "long_context_mps": {
         "dataset": "long_context_handoff",
         "eval_limit": 8,
-        "train_limit": 64,
+        "train_limit": 128,
         "max_new_tokens": 32,
         "reasoner_max_new_tokens": 64,
         "torch_dtype": "float32",
@@ -78,7 +82,9 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_source_mode": "final_answer_tail",
         "generated_trajectory_adapter_source_tail_tokens": 12,
         "generated_trajectory_adapter_target_mode": "final_answer_line",
-        "generated_trajectory_adapter_target_alignment": "linear",
+        "generated_trajectory_adapter_target_alignment": "tail_tokens",
+        "generated_trajectory_adapter_strategy": "per_step_ridge",
+        "generated_trajectory_local_residual_enabled": False,
         "generated_trajectory_local_residual_temperature": 0.05,
         "generated_trajectory_semantic_memory_enabled": False,
         "generated_trajectory_semantic_memory_min_similarity": 0.98,
@@ -198,6 +204,19 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
                 args.generated_trajectory_adapter_target_alignment,
             ]
         )
+    if getattr(args, "generated_trajectory_adapter_strategy", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-strategy",
+                args.generated_trajectory_adapter_strategy,
+            ]
+        )
+    if getattr(args, "generated_trajectory_local_residual_enabled", None) is False:
+        # benchmark_all force-enables the local residual for raw-input smoke runs;
+        # the per-step-ridge profile must keep it off (validated without it).
+        command.append("--disable-generated-trajectory-local-residual")
+    elif getattr(args, "generated_trajectory_local_residual_enabled", None) is True:
+        command.append("--enable-generated-trajectory-local-residual")
     if getattr(args, "generated_trajectory_local_residual_temperature", None) is not None:
         command.extend(
             [
@@ -415,7 +434,12 @@ def main() -> int:
     parser.add_argument("--generated-trajectory-adapter-train-split", default=None)
     parser.add_argument(
         "--generated-trajectory-adapter-source-mode",
-        choices=("generated_text", "final_answer_tail"),
+        choices=("generated_text", "final_answer_tail", "final_answer_tail_anchored"),
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-adapter-strategy",
+        choices=("hybrid_affine", "ridge", "per_step_ridge"),
         default=None,
     )
     parser.add_argument(
@@ -430,7 +454,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--generated-trajectory-adapter-target-alignment",
-        choices=("character", "linear"),
+        choices=("character", "linear", "tail_tokens"),
         default=None,
     )
     parser.add_argument("--generated-trajectory-local-residual-temperature", type=float, default=None)
@@ -518,6 +542,13 @@ def main() -> int:
         args.generated_trajectory_adapter_target_alignment = defaults[
             "generated_trajectory_adapter_target_alignment"
         ]
+    if getattr(args, "generated_trajectory_adapter_strategy", None) is None:
+        args.generated_trajectory_adapter_strategy = defaults.get(
+            "generated_trajectory_adapter_strategy"
+        )
+    args.generated_trajectory_local_residual_enabled = defaults.get(
+        "generated_trajectory_local_residual_enabled"
+    )
     if args.generated_trajectory_local_residual_temperature is None:
         args.generated_trajectory_local_residual_temperature = defaults[
             "generated_trajectory_local_residual_temperature"

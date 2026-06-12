@@ -1,3 +1,14 @@
+"""
+LXP Continuous Latent Dynamics
+------------------------------
+This module defines the continuous-time mechanics that replace traditional discrete text generation.
+
+Key Components:
+- TransformerBlockDynamics: Wraps a standard transformer block into an Ordinary Differential Equation (ODE).
+  It defines the derivative `dh/dt = f(h) - h`, allowing libraries like `torchdiffeq` to integrate a thought trajectory over continuous time.
+- KV Cache Management: Utilities for extracting, normalizing, and verifying the Key-Value caches so they can be losslessly transferred to the downstream actor model.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -245,6 +256,19 @@ class TransformerBlockDynamics(nn.Module):
         raise TypeError("Unsupported transformer block output type for ODE dynamics")
 
     def forward(self, t: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        The differential equation logic evaluated by the ODE solver (`torchdiffeq.odeint`).
+
+        Instead of treating the transformer block as a discrete step `h(t+1) = f(h(t))`,
+        this function formulates it as a continuous derivative: `dh/dt = f(h(t), t) - h(t)`.
+
+        Args:
+            t: The continuous integration time step (managed by the ODE solver, usually RK4).
+            hidden_states: The current continuous latent vector being reasoned over.
+
+        Returns:
+            The delta (rate of change) of the hidden state, which the solver integrates to find the next state.
+        """
         del t
         kwargs: dict[str, Any] = {}
         accepts_hidden_kw = "hidden_states" in self._accepted_args

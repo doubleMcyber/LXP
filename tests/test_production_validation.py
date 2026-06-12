@@ -81,6 +81,12 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
         generated_trajectory_adapter_target_alignment=defaults[
             "generated_trajectory_adapter_target_alignment"
         ],
+        generated_trajectory_adapter_strategy=defaults[
+            "generated_trajectory_adapter_strategy"
+        ],
+        generated_trajectory_local_residual_enabled=defaults[
+            "generated_trajectory_local_residual_enabled"
+        ],
         generated_trajectory_local_residual_temperature=defaults[
             "generated_trajectory_local_residual_temperature"
         ],
@@ -125,7 +131,10 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "--generated-trajectory-adapter-target-mode" in benchmark_command
     assert "final_answer_line" in benchmark_command
     assert "--generated-trajectory-adapter-target-alignment" in benchmark_command
-    assert "linear" in benchmark_command
+    assert "tail_tokens" in benchmark_command
+    assert "--generated-trajectory-adapter-strategy" in benchmark_command
+    assert "per_step_ridge" in benchmark_command
+    assert "--disable-generated-trajectory-local-residual" in benchmark_command
     assert "--generated-trajectory-local-residual-temperature" in benchmark_command
     assert "0.05" in benchmark_command
     assert "--enable-generated-trajectory-semantic-memory" not in benchmark_command
@@ -138,7 +147,8 @@ def test_production_validation_long_context_profile_uses_local_dataset() -> None
     assert "0.8" in benchmark_command
     assert "outputs/prod/production_context_vs_latent_8_manifest.json" in replay_command
     assert "--generated-trajectory-adapter-train-limit" in replay_command
-    assert "64" in replay_command
+    assert "128" in replay_command
     assert "--generated-trajectory-adapter-train-split" in replay_command
     assert "final_answer_tail" in replay_text
     assert "final_answer_line" in replay_text
+    assert "per_step_ridge" in replay_text
