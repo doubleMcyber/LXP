@@ -38,6 +38,11 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
+        "generated_trajectory_token_readout_enabled": False,
+        "generated_trajectory_token_readout_min_similarity": None,
     },
     "mps": {
         "dataset": "gsm8k",
@@ -48,28 +53,44 @@ PROFILE_DEFAULTS = {
         "torch_dtype": "float32",
         "device_map": "mps",
         "methods": DEFAULT_METHODS,
-        "generated_trajectory_adapter_train_split": None,
-        "generated_trajectory_adapter_source_mode": None,
-        "generated_trajectory_adapter_source_tail_tokens": None,
-        "generated_trajectory_adapter_target_mode": None,
-        "generated_trajectory_adapter_target_alignment": None,
+        "generated_trajectory_adapter_train_split": "train",
+        # Diverse-text tasks: one global ridge over token-anchored tail features
+        # (per-step maps are the right bias only for fixed-template tails).
+        "generated_trajectory_adapter_source_mode": "final_answer_tail_anchored",
+        "generated_trajectory_adapter_source_tail_tokens": 12,
+        "generated_trajectory_adapter_target_mode": "final_answer_line",
+        "generated_trajectory_adapter_target_alignment": "tail_tokens",
+        "generated_trajectory_adapter_strategy": "ridge",
+        "generated_trajectory_local_residual_enabled": False,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
+        "generated_trajectory_token_readout_enabled": False,
+        "generated_trajectory_token_readout_min_similarity": None,
     },
     "long_context_mps": {
         "dataset": "long_context_handoff",
-        "eval_limit": 3,
-        "train_limit": 8,
+        "eval_limit": 8,
+        "train_limit": 128,
         "max_new_tokens": 32,
         "reasoner_max_new_tokens": 64,
         "torch_dtype": "float32",
         "device_map": "mps",
         "methods": LONG_CONTEXT_METHODS,
-        "generated_trajectory_adapter_train_split": "test",
+        "generated_trajectory_adapter_train_split": "train",
         "generated_trajectory_adapter_source_mode": "final_answer_tail",
         "generated_trajectory_adapter_source_tail_tokens": 12,
         "generated_trajectory_adapter_target_mode": "final_answer_line",
-        "generated_trajectory_adapter_target_alignment": "linear",
+        "generated_trajectory_adapter_target_alignment": "tail_tokens",
+        "generated_trajectory_adapter_strategy": "per_step_ridge",
+        "generated_trajectory_local_residual_enabled": False,
         "generated_trajectory_local_residual_temperature": 0.05,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": 0.98,
+        "generated_trajectory_semantic_memory_max_entries": 2048,
+        "generated_trajectory_token_readout_enabled": True,
+        "generated_trajectory_token_readout_min_similarity": 0.80,
     },
     "gpu": {
         "dataset": "gsm8k",
@@ -86,6 +107,11 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
+        "generated_trajectory_token_readout_enabled": False,
+        "generated_trajectory_token_readout_min_similarity": None,
     },
     "scale": {
         "dataset": "gsm8k",
@@ -102,6 +128,11 @@ PROFILE_DEFAULTS = {
         "generated_trajectory_adapter_target_mode": None,
         "generated_trajectory_adapter_target_alignment": None,
         "generated_trajectory_local_residual_temperature": None,
+        "generated_trajectory_semantic_memory_enabled": False,
+        "generated_trajectory_semantic_memory_min_similarity": None,
+        "generated_trajectory_semantic_memory_max_entries": None,
+        "generated_trajectory_token_readout_enabled": False,
+        "generated_trajectory_token_readout_min_similarity": None,
     },
 }
 
@@ -173,11 +204,49 @@ def _common_hetero_args(args: argparse.Namespace) -> list[str]:
                 args.generated_trajectory_adapter_target_alignment,
             ]
         )
+    if getattr(args, "generated_trajectory_adapter_strategy", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-adapter-strategy",
+                args.generated_trajectory_adapter_strategy,
+            ]
+        )
+    if getattr(args, "generated_trajectory_local_residual_enabled", None) is False:
+        # benchmark_all force-enables the local residual for raw-input smoke runs;
+        # the per-step-ridge profile must keep it off (validated without it).
+        command.append("--disable-generated-trajectory-local-residual")
+    elif getattr(args, "generated_trajectory_local_residual_enabled", None) is True:
+        command.append("--enable-generated-trajectory-local-residual")
     if getattr(args, "generated_trajectory_local_residual_temperature", None) is not None:
         command.extend(
             [
                 "--generated-trajectory-local-residual-temperature",
                 str(args.generated_trajectory_local_residual_temperature),
+            ]
+        )
+    if getattr(args, "generated_trajectory_semantic_memory_enabled", False):
+        command.append("--enable-generated-trajectory-semantic-memory")
+    if getattr(args, "generated_trajectory_semantic_memory_min_similarity", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-semantic-memory-min-similarity",
+                str(args.generated_trajectory_semantic_memory_min_similarity),
+            ]
+        )
+    if getattr(args, "generated_trajectory_semantic_memory_max_entries", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-semantic-memory-max-entries",
+                str(args.generated_trajectory_semantic_memory_max_entries),
+            ]
+        )
+    if getattr(args, "generated_trajectory_token_readout_enabled", False):
+        command.append("--enable-generated-trajectory-token-readout")
+    if getattr(args, "generated_trajectory_token_readout_min_similarity", None) is not None:
+        command.extend(
+            [
+                "--generated-trajectory-token-readout-min-similarity",
+                str(args.generated_trajectory_token_readout_min_similarity),
             ]
         )
     if args.max_new_tokens is not None:
@@ -231,6 +300,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
                 "--methods",
                 generated_methods_csv,
                 "--prepare-generated-trajectory-adapter",
+                "--generated-trajectory-adapter-train-on-missing",
                 "--report-output",
                 _with_output_dir(
                     args,
@@ -298,6 +368,7 @@ def _print_report_summary(report_path: Path) -> None:
     semantic = report.get("semantic_smoke_report") or {}
     comparison = report.get("transfer_comparison_report") or {}
     hetero = report.get("heterogeneous_transfer_report") or {}
+    leakage = report.get("generated_adapter_leakage_report") or semantic.get("leakage_report") or {}
     manifest = report.get("eval_manifest") or {}
     best_comparison = {}
     best_latent_method = comparison.get("best_latent_method")
@@ -323,6 +394,8 @@ def _print_report_summary(report_path: Path) -> None:
                 ),
                 "heterogeneous_passed": hetero.get("passed"),
                 "heterogeneous_missing_requirements": hetero.get("missing_requirements"),
+                "generated_adapter_leakage_status": leakage.get("status"),
+                "generated_adapter_possible_leakage": leakage.get("possible_leakage"),
                 "sample_content_digest": manifest.get("sample_content_digest"),
                 "eval_manifest_digest": manifest.get("manifest_digest"),
             },
@@ -361,7 +434,12 @@ def main() -> int:
     parser.add_argument("--generated-trajectory-adapter-train-split", default=None)
     parser.add_argument(
         "--generated-trajectory-adapter-source-mode",
-        choices=("generated_text", "final_answer_tail"),
+        choices=("generated_text", "final_answer_tail", "final_answer_tail_anchored"),
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-adapter-strategy",
+        choices=("hybrid_affine", "ridge", "per_step_ridge"),
         default=None,
     )
     parser.add_argument(
@@ -376,10 +454,45 @@ def main() -> int:
     )
     parser.add_argument(
         "--generated-trajectory-adapter-target-alignment",
-        choices=("character", "linear"),
+        choices=("character", "linear", "tail_tokens"),
         default=None,
     )
     parser.add_argument("--generated-trajectory-local-residual-temperature", type=float, default=None)
+    parser.add_argument(
+        "--enable-generated-trajectory-semantic-memory",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-semantic-memory",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-min-similarity",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-semantic-memory-max-entries",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--enable-generated-trajectory-token-readout",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--disable-generated-trajectory-token-readout",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--generated-trajectory-token-readout-min-similarity",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--replay", action="store_true")
@@ -429,9 +542,44 @@ def main() -> int:
         args.generated_trajectory_adapter_target_alignment = defaults[
             "generated_trajectory_adapter_target_alignment"
         ]
+    if getattr(args, "generated_trajectory_adapter_strategy", None) is None:
+        args.generated_trajectory_adapter_strategy = defaults.get(
+            "generated_trajectory_adapter_strategy"
+        )
+    args.generated_trajectory_local_residual_enabled = defaults.get(
+        "generated_trajectory_local_residual_enabled"
+    )
     if args.generated_trajectory_local_residual_temperature is None:
         args.generated_trajectory_local_residual_temperature = defaults[
             "generated_trajectory_local_residual_temperature"
+        ]
+    if args.enable_generated_trajectory_semantic_memory:
+        args.generated_trajectory_semantic_memory_enabled = True
+    elif args.disable_generated_trajectory_semantic_memory:
+        args.generated_trajectory_semantic_memory_enabled = False
+    else:
+        args.generated_trajectory_semantic_memory_enabled = defaults[
+            "generated_trajectory_semantic_memory_enabled"
+        ]
+    if args.generated_trajectory_semantic_memory_min_similarity is None:
+        args.generated_trajectory_semantic_memory_min_similarity = defaults[
+            "generated_trajectory_semantic_memory_min_similarity"
+        ]
+    if args.generated_trajectory_semantic_memory_max_entries is None:
+        args.generated_trajectory_semantic_memory_max_entries = defaults[
+            "generated_trajectory_semantic_memory_max_entries"
+        ]
+    if args.enable_generated_trajectory_token_readout:
+        args.generated_trajectory_token_readout_enabled = True
+    elif args.disable_generated_trajectory_token_readout:
+        args.generated_trajectory_token_readout_enabled = False
+    else:
+        args.generated_trajectory_token_readout_enabled = defaults[
+            "generated_trajectory_token_readout_enabled"
+        ]
+    if args.generated_trajectory_token_readout_min_similarity is None:
+        args.generated_trajectory_token_readout_min_similarity = defaults[
+            "generated_trajectory_token_readout_min_similarity"
         ]
     args.include_tests = not args.skip_tests
     args.prepare = not args.skip_prepare

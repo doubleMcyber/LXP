@@ -20,11 +20,17 @@ from benchmark_all import (
     _apply_eval_manifest_to_args,
     _apply_model_profile_defaults,
     _apply_generated_adapter_local_residual,
+    _apply_generated_adapter_semantic_memory,
+    _build_generated_adapter_leakage_report,
     _build_generated_adapter_local_residual_state,
+    _build_generated_adapter_semantic_memory_state,
     _build_eval_manifest,
     _answers_match,
     _cache_key_digest,
     _cache_key_metadata,
+    _collect_sender_generated_consensus_state,
+    _readout_embedding_scoring_state,
+    _receiver_embedding_sequence_for_aligned_text,
     _final_answer_tail_needs_scalar_verification,
     _format_sender_answer_text_handoff_prompt,
     _format_token_context_handoff_prompt,
@@ -32,18 +38,22 @@ from benchmark_all import (
     _format_verified_final_answer_text,
     _generated_trajectory_adapter_train_on_missing,
     _generated_trajectory_adapter_input_space,
+    _generated_trajectory_adapter_source_sequence,
     _generated_trajectory_adapter_target_alignment,
     _generated_trajectory_adapter_target_text,
     _generated_trajectory_adapter_trace_cache_path,
     _generated_trajectory_adapter_training_rows_cache_key,
     _generated_trajectory_trace_cache_key,
     _generated_adapter_include_prompt_values,
+    _generated_adapter_token_readout,
     _handoff_decode_prompt,
     _load_generated_trajectory_training_rows_from_disk,
     _load_generated_trajectory_trace_from_disk,
     _load_eval_manifest,
     _load_generated_trajectory_adapter_from_disk,
+    _load_or_train_generated_trajectory_adapter_state,
     _methods_for_suite,
+    _release_accelerator_memory,
     _predicted_answer,
     _sample_fingerprints,
     _resolve_sender_trace_reasoning_metadata_from_layer_counts,
@@ -51,6 +61,9 @@ from benchmark_all import (
     _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
+    _truncate_reasoning_token_ids,
+    _apply_sender_truncation_to_consensus,
+    _uniform_training_row_step_count,
     _validate_eval_manifest_sample_lock,
 )
 from src.utils.benchmarking import (
@@ -796,6 +809,15 @@ def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
             "blend": 1.0,
             "max_memory_rows": 4096,
         },
+        "semantic_memory": {
+            "enabled": True,
+            "min_similarity": 0.98,
+            "max_entries": 2048,
+        },
+        "token_readout": {
+            "enabled": True,
+            "min_similarity": 0.8,
+        },
     }
     handoff_identity = {
         "latent_pooling": "last_token",
@@ -830,7 +852,7 @@ def test_eval_manifest_locks_generated_adapter_identity(tmp_path) -> None:
 
     loaded = _load_eval_manifest(path)
 
-    assert loaded["manifest_schema_version"] == 2
+    assert loaded["manifest_schema_version"] == 3
     assert loaded["generated_trajectory_adapter"] == generated_identity
     assert loaded["handoff"] == handoff_identity
 
@@ -863,6 +885,7 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
             "source_mode": "final_answer_tail",
             "source_tail_tokens": 12,
             "input_space": "raw",
+            "strategy": "per_step_ridge",
             "target_mode": "final_answer_line",
             "target_alignment": "linear",
             "local_residual": {
@@ -871,6 +894,15 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
                 "temperature": 0.05,
                 "blend": 1.0,
                 "max_memory_rows": 4096,
+            },
+            "semantic_memory": {
+                "enabled": True,
+                "min_similarity": 0.98,
+                "max_entries": 2048,
+            },
+            "token_readout": {
+                "enabled": True,
+                "min_similarity": 0.8,
             },
         },
         handoff_identity={
@@ -899,6 +931,13 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
         generated_trajectory_local_residual_temperature=None,
         generated_trajectory_local_residual_blend=None,
         generated_trajectory_local_residual_max_memory_rows=None,
+        enable_generated_trajectory_semantic_memory=False,
+        disable_generated_trajectory_semantic_memory=False,
+        generated_trajectory_semantic_memory_min_similarity=None,
+        generated_trajectory_semantic_memory_max_entries=None,
+        enable_generated_trajectory_token_readout=False,
+        disable_generated_trajectory_token_readout=False,
+        generated_trajectory_token_readout_min_similarity=None,
         latent_pooling=None,
         receiver_context_mode=None,
         receiver_context_latent_position=None,
@@ -915,6 +954,7 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
     assert args.generated_trajectory_adapter_train_limit == 8
     assert args.generated_trajectory_adapter_train_split == "test"
     assert args.generated_trajectory_adapter_input_space == "raw"
+    assert args.generated_trajectory_adapter_strategy == "per_step_ridge"
     assert args.generated_trajectory_adapter_source_mode == "final_answer_tail"
     assert args.generated_trajectory_adapter_source_tail_tokens == 12
     assert args.generated_trajectory_adapter_target_mode == "final_answer_line"
@@ -923,6 +963,11 @@ def test_apply_eval_manifest_restores_generated_adapter_identity() -> None:
     assert args.generated_trajectory_local_residual_top_k == 8
     assert args.generated_trajectory_local_residual_temperature == 0.05
     assert args.generated_trajectory_local_residual_max_memory_rows == 4096
+    assert args.enable_generated_trajectory_semantic_memory is True
+    assert args.generated_trajectory_semantic_memory_min_similarity == 0.98
+    assert args.generated_trajectory_semantic_memory_max_entries == 2048
+    assert args.enable_generated_trajectory_token_readout is True
+    assert args.generated_trajectory_token_readout_min_similarity == 0.8
     assert args.receiver_context_mode == "prompt_prefix"
     assert args.enable_embedding_manifold is True
     assert args.embedding_manifold_top_k == 4
@@ -1325,6 +1370,61 @@ def test_generated_trajectory_training_rows_cache_key_scopes_source_rows_only() 
     ) != first_key
 
 
+def test_missing_generated_trajectory_adapter_reports_enabled(tmp_path) -> None:
+    cfg = OmegaConf.create(
+        {
+            "agent_a_model": "agent-a",
+            "agent_b_model": "agent-b",
+            "torch_dtype": "float32",
+            "max_new_tokens": 32,
+            "benchmark": {
+                "answer_only_final": True,
+                "text_hybrid_reasoning_max_new_tokens": 64,
+            },
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "enabled": True,
+                    "train_on_missing": False,
+                    "train_limit": 8,
+                    "train_split": "test",
+                    "dataset_name": "long_context_handoff",
+                    "cache_dir": str(tmp_path / "generated_adapter"),
+                    "input_space": "raw",
+                    "source_mode": "final_answer_tail",
+                    "source_tail_tokens": 12,
+                    "target_mode": "final_answer_line",
+                    "target_alignment": "linear",
+                    "strategy": "hybrid_affine",
+                    "regularization": 1e-3,
+                    "residual_alpha": 1.0,
+                    "residual_max_norm_ratio": 0.5,
+                    "center": True,
+                    "use_bias": True,
+                    "local_residual": {
+                        "enabled": True,
+                        "top_k": 8,
+                        "temperature": 0.05,
+                        "blend": 1.0,
+                        "max_memory_rows": 4096,
+                    },
+                }
+            },
+        }
+    )
+
+    info = _load_or_train_generated_trajectory_adapter_state(
+        cfg,
+        {"global_alignment_cache_key": ("alignment", 1)},
+        {},
+        include_prompt=False,
+    )
+
+    assert info["enabled"] is True
+    assert info["status"] == "missing"
+    assert info["cache_hit"] is False
+    assert info["state"] is None
+
+
 def test_load_generated_trajectory_training_rows_validates_disk_cache(tmp_path) -> None:
     cache_path = tmp_path / "rows.pt"
     expected_key = ("rows", "expected")
@@ -1609,6 +1709,153 @@ def test_generated_trajectory_local_residual_corrects_nearest_training_error() -
     assert metrics["generated_adapter_local_residual_applied"] is True
     assert metrics["generated_adapter_local_residual_memory_rows"] == 2
     assert torch.allclose(corrected.reshape(2, 2), target)
+
+
+def test_generated_trajectory_semantic_memory_reads_nearest_latent_answer() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "semantic_memory": {
+                        "enabled": True,
+                        "min_similarity": 0.95,
+                        "max_entries": 8,
+                    }
+                }
+            }
+        }
+    )
+    source_sequence = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    training_rows = {
+        "semantic_memory_entries": [
+            {
+                "source_sequence": source_sequence.squeeze(0),
+                "target_text": "Final answer: 3037",
+                "target_answer": "3037",
+                "source_token_count": 2,
+            }
+        ]
+    }
+    memory_state = _build_generated_adapter_semantic_memory_state(cfg, training_rows)
+
+    metrics = _apply_generated_adapter_semantic_memory(
+        source_sequence,
+        {"semantic_memory_state": memory_state},
+        cfg,
+    )
+
+    assert metrics["generated_adapter_semantic_memory_applied"] is True
+    assert metrics["generated_adapter_semantic_memory_target_text"] == "Final answer: 3037"
+    assert metrics["generated_adapter_semantic_memory_similarity"] == pytest.approx(1.0)
+
+    cfg.handoff.generated_trajectory_adapter.semantic_memory.min_similarity = 1.01
+    rejected = _apply_generated_adapter_semantic_memory(
+        source_sequence,
+        {"semantic_memory_state": memory_state},
+        cfg,
+    )
+    assert rejected["generated_adapter_semantic_memory_applied"] is False
+
+
+def test_generated_trajectory_token_readout_decodes_nearest_receiver_tokens() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "token_readout": {
+                        "enabled": True,
+                        "min_similarity": 0.99,
+                    }
+                }
+            }
+        }
+    )
+
+    class ToyTokenizer:
+        pieces = {
+            0: "Final answer: ",
+            1: "3037",
+            2: " distractor",
+        }
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(self.pieces[int(token_id)] for token_id in token_ids)
+
+    class ToyEmbeddings:
+        weight = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+            ]
+        )
+
+    class ToyAgent:
+        def get_input_embeddings(self):
+            return ToyEmbeddings()
+
+    handoff_step = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+
+    metrics = _generated_adapter_token_readout(
+        handoff_step,
+        tokenizer_b=ToyTokenizer(),
+        agent_b=ToyAgent(),
+        cfg=cfg,
+    )
+
+    assert metrics["generated_adapter_token_readout_applied"] is True
+    assert metrics["generated_adapter_token_readout_text"] == "Final answer: 3037"
+    assert metrics["generated_adapter_token_readout_answer"] == "3037"
+    assert metrics["generated_adapter_token_readout_mean_similarity"] == pytest.approx(1.0)
+
+    cfg.handoff.generated_trajectory_adapter.token_readout.min_similarity = 1.01
+    rejected = _generated_adapter_token_readout(
+        handoff_step,
+        tokenizer_b=ToyTokenizer(),
+        agent_b=ToyAgent(),
+        cfg=cfg,
+    )
+    assert rejected["generated_adapter_token_readout_applied"] is False
+
+
+def test_generated_adapter_leakage_report_flags_same_split_overlap() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "enabled": True,
+                    "dataset_name": "long_context_handoff",
+                    "train_split": "test",
+                    "train_limit": 8,
+                }
+            }
+        }
+    )
+
+    report = _build_generated_adapter_leakage_report(
+        cfg,
+        eval_dataset_name="long_context_handoff",
+        eval_split="test",
+        eval_limit=3,
+        eval_sample_indices=[0, 1, 2],
+    )
+
+    assert report["possible_leakage"] is True
+    assert report["leakage_ruled_out"] is False
+    assert report["overlapping_sample_indices"] == [0, 1, 2]
+
+    cfg.handoff.generated_trajectory_adapter.train_split = "train"
+    clean_report = _build_generated_adapter_leakage_report(
+        cfg,
+        eval_dataset_name="long_context_handoff",
+        eval_split="test",
+        eval_limit=3,
+        eval_sample_indices=[0, 1, 2],
+    )
+
+    assert clean_report["possible_leakage"] is False
+    assert clean_report["leakage_ruled_out"] is True
+    assert clean_report["status"] == "ruled_out"
 
 
 def test_raw_latent_methods_are_available_for_standard_suite() -> None:
@@ -2038,3 +2285,366 @@ def test_methods_for_suite_filters_requested_methods_in_order() -> None:
     assert selected_methods == ["hybrid_hl_mas", "pure_text_cot"]
     with pytest.raises(ValueError, match="Unknown methods"):
         _methods_for_suite("standard", ["does_not_exist"])
+
+
+def test_release_accelerator_memory_runs_for_any_device() -> None:
+    # Must never raise regardless of accelerator availability: on CPU-only hosts
+    # it is just a gc pass, while on MPS/CUDA it also releases cached blocks so
+    # long adapter-construction loops do not climb to an out-of-memory crash.
+    _release_accelerator_memory()
+    _release_accelerator_memory(torch.device("cpu"))
+    _release_accelerator_memory("mps")
+
+
+class _ToySenderTokenizer:
+    def __init__(self) -> None:
+        self.encode_calls = 0
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        self.encode_calls += 1
+        return [3, 4, 5]
+
+    def __call__(self, text: str, return_tensors: str = "pt", add_special_tokens: bool = False):
+        return {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.ones((1, 2), dtype=torch.long),
+        }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        return "Final answer: 42."
+
+
+class _ToySenderModel:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        total_tokens = int(kwargs["input_ids"].shape[1])
+        base = torch.arange(total_tokens, dtype=torch.float32).reshape(1, total_tokens, 1)
+        hidden = base.expand(1, total_tokens, 4).clone()
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            hidden_states=(hidden, hidden * 0.5, hidden * 0.25),
+            past_key_values=None,
+            last_hidden_state=hidden,
+        )
+
+
+class _ToySenderAgent:
+    def __init__(self) -> None:
+        self.model = _ToySenderModel()
+
+    def parameters(self):
+        return iter([torch.zeros(1)])
+
+
+def _toy_sender_state() -> dict:
+    return {
+        "tokenizer_a": _ToySenderTokenizer(),
+        "agent_a": _ToySenderAgent(),
+        "global_reasoning_layer_indices": (0, 1),
+        "global_reasoning_layer_weights": (0.5, 0.5),
+        "_current_sample_row": {
+            "sender_reasoning_text": "Scratch step 1: track 42.\nFinal answer: 42."
+        },
+    }
+
+
+def test_collect_sender_generated_consensus_state_eval_retention_contract() -> None:
+    # The 100+ handoff loop depends on two properties of the sender producer:
+    # the never-consumed sender KV cache is not materialized or retained, and
+    # retain_in_memory=False keeps the shared consensus cache empty so unique
+    # long-context prompts cannot accumulate device tensors across the run.
+    cfg = OmegaConf.create(
+        {"agent_a_model": "toy-a", "torch_dtype": "float32", "max_new_tokens": 8}
+    )
+    state = _toy_sender_state()
+
+    result = _collect_sender_generated_consensus_state(
+        "What is 6 * 7?",
+        state,
+        cfg,
+        retain_in_memory=False,
+    )
+
+    assert result["kv_cache_a"] is None
+    assert state["agent_a"].model.calls[0]["use_cache"] is False
+    # include_prompt=False keeps only the generated-trace positions (3 frozen ids).
+    assert tuple(result["consensus_hidden_states"].shape) == (1, 3, 4)
+    assert result["generated_reasoning_status"] == "complete"
+    assert state["_generated_sender_consensus_cache"] == {}
+
+    retained = _collect_sender_generated_consensus_state(
+        "What is 6 * 7?",
+        state,
+        cfg,
+        retain_in_memory=True,
+    )
+    assert retained["kv_cache_a"] is None
+    assert len(state["_generated_sender_consensus_cache"]) == 1
+    # The frozen sender trace is encoded once and reused via the shared token-id
+    # cache, not re-tokenized on every method/sample pass.
+    assert state["tokenizer_a"].encode_calls == 1
+
+
+def test_token_readout_embedding_scoring_state_is_cached_per_weight() -> None:
+    weight = torch.tensor([[3.0, 4.0], [0.0, 2.0]])
+    device = torch.device("cpu")
+
+    first = _readout_embedding_scoring_state(weight, device)
+    second = _readout_embedding_scoring_state(weight, device)
+
+    assert first is second
+    # fp32 weights score against the table itself with cached row norms — no
+    # duplicated normalized copy of the full embedding matrix.
+    assert "normalized" not in first
+    assert torch.allclose(first["norms"], torch.tensor([5.0, 2.0]))
+    query = torch.nn.functional.normalize(torch.tensor([[3.0, 4.0]]), dim=-1)
+    norm_scores = (query @ first["weight"].transpose(0, 1)) / first["norms"]
+    assert torch.allclose(
+        norm_scores,
+        query @ torch.nn.functional.normalize(weight, dim=-1).transpose(0, 1),
+    )
+
+    half_weight = torch.tensor([[3.0, 4.0], [0.0, 2.0]], dtype=torch.float16)
+    half_state = _readout_embedding_scoring_state(half_weight, device)
+    assert "normalized" in half_state
+    assert half_state["normalized"].dtype == torch.float32
+
+
+def test_receiver_embedding_tail_tokens_alignment_is_exact_and_right_aligned() -> None:
+    # tail_tokens targets must be real receiver embedding rows (no interpolation):
+    # right-aligned against the source tail, left-padded with the first token's
+    # embedding when the receiver tokenization is shorter than the source steps.
+    class _TailTokenizer:
+        def __call__(self, text, return_tensors="pt", add_special_tokens=False):
+            return {"input_ids": torch.tensor([[3, 5, 7]])}
+
+    class _TailEmbeddings:
+        weight = torch.arange(40, dtype=torch.float32).reshape(10, 4)
+
+        def __call__(self, input_ids):
+            return self.weight[input_ids]
+
+    class _TailAgent:
+        def get_input_embeddings(self):
+            return _TailEmbeddings()
+
+        def parameters(self):
+            return iter([torch.zeros(1)])
+
+    state = {"tokenizer_b": _TailTokenizer(), "agent_b": _TailAgent()}
+    table = _TailEmbeddings.weight
+
+    padded = _receiver_embedding_sequence_for_aligned_text(
+        "Final answer: 42",
+        state=state,
+        source_token_ids=(1, 1, 1, 1, 1),
+        target_steps=5,
+        target_alignment="tail_tokens",
+    )
+    assert tuple(padded.shape) == (1, 5, 4)
+    assert torch.equal(padded[0, 0], table[3])
+    assert torch.equal(padded[0, 1], table[3])
+    assert torch.equal(padded[0, 2], table[3])
+    assert torch.equal(padded[0, 3], table[5])
+    assert torch.equal(padded[0, 4], table[7])
+
+    truncated = _receiver_embedding_sequence_for_aligned_text(
+        "Final answer: 42",
+        state=state,
+        source_token_ids=(1, 1),
+        target_steps=2,
+        target_alignment="tail_tokens",
+    )
+    assert tuple(truncated.shape) == (1, 2, 4)
+    assert torch.equal(truncated[0, 0], table[5])
+    assert torch.equal(truncated[0, 1], table[7])
+
+
+def test_target_alignment_accepts_tail_tokens_without_generated_text_mode() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "target_alignment": "tail_tokens",
+                    "target_mode": "final_answer_line",
+                }
+            }
+        }
+    )
+    assert _generated_trajectory_adapter_target_alignment(cfg) == "tail_tokens"
+
+
+def test_uniform_training_row_step_count_validates_and_infers() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "source_tail_tokens": 3,
+                }
+            }
+        }
+    )
+    assert (
+        _uniform_training_row_step_count(cfg, {"row_step_counts": [3, 3, 3]}) == 3
+    )
+    with pytest.raises(ValueError, match="uniform step count"):
+        _uniform_training_row_step_count(cfg, {"row_step_counts": [3, 2]})
+    # legacy caches without step counts: infer from the configured tail length only
+    # when the prompt count confirms the exact layout
+    legacy = {"source_matrix": torch.zeros(6, 4), "training_prompt_count": 2}
+    assert _uniform_training_row_step_count(cfg, legacy) == 3
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(
+            cfg, {"source_matrix": torch.zeros(7, 4), "training_prompt_count": 2}
+        )
+    # divisible totals without a confirming prompt count are rejected, not guessed
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(cfg, {"source_matrix": torch.zeros(6, 4)})
+    with pytest.raises(ValueError, match="legacy"):
+        _uniform_training_row_step_count(
+            cfg, {"source_matrix": torch.zeros(6, 4), "training_prompt_count": 3}
+        )
+
+
+def test_anchored_source_mode_concatenates_sender_tail_embeddings() -> None:
+    cfg = OmegaConf.create(
+        {
+            "handoff": {
+                "generated_trajectory_adapter": {
+                    "source_mode": "final_answer_tail_anchored",
+                    "source_tail_tokens": 2,
+                    "input_space": "raw",
+                }
+            }
+        }
+    )
+
+    class _AnchorEmbeddings:
+        weight = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+
+        def __call__(self, input_ids):
+            return self.weight[input_ids]
+
+    class _AnchorAgent:
+        def get_input_embeddings(self):
+            return _AnchorEmbeddings()
+
+    sender_state = {
+        "consensus_hidden_states": torch.ones((1, 3, 4)),
+        "generated_token_ids": [5, 6, 7],
+    }
+    state = {"agent_a": _AnchorAgent()}
+
+    anchored = _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=state)
+    assert tuple(anchored.shape) == (1, 2, 6)
+    # last 2 consensus steps, concatenated with embeddings of the last 2 tail ids
+    assert torch.equal(anchored[0, :, :4], torch.ones((2, 4)))
+    assert torch.equal(anchored[0, 0, 4:], _AnchorEmbeddings.weight[6])
+    assert torch.equal(anchored[0, 1, 4:], _AnchorEmbeddings.weight[7])
+
+    cfg.handoff.generated_trajectory_adapter.input_space = "aligned"
+    with pytest.raises(ValueError, match="input_space=raw"):
+        _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=state)
+    cfg.handoff.generated_trajectory_adapter.input_space = "raw"
+    with pytest.raises(ValueError, match="agent_a"):
+        _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=None)
+
+
+class _TruncTokenizer:
+    # one token per word; decode joins with spaces
+    vocab = ["step", "one", "two", "three", "Final", "answer:", "42", "."]
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return " ".join(self.vocab[int(t)] for t in token_ids)
+
+
+def test_truncate_reasoning_cuts_strictly_before_final_answer_marker() -> None:
+    tokenizer = _TruncTokenizer()
+    # "step one two three Final answer: 42 ." — marker becomes visible at token 6
+    ids = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    half = _truncate_reasoning_token_ids(tokenizer, ids, 0.5)
+    # marker first visible once "answer:" lands (prefix length 6) -> pre-marker
+    # span is 5 tokens; half of it is 2
+    assert half == [0, 1]
+    assert "final answer" not in tokenizer.decode(half).lower()
+
+    nearly_all = _truncate_reasoning_token_ids(tokenizer, ids, 0.99)
+    assert "final answer" not in tokenizer.decode(nearly_all).lower()
+    assert len(nearly_all) >= 1
+
+    # no marker: fraction of the whole sequence, never empty
+    no_marker = _truncate_reasoning_token_ids(tokenizer, [0, 1, 2, 3], 0.5)
+    assert no_marker == [0, 1]
+    assert _truncate_reasoning_token_ids(tokenizer, [0], 0.5) == [0]
+
+
+def test_sender_truncation_slices_consensus_and_strips_marker() -> None:
+    cfg = OmegaConf.create(
+        {
+            "benchmark": {"sender_reasoning_truncation_fraction": 0.5},
+            "max_new_tokens": 8,
+        }
+    )
+    tokenizer = _TruncTokenizer()
+    consensus = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1).expand(1, 8, 4).clone()
+    result = {
+        "consensus_hidden_states": consensus,
+        "current_latent_step": consensus[:, -1:, :],
+        "attention_mask": torch.ones((1, 8), dtype=torch.long),
+        "latent_pooling": "last_token",
+        "generated_token_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+        "generated_reasoning_text": "step one two three Final answer: 42 .",
+        "generated_reasoning_token_count": 8,
+        "generated_latent_includes_prompt": False,
+        "generated_reasoning_status": "complete",
+        "generated_reasoning_final_answer_marker": True,
+    }
+
+    truncated = _apply_sender_truncation_to_consensus(result, cfg, tokenizer)
+
+    assert truncated["generated_token_ids"] == [0, 1]
+    assert tuple(truncated["consensus_hidden_states"].shape) == (1, 2, 4)
+    # causal prefix: the sliced latents are exactly the first rows of the original
+    assert torch.equal(truncated["consensus_hidden_states"], consensus[:, :2, :])
+    assert "final answer" not in truncated["generated_reasoning_text"].lower()
+    assert truncated["generated_reasoning_final_answer_marker"] is False
+    assert truncated["generated_reasoning_status"] != "complete"
+    # the original full-trace result (what gets disk-cached) is untouched
+    assert result["generated_token_ids"] == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert tuple(result["consensus_hidden_states"].shape) == (1, 8, 4)
+
+    cfg.benchmark.sender_reasoning_truncation_fraction = None
+    untouched = _apply_sender_truncation_to_consensus(result, cfg, tokenizer)
+    assert untouched is result
+
+
+def test_truncation_fraction_extends_rows_and_adapter_cache_keys_only_when_set() -> None:
+    base_cfg = OmegaConf.create(
+        {
+            "agent_a_model": "a",
+            "agent_b_model": "b",
+            "torch_dtype": "float32",
+            "max_new_tokens": 8,
+            "handoff": {"generated_trajectory_adapter": {"source_tail_tokens": 4}},
+        }
+    )
+    state = {
+        "global_alignment_cache_key": ("k",),
+        "global_reasoning_layer_indices": (0,),
+        "global_reasoning_layer_weights": (1.0,),
+    }
+    plain_rows = _generated_trajectory_adapter_training_rows_cache_key(
+        base_cfg, state, include_prompt=False
+    )
+    truncated_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    truncated_cfg.benchmark = {"sender_reasoning_truncation_fraction": 0.5}
+    truncated_rows = _generated_trajectory_adapter_training_rows_cache_key(
+        truncated_cfg, state, include_prompt=False
+    )
+    assert plain_rows != truncated_rows
+    assert plain_rows == truncated_rows[: len(plain_rows)]

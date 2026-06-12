@@ -107,6 +107,13 @@ handoff:
       blend: 1.0
       max_memory_rows: 4096
       chunk_size: 64
+    semantic_memory:
+      enabled: false
+      min_similarity: 0.98
+      max_entries: 2048
+    token_readout:
+      enabled: false
+      min_similarity: 0.80
   embedding_manifold:
     enabled: false
     top_k: 4

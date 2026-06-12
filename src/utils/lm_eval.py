@@ -45,6 +45,20 @@ def _tuple_kv_cache_batch_size(kv_cache: Any) -> Optional[int]:
     return int(key_tensor.shape[0])
 
 
+def _retain_last_position_logits(outputs: Any) -> Any:
+    """Drop all but the last-position logits from a retained prefix forward.
+
+    Prefix states outlive their forward pass (decode, answer scoring, entropy) but
+    every consumer reads only ``logits[:, -1, :]``; keeping the full [1, seq, vocab]
+    tensor alive dominates peak accelerator memory on long-context prompts. The
+    clone detaches the slice from the full tensor's storage so it can be freed.
+    """
+    logits = getattr(outputs, "logits", None)
+    if torch.is_tensor(logits) and logits.dim() == 3 and logits.shape[1] > 1:
+        outputs.logits = logits[:, -1:, :].clone()
+    return outputs
+
+
 def prepare_text_prefix_state(
     *,
     model: AutoModelForCausalLM,
@@ -67,7 +81,7 @@ def prepare_text_prefix_state(
         )
 
     return {
-        "outputs": outputs,
+        "outputs": _retain_last_position_logits(outputs),
         "attention_mask": attention_mask,
         "prefix_seq_len": int(attention_mask.shape[1]),
         "kv_cache_transferred": None,
@@ -133,7 +147,7 @@ def prepare_latent_prefix_state(
         )
 
     return {
-        "outputs": outputs,
+        "outputs": _retain_last_position_logits(outputs),
         "attention_mask": attention_mask,
         "prefix_seq_len": int(attention_mask.shape[1]),
         "kv_cache_transferred": kv_cache_transferred,
@@ -264,7 +278,7 @@ def append_text_to_prefix_state(
 
     return {
         **prefix_state,
-        "outputs": outputs,
+        "outputs": _retain_last_position_logits(outputs),
         "attention_mask": attention_mask,
         "prefix_seq_len": int(attention_mask.shape[1]),
         "decoded_text_prefix": str(prefix_state.get("decoded_text_prefix", "")) + decoded_text_prefix,
@@ -286,6 +300,10 @@ def greedy_decode_from_prefix(
     _reset_kv_cache_to_prefix(outputs.past_key_values, prefix_seq_len)
     generated_token_ids: list[int] = []
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    # Appended tokens are always attended, so each step's position is simply the
+    # previous last position + 1; recomputing the cumsum over the full mask every
+    # step is O(T * (prefix + T)) for the same result.
+    last_position_ids = build_position_ids(attention_mask)[:, -1:]
 
     for _ in range(max_new_tokens):
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
@@ -293,12 +311,13 @@ def greedy_decode_from_prefix(
         if eos_token_id is not None and next_token_id == eos_token_id:
             break
         generated_token_ids.append(next_token_id)
-        decoded_text = str(prefix_state.get("decoded_text_prefix", "")) + tokenizer.decode(
-            generated_token_ids,
-            skip_special_tokens=True,
-        )
-        if stop_regex is not None and stop_regex.search(decoded_text) is not None:
-            break
+        if stop_regex is not None:
+            decoded_text = str(prefix_state.get("decoded_text_prefix", "")) + tokenizer.decode(
+                generated_token_ids,
+                skip_special_tokens=True,
+            )
+            if stop_regex.search(decoded_text) is not None:
+                break
         kv_cache = _normalize_kv_cache(outputs.past_key_values)
         attention_mask = torch.cat(
             [
@@ -311,13 +330,13 @@ def greedy_decode_from_prefix(
             ],
             dim=1,
         )
-        position_ids = build_position_ids(attention_mask)[:, -1:]
+        last_position_ids = last_position_ids + 1
         with torch.no_grad():
             outputs = model(
                 input_ids=next_token.unsqueeze(-1),
                 past_key_values=kv_cache,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=last_position_ids,
                 use_cache=True,
                 return_dict=True,
             )

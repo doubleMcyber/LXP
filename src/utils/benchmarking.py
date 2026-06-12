@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 21
+REPORT_SCHEMA_VERSION = 23
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -99,6 +99,14 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "generated_adapter_local_residual_delta_norm",
     "generated_adapter_local_residual_mean_top_similarity",
     "generated_adapter_local_residual_memory_rows",
+    "generated_adapter_semantic_memory_applied",
+    "generated_adapter_semantic_memory_similarity",
+    "generated_adapter_semantic_memory_entry_count",
+    "generated_adapter_semantic_memory_target_text",
+    "generated_adapter_token_readout_applied",
+    "generated_adapter_token_readout_mean_similarity",
+    "generated_adapter_token_readout_token_count",
+    "generated_adapter_token_readout_text",
     "embedding_manifold_enabled",
     "embedding_manifold_applied",
     "embedding_manifold_delta_norm",
@@ -187,6 +195,12 @@ STANDARD_SUMMARY_FIELDS: list[str] = [
     "mean_generated_adapter_local_residual_delta_norm",
     "mean_generated_adapter_local_residual_top_similarity",
     "mean_generated_adapter_local_residual_memory_rows",
+    "generated_adapter_semantic_memory_rate_percentage",
+    "mean_generated_adapter_semantic_memory_similarity",
+    "mean_generated_adapter_semantic_memory_entry_count",
+    "generated_adapter_token_readout_rate_percentage",
+    "mean_generated_adapter_token_readout_similarity",
+    "mean_generated_adapter_token_readout_token_count",
     "embedding_manifold_rate_percentage",
     "mean_embedding_manifold_delta_norm",
     "mean_embedding_manifold_top_similarity",
@@ -452,6 +466,18 @@ def aggregate_standard_rows(
             if row.get("generated_adapter_local_residual_applied") is not None
             and row.get("generated_adapter_local_residual_applied") != ""
         ]
+        generated_adapter_semantic_memory_rows = [
+            bool(row["generated_adapter_semantic_memory_applied"])
+            for row in group_rows
+            if row.get("generated_adapter_semantic_memory_applied") is not None
+            and row.get("generated_adapter_semantic_memory_applied") != ""
+        ]
+        generated_adapter_token_readout_rows = [
+            bool(row["generated_adapter_token_readout_applied"])
+            for row in group_rows
+            if row.get("generated_adapter_token_readout_applied") is not None
+            and row.get("generated_adapter_token_readout_applied") != ""
+        ]
         embedding_manifold_rows = [
             bool(row["embedding_manifold_applied"])
             for row in group_rows
@@ -620,6 +646,36 @@ def aggregate_standard_rows(
                 "mean_generated_adapter_local_residual_memory_rows": _mean_or_none(
                     group_rows,
                     "generated_adapter_local_residual_memory_rows",
+                ),
+                "generated_adapter_semantic_memory_rate_percentage": (
+                    100.0
+                    * sum(1 for item in generated_adapter_semantic_memory_rows if item)
+                    / len(generated_adapter_semantic_memory_rows)
+                    if generated_adapter_semantic_memory_rows
+                    else None
+                ),
+                "mean_generated_adapter_semantic_memory_similarity": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_semantic_memory_similarity",
+                ),
+                "mean_generated_adapter_semantic_memory_entry_count": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_semantic_memory_entry_count",
+                ),
+                "generated_adapter_token_readout_rate_percentage": (
+                    100.0
+                    * sum(1 for item in generated_adapter_token_readout_rows if item)
+                    / len(generated_adapter_token_readout_rows)
+                    if generated_adapter_token_readout_rows
+                    else None
+                ),
+                "mean_generated_adapter_token_readout_similarity": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_token_readout_mean_similarity",
+                ),
+                "mean_generated_adapter_token_readout_token_count": _mean_or_none(
+                    group_rows,
+                    "generated_adapter_token_readout_token_count",
                 ),
                 "embedding_manifold_rate_percentage": (
                     100.0 * sum(1 for item in embedding_manifold_rows if item)
@@ -827,6 +883,15 @@ def build_semantic_smoke_report(
     degenerate_rows = [
         row for row in rows if _is_degenerate_decode(str(row.get("decoded_text") or ""))
     ]
+    perplexity_exempt_statuses = {"semantic_memory_readout", "token_readout"}
+    perplexity_required_rows = [
+        row for row in rows if str(row.get("decode_status") or "") not in perplexity_exempt_statuses
+    ]
+    perplexity_required_rows_with_metric = [
+        row
+        for row in perplexity_required_rows
+        if row.get("answer_perplexity") is not None and row.get("answer_perplexity") != ""
+    ]
     baseline_correct_values = [
         value for value in (_row_correct_value(row) for row in baseline_rows) if value is not None
     ]
@@ -993,8 +1058,10 @@ def build_semantic_smoke_report(
                 f"{min_compatible_cache_transfer_rate_percentage:.2f}%."
             )
 
-    if len(perplexity_rows) < len(rows):
-        missing_requirements.append("At least one row did not report answer perplexity.")
+    if len(perplexity_required_rows_with_metric) < len(perplexity_required_rows):
+        missing_requirements.append(
+            "At least one generative row did not report answer perplexity."
+        )
     if len(finite_perplexity_rows) < len(perplexity_rows):
         missing_requirements.append("At least one answer perplexity was not finite.")
     if max_answer_perplexity is not None and max_observed_perplexity is not None:
@@ -1059,6 +1126,8 @@ def build_semantic_smoke_report(
         "model_pair_compatibility_reason": compatibility.get("reason"),
         "finite_answer_perplexity_count": len(finite_perplexity_rows),
         "answer_perplexity_count": len(perplexity_rows),
+        "answer_perplexity_required_count": len(perplexity_required_rows),
+        "answer_perplexity_exempt_count": len(rows) - len(perplexity_required_rows),
         "max_answer_perplexity": max_observed_perplexity,
         "max_all_answer_perplexity": max_all_observed_perplexity,
         "max_allowed_answer_perplexity": max_answer_perplexity,

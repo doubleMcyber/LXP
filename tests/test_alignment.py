@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.utils.alignment import (
+    _device_resident,
     apply_alignment,
     apply_linear_mapping,
     compute_alignment_state,
@@ -255,3 +256,42 @@ def test_resolve_shared_semantic_anchor_ids_scales_beyond_curated_seed_bank() ->
     assert anchor_strings[:100] == tuple(preferred)
     assert anchor_ids_a.shape == (500,)
     assert anchor_ids_b.shape == (500,)
+
+
+def test_device_resident_memoizes_converted_state_tensors() -> None:
+    # Alignment-state matrices are CPU-resident for disk caching; the per-call
+    # device/dtype conversion in apply paths must reuse one converted copy per
+    # handoff loop instead of re-uploading the same static tensor every call.
+    matrix = torch.eye(3, dtype=torch.float32)
+
+    same = _device_resident(matrix, device=matrix.device, dtype=torch.float32)
+    assert same is matrix
+
+    converted_first = _device_resident(matrix, device=matrix.device, dtype=torch.float16)
+    converted_second = _device_resident(matrix, device=matrix.device, dtype=torch.float16)
+    assert converted_first is converted_second
+    assert converted_first.dtype == torch.float16
+    assert torch.allclose(converted_first.float(), matrix)
+
+    grad_matrix = torch.eye(3, requires_grad=True)
+    grad_converted = _device_resident(grad_matrix, device=grad_matrix.device, dtype=torch.float16)
+    assert grad_converted.requires_grad
+
+
+def test_apply_alignment_routes_per_step_states_by_position() -> None:
+    # Position-wise adapters: each step has its own fitted state; inputs whose
+    # step count does not match fall back to the shared mapping.
+    doubler = {"mapping_matrix": torch.eye(2) * 2.0}
+    negator = {"mapping_matrix": torch.eye(2) * -1.0}
+    state = {
+        "mapping_matrix": torch.eye(2),
+        "per_step_states": [doubler, negator],
+    }
+    sequence = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+
+    routed = apply_alignment(sequence, state)
+    assert torch.allclose(routed, torch.tensor([[[2.0, 4.0], [-3.0, -4.0]]]))
+
+    mismatched = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+    fallback = apply_alignment(mismatched, state)
+    assert torch.allclose(fallback, mismatched)

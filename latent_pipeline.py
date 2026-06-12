@@ -1,3 +1,16 @@
+"""
+LXP Latent Pipeline Execution Engine
+------------------------------------
+This module acts as the core orchestrator for the Latent Exchange Protocol (LXP).
+It manages the end-to-end tensor flow between heterogeneous models (Agent A to Agent B).
+
+Key Responsibilities:
+1. Model Initialization: Loading both the Sender (Reasoner) and Receiver (Actor) models.
+2. Latent Extraction: Intercepting the continuous hidden states from Agent A instead of standard text generation.
+3. Continuous Dynamics: Invoking the Neural ODE solver (`TransformerBlockDynamics`) to simulate multi-step reasoning in continuous time.
+4. Alignment & Handoff: Routing the compressed thought vector through the Orthogonal Procrustes bridge and passing it to Agent B along with the prompt's KV cache.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -5,6 +18,7 @@ import json
 import math
 import re
 import time
+import weakref
 from collections.abc import Sequence
 from pathlib import Path
 from types import MethodType
@@ -21,7 +35,6 @@ from src.data.loader import get_dataloader, pick_field
 from src.models.dynamics import (
     TransformerBlockDynamics,
     _is_kv_cache_compatible,
-    _kv_cache_compatibility_status,
     _kv_cache_layer_count,
     _kv_cache_seq_len,
     _move_kv_cache_to_device,
@@ -36,7 +49,6 @@ from src.models.handoff_adapter import (
 from src.utils.alignment import (
     apply_alignment,
     apply_linear_mapping,
-    compute_cross_covariance,
     compute_alignment_state,
     compute_orthogonal_mapping,
     score_anchor_stability,
@@ -393,6 +405,9 @@ def _should_use_receiver_context(context_mode: str, *, sender_kv_cache_transferr
     return not sender_kv_cache_transferred
 
 
+_CHAT_TEMPLATE_FALLBACK_WARNED: set[int] = set()
+
+
 def _maybe_apply_chat_template(tokenizer: Any, user_message: str) -> str:
     if tokenizer is None or not getattr(tokenizer, "chat_template", None):
         return user_message
@@ -402,7 +417,23 @@ def _maybe_apply_chat_template(tokenizer: Any, user_message: str) -> str:
             tokenize=False,
             add_generation_prompt=True,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
+        # A silently dropped chat template degrades every handoff in the run;
+        # surface the fallback once per tokenizer instead of failing or spamming.
+        if id(tokenizer) not in _CHAT_TEMPLATE_FALLBACK_WARNED:
+            _CHAT_TEMPLATE_FALLBACK_WARNED.add(id(tokenizer))
+            # evict on GC so a recycled id() cannot suppress a new tokenizer's warning
+            try:
+                weakref.finalize(
+                    tokenizer, _CHAT_TEMPLATE_FALLBACK_WARNED.discard, id(tokenizer)
+                )
+            except TypeError:
+                pass
+            print(
+                f"Warning: chat template failed ({error!r}); "
+                "falling back to raw prompts for this tokenizer.",
+                flush=True,
+            )
         return user_message
 
 
@@ -1981,6 +2012,28 @@ def run_hybrid_pipeline(
     alignment_q_override: Optional[Any] = None,
     alignment_mode_override: Optional[str] = None,
 ) -> dict[str, Any]:
+    """
+    Executes the end-to-end Latent Exchange Protocol (LXP) pipeline for a single prompt.
+
+    This function handles the entire lifecycle of a multi-agent latent handoff:
+    1. Agent A encodes the prompt and its internal reasoning hidden states are captured.
+    2. A continuous trajectory is generated using Neural ODEs (`TransformerBlockDynamics`).
+    3. The continuous thoughts are aligned using an Orthogonal Procrustes geometric bridge.
+    4. The compressed, aligned thought vector (along with Agent A's KV cache) is injected
+       into Agent B (the Actor) as a latent prefix.
+    5. Agent B decodes the task.
+
+    Args:
+        cfg: The main configuration dictionary specifying models, latent steps, and alignment strategies.
+        prompt: The input math or coding problem string.
+        collect_alignment_metrics: If true, runs expensive baseline checks for tensor drift.
+        target_answer_text: Optional ground truth string.
+        alignment_q_override: Pre-computed Procrustes matrix Q to use instead of calculating on the fly.
+        alignment_mode_override: Bypass config strategy (e.g., force 'orthogonal' or 'ridge').
+
+    Returns:
+        A dictionary containing the generated metrics, trajectories, handoff tensors, and final decoded output.
+    """
     if prompt is None:
         prompt = cfg.default_prompt
 
@@ -2013,18 +2066,26 @@ def run_hybrid_pipeline(
     attention_mask_a = encoded["attention_mask"].to(agent_a_device)
     position_ids_a = _build_position_ids(attention_mask_a)
 
+    # The sender KV cache is consumed only by the scalar-prefix path (direct cache
+    # transfer plus the discrete fallback) and by the before_context receiver layout;
+    # in sequence mode with after_context it is dead weight that scales with prompt
+    # length, so skip materializing it.
+    sender_kv_needed = (not sequence_prefix) or (
+        receiver_context_mode != "none" and receiver_context_latent_position == "before_context"
+    )
     with torch.no_grad():
         agent_a_outputs = agent_a.model(
             input_ids=input_ids_a,
             attention_mask=attention_mask_a,
             position_ids=position_ids_a,
-            use_cache=True,
+            use_cache=sender_kv_needed,
             output_hidden_states=True,
             return_dict=True,
         )
 
     reasoner_last_hidden_state = agent_a_outputs.last_hidden_state
     kv_cache_a = _normalize_kv_cache(agent_a_outputs.past_key_values)
+    kv_cache_a_layer_count = _kv_cache_layer_count(kv_cache_a)
     sender_reasoning_stack = agent_a_outputs.hidden_states
     if sender_reasoning_stack is None:
         raise ValueError("Agent A did not return hidden states for reasoning-layer alignment")
@@ -2036,6 +2097,11 @@ def run_hybrid_pipeline(
         sender_reasoning_layers,
         reasoning_layer_weights,
     )
+    if sequence_prefix:
+        # The fallback path that reads the last hidden state is scalar-mode only;
+        # drop the full per-layer stack before receiver work to cap peak memory.
+        reasoner_last_hidden_state = None
+    del sender_reasoning_layers, sender_reasoning_stack, agent_a_outputs
     base_handoff_alignment_state = _handoff_alignment_state_from_pipeline_state(state)
     if alignment_q_override is None:
         alignment_state: Any = base_handoff_alignment_state
@@ -2208,31 +2274,52 @@ def run_hybrid_pipeline(
         device=agent_b_device,
         dtype=agent_b_embed_dtype,
     )
-    sender_prefix_state = prepare_latent_prefix_state(
-        model=agent_b,
-        handoff_step=handoff_step,
-        kv_cache=None if sequence_prefix else kv_cache_a,
-    )
-    kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
-    kv_cache_status = str(
-        sender_prefix_state.get(
-            "kv_cache_status",
-            "transferred" if kv_cache_transferred else "unsupported",
+    prefix_kv_cache_a = None if sequence_prefix else kv_cache_a
+    if prefix_kv_cache_a is None and _should_use_receiver_context(
+        receiver_context_mode,
+        sender_kv_cache_transferred=False,
+    ):
+        # With no sender cache offered, the latent-only prefix statuses are fixed and
+        # the receiver-context path below rebuilds the prefix anyway — skip the
+        # otherwise-discarded full receiver forward over the latent prefix.
+        sender_prefix_state = None
+        kv_cache_transferred = False
+        kv_cache_status = "not_provided"
+        kv_cache_reason = "no_cache_provided"
+        receiver_context_status = "not_used"
+        receiver_context_reason = "latent_only"
+        receiver_context_token_count = 0
+        receiver_context_latent_position_value = "not_applicable"
+        active_kv_cache_transferred = False
+        active_kv_cache_status = "not_provided"
+        active_kv_cache_reason = "no_cache_provided"
+        active_kv_cache_source = "none"
+    else:
+        sender_prefix_state = prepare_latent_prefix_state(
+            model=agent_b,
+            handoff_step=handoff_step,
+            kv_cache=prefix_kv_cache_a,
         )
-    )
-    kv_cache_reason = str(sender_prefix_state.get("kv_cache_reason", ""))
-    receiver_context_status = str(sender_prefix_state.get("receiver_context_status", "not_used"))
-    receiver_context_reason = str(sender_prefix_state.get("receiver_context_reason", "latent_only"))
-    receiver_context_token_count = int(sender_prefix_state.get("receiver_context_token_count", 0))
-    receiver_context_latent_position_value = str(
-        sender_prefix_state.get("receiver_context_latent_position", "not_applicable")
-    )
-    active_kv_cache_transferred = bool(
-        sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
-    )
-    active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
-    active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
-    active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
+        kv_cache_transferred = bool(sender_prefix_state["kv_cache_transferred"])
+        kv_cache_status = str(
+            sender_prefix_state.get(
+                "kv_cache_status",
+                "transferred" if kv_cache_transferred else "unsupported",
+            )
+        )
+        kv_cache_reason = str(sender_prefix_state.get("kv_cache_reason", ""))
+        receiver_context_status = str(sender_prefix_state.get("receiver_context_status", "not_used"))
+        receiver_context_reason = str(sender_prefix_state.get("receiver_context_reason", "latent_only"))
+        receiver_context_token_count = int(sender_prefix_state.get("receiver_context_token_count", 0))
+        receiver_context_latent_position_value = str(
+            sender_prefix_state.get("receiver_context_latent_position", "not_applicable")
+        )
+        active_kv_cache_transferred = bool(
+            sender_prefix_state.get("active_kv_cache_transferred", kv_cache_transferred)
+        )
+        active_kv_cache_status = str(sender_prefix_state.get("active_kv_cache_status", kv_cache_status))
+        active_kv_cache_reason = str(sender_prefix_state.get("active_kv_cache_reason", kv_cache_reason))
+        active_kv_cache_source = str(sender_prefix_state.get("active_kv_cache_source", "provided_cache"))
 
     if _should_use_receiver_context(
         receiver_context_mode,
@@ -2300,6 +2387,7 @@ def run_hybrid_pipeline(
             extra_discrete_steps=extra_discrete_steps,
         )
         executed_discrete_fallback_steps = len(fallback_token_ids)
+        kv_cache_a_layer_count = _kv_cache_layer_count(kv_cache_a)
         aligned_handoff_step = apply_alignment(current_latent_step, alignment_state)
         aligned_handoff_step, adapter_metrics = apply_handoff_adapter(
             aligned_handoff_step,
@@ -2481,7 +2569,6 @@ def run_hybrid_pipeline(
         "receiver_context_status": receiver_context_status,
         "receiver_context_reason": receiver_context_reason,
         "receiver_context_token_count": receiver_context_token_count,
-        "receiver_context_latent_position": receiver_context_latent_position_value,
         "trace_events": trace_events,
         "complexity_factor": complexity_factor,
         "dynamics_mode": dynamics_mode,
@@ -2556,7 +2643,7 @@ def run_hybrid_pipeline(
         "answer_token_count": answer_metrics["answer_token_count"],
         "answer_nll": answer_metrics["answer_nll"],
         "answer_perplexity": answer_metrics["answer_perplexity"],
-        "kv_cache_length": _kv_cache_layer_count(kv_cache_a),
+        "kv_cache_length": kv_cache_a_layer_count,
         "kv_cache_transferred": kv_cache_transferred,
         "continuous_integration_seconds": integration_duration,
         "continuous_integration_50_steps_seconds": integration_duration,
