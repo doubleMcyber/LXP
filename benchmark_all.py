@@ -227,6 +227,105 @@ def _benchmark_cfg(cfg: Any) -> Any:
     return getattr(cfg, "benchmark", None)
 
 
+def _sender_reasoning_truncation_fraction(cfg: Any) -> Optional[float]:
+    value = getattr(_benchmark_cfg(cfg), "sender_reasoning_truncation_fraction", None)
+    if value is None:
+        return None
+    fraction = float(value)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            "benchmark.sender_reasoning_truncation_fraction must be in (0, 1); "
+            f"received {fraction}"
+        )
+    return fraction
+
+
+def _truncate_reasoning_token_ids(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    fraction: float,
+) -> list[int]:
+    """Cut the reasoning strictly before its final-answer marker.
+
+    Mid-reasoning handoff: the receiver must continue the computation, so the
+    answer (and the marker that introduces it) must never ride along. The cut
+    point is `fraction` of the tokens preceding the marker; when no marker is
+    present, `fraction` of the whole sequence.
+    """
+    ids = [int(token_id) for token_id in token_ids]
+    if not ids:
+        return ids
+
+    def _marker_visible(prefix_length: int) -> bool:
+        return "final answer" in tokenizer.decode(
+            ids[:prefix_length],
+            skip_special_tokens=True,
+        ).lower()
+
+    marker_token_index = len(ids)
+    if _marker_visible(len(ids)):
+        low, high = 1, len(ids)
+        while low < high:
+            mid = (low + high) // 2
+            if _marker_visible(mid):
+                high = mid
+            else:
+                low = mid + 1
+        # last index whose prefix does NOT yet show the marker
+        marker_token_index = low - 1
+    cut = max(1, int(fraction * marker_token_index))
+    return ids[:cut]
+
+
+def _apply_sender_truncation_to_consensus(
+    result: dict[str, Any],
+    cfg: Any,
+    tokenizer_a: Any,
+) -> dict[str, Any]:
+    fraction = _sender_reasoning_truncation_fraction(cfg)
+    if fraction is None:
+        return result
+    if bool(result.get("generated_latent_includes_prompt", False)):
+        raise ValueError(
+            "sender_reasoning_truncation_fraction requires include_prompt=False "
+            "(the consensus slice offset is only known for generated-only latents)"
+        )
+    generated_ids = list(result.get("generated_token_ids") or ())
+    truncated_ids = _truncate_reasoning_token_ids(tokenizer_a, generated_ids, fraction)
+    consensus = result["consensus_hidden_states"]
+    # hidden states are causal, so the truncated trace's latents are exactly a
+    # prefix slice of the cached full-trace latents — no fresh sender forward
+    steps = min(len(truncated_ids), int(consensus.shape[1]))
+    steps = max(1, steps)
+    truncated_consensus = consensus[:, :steps, :]
+    truncated_mask = torch.ones(
+        (truncated_consensus.shape[0], truncated_consensus.shape[1]),
+        dtype=result["attention_mask"].dtype,
+        device=result["attention_mask"].device,
+    )
+    truncated_text = tokenizer_a.decode(truncated_ids, skip_special_tokens=True)
+    truncated = dict(result)
+    truncated.update(
+        {
+            "consensus_hidden_states": truncated_consensus,
+            "current_latent_step": _pool_latent_handoff_step(
+                truncated_consensus,
+                truncated_mask,
+                pooling_mode=result.get("latent_pooling", _latent_pooling_mode(cfg)),
+            ),
+            "attention_mask": truncated_mask,
+            "generated_token_ids": truncated_ids,
+            "generated_reasoning_text": truncated_text,
+            "generated_reasoning_token_count": len(truncated_ids),
+            "generated_reasoning_status": _sender_reasoning_status(
+                truncated_ids, truncated_text, cfg
+            ),
+            "generated_reasoning_final_answer_marker": False,
+        }
+    )
+    return truncated
+
+
 def _text_hybrid_reasoning_max_new_tokens(cfg: Any) -> int:
     benchmark_cfg = _benchmark_cfg(cfg)
     fallback_max_new_tokens = int(getattr(cfg, "max_new_tokens", 0))
@@ -938,6 +1037,29 @@ def _reasoner_metadata_for_text_hybrid(
     cfg: Any,
     state: dict[str, Any],
 ) -> dict[str, Any]:
+    metadata = _reasoner_metadata_for_text_hybrid_impl(prompt, cfg, state)
+    fraction = _sender_reasoning_truncation_fraction(cfg)
+    if fraction is None:
+        return metadata
+    # Mid-reasoning handoff: the text baselines must see the same truncated
+    # reasoning the latent path hands off, or the comparison is unfair.
+    tokenizer_a = state["tokenizer_a"]
+    truncated_ids = _truncate_reasoning_token_ids(
+        tokenizer_a,
+        metadata.get("token_ids") or (),
+        fraction,
+    )
+    truncated = dict(metadata)
+    truncated["token_ids"] = truncated_ids
+    truncated["reasoning_text"] = tokenizer_a.decode(truncated_ids, skip_special_tokens=True)
+    return truncated
+
+
+def _reasoner_metadata_for_text_hybrid_impl(
+    prompt: str,
+    cfg: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
     frozen_reasoning_text = _frozen_sender_reasoning_text(state)
     if frozen_reasoning_text is not None:
         generation_metadata = _generate_reasoner_metadata(prompt, cfg, state)
@@ -1601,7 +1723,7 @@ def _collect_sender_generated_consensus_state(
     )
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached
+        return _apply_sender_truncation_to_consensus(cached, cfg, state["tokenizer_a"])
 
     trace_cache_path: Optional[Path] = None
     if _generated_trajectory_adapter_trace_cache_enabled(cfg):
@@ -1619,7 +1741,7 @@ def _collect_sender_generated_consensus_state(
             )
             if retain_in_memory:
                 cache[cache_key] = result
-            return result
+            return _apply_sender_truncation_to_consensus(result, cfg, state["tokenizer_a"])
 
     tokenizer_a = state["tokenizer_a"]
     agent_a = state["agent_a"]
@@ -1734,7 +1856,7 @@ def _collect_sender_generated_consensus_state(
         torch.save(_sender_generated_trace_payload(result, cache_key=cache_key), trace_cache_path)
     if retain_in_memory:
         cache[cache_key] = result
-    return result
+    return _apply_sender_truncation_to_consensus(result, cfg, tokenizer_a)
 
 
 def _collect_sender_consensus_state(prompt: str, state: dict[str, Any], cfg: Any = None) -> dict[str, Any]:
@@ -2241,6 +2363,9 @@ def _generated_trajectory_adapter_cache_key(
         bool(_generated_trajectory_adapter_semantic_memory_enabled(cfg)),
         _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
     )
+    truncation_fraction = _sender_reasoning_truncation_fraction(cfg)
+    if truncation_fraction is not None:
+        base_key = (*base_key, ("reasoning_truncation", float(truncation_fraction)))
     if not local_residual_enabled:
         return base_key
     return (
@@ -2301,6 +2426,13 @@ def _generated_trajectory_adapter_training_rows_cache_key(
         _generated_trajectory_adapter_input_space(cfg),
         bool(_generated_trajectory_adapter_semantic_memory_enabled(cfg)),
         _generated_trajectory_adapter_semantic_memory_max_entries(cfg),
+        # appended only when mid-reasoning truncation is active so existing
+        # full-trace row caches keep their keys
+        *(
+            ()
+            if _sender_reasoning_truncation_fraction(cfg) is None
+            else (("reasoning_truncation", float(_sender_reasoning_truncation_fraction(cfg))),)
+        ),
     )
 
 
@@ -3645,6 +3777,21 @@ def _apply_local_sequence_calibration(
     return calibrated, float(correction_norm.detach().cpu().item())
 
 
+def _decoded_text_prefix_for_suffix(suffix_text: str) -> str:
+    # The decode transcript only begins at "Final answer:" when the appended suffix
+    # actually primes it; continuation-style suffixes leave the receiver free to
+    # keep reasoning before emitting its own marker.
+    return "Final answer:" if suffix_text.rstrip().endswith("Final answer:") else ""
+
+
+def _latent_answer_suffix(cfg: Any) -> str:
+    receiver_context_cfg = getattr(getattr(cfg, "handoff", None), "receiver_context", None)
+    override = getattr(receiver_context_cfg, "latent_answer_suffix", None)
+    if override is not None and str(override).strip():
+        return str(override)
+    return "\n\nRepeat the final answer from the latent reasoning.\nFinal answer:"
+
+
 def _decode_handoff(
     *,
     agent_b: Any,
@@ -3714,6 +3861,11 @@ def _decode_handoff(
             if context_mode == "prompt_prefix"
             else f"sender_kv_cache_status:{kv_cache_status}"
         )
+        context_suffix_text = (
+            answer_suffix_text
+            if answer_suffix_text is not None
+            else _format_receiver_context_answer_suffix(cfg)
+        )
         prefix_state = prepare_receiver_context_latent_prefix_state(
             model=agent_b,
             tokenizer=tokenizer_b,
@@ -3721,10 +3873,8 @@ def _decode_handoff(
             handoff_step=handoff_step,
             kv_cache=kv_cache_a,
             reason=context_reason,
-            suffix_text=answer_suffix_text
-            if answer_suffix_text is not None
-            else _format_receiver_context_answer_suffix(cfg),
-            decoded_text_prefix="Final answer:",
+            suffix_text=context_suffix_text,
+            decoded_text_prefix=_decoded_text_prefix_for_suffix(context_suffix_text),
             latent_position=latent_position,
         )
         receiver_context_status = str(prefix_state.get("receiver_context_status", "used_prompt_prefix"))
@@ -3751,7 +3901,7 @@ def _decode_handoff(
                     tokenizer=tokenizer_b,
                     prefix_state=prefix_state,
                     suffix_text=suffix_text,
-                    decoded_text_prefix="Final answer:",
+                    decoded_text_prefix=_decoded_text_prefix_for_suffix(suffix_text),
                 )
 
     outputs_b = prefix_state["outputs"]
@@ -5218,7 +5368,7 @@ def _run_generated_latent_variant(
         max_new_tokens=int(cfg.max_new_tokens),
         target_answer_text=target_answer_text,
         append_answer_suffix_without_context=not use_receiver_context,
-        answer_suffix_text="\n\nRepeat the final answer from the latent reasoning.\nFinal answer:",
+        answer_suffix_text=_latent_answer_suffix(variant_cfg),
     )
     latent_trajectory_steps = int(handoff_source.shape[1])
     return {
@@ -5746,6 +5896,8 @@ def _configured_base_cfg(
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_strategy: Optional[str] = None,
+    sender_reasoning_truncation_fraction: Optional[float] = None,
+    latent_answer_suffix: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -5829,6 +5981,12 @@ def _configured_base_cfg(
         base_cfg.handoff.generated_trajectory_adapter.strategy = str(
             generated_trajectory_adapter_strategy
         )
+    if sender_reasoning_truncation_fraction is not None:
+        base_cfg.benchmark.sender_reasoning_truncation_fraction = float(
+            sender_reasoning_truncation_fraction
+        )
+    if latent_answer_suffix is not None:
+        base_cfg.handoff.receiver_context.latent_answer_suffix = str(latent_answer_suffix)
     if generated_trajectory_adapter_target_alignment is not None:
         base_cfg.handoff.generated_trajectory_adapter.target_alignment = str(
             generated_trajectory_adapter_target_alignment
@@ -6011,6 +6169,8 @@ def run_benchmark(
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_strategy: Optional[str] = None,
+    sender_reasoning_truncation_fraction: Optional[float] = None,
+    latent_answer_suffix: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -6062,6 +6222,8 @@ def run_benchmark(
         generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
+        sender_reasoning_truncation_fraction=sender_reasoning_truncation_fraction,
+        latent_answer_suffix=latent_answer_suffix,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -6949,6 +7111,8 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_train_split: Optional[str] = None,
     generated_trajectory_adapter_input_space: Optional[str] = None,
     generated_trajectory_adapter_strategy: Optional[str] = None,
+    sender_reasoning_truncation_fraction: Optional[float] = None,
+    latent_answer_suffix: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -6995,6 +7159,8 @@ def prepare_generated_trajectory_adapter_cache(
         generated_trajectory_adapter_train_split=generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
+        sender_reasoning_truncation_fraction=sender_reasoning_truncation_fraction,
+        latent_answer_suffix=latent_answer_suffix,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -7491,6 +7657,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--sender-reasoning-truncation-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Mid-reasoning handoff: truncate the sender's reasoning strictly before "
+            "its final-answer marker at this fraction, for both the latent handoff "
+            "and the text baselines. The receiver must continue the computation."
+        ),
+    )
+    parser.add_argument(
+        "--latent-answer-suffix",
+        default=None,
+        help=(
+            "Optional override for handoff.receiver_context.latent_answer_suffix — "
+            "the instruction appended after the latent prefix before receiver decode."
+        ),
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-source-mode",
         choices=("generated_text", "final_answer_tail", "final_answer_tail_anchored"),
         default=None,
@@ -7815,6 +7999,8 @@ def main() -> None:
             generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
             generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
             generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
+            sender_reasoning_truncation_fraction=args.sender_reasoning_truncation_fraction,
+            latent_answer_suffix=args.latent_answer_suffix,
             generated_trajectory_adapter_target_alignment=(
                 args.generated_trajectory_adapter_target_alignment
             ),
@@ -7973,6 +8159,8 @@ def main() -> None:
         generated_trajectory_adapter_train_split=args.generated_trajectory_adapter_train_split,
         generated_trajectory_adapter_input_space=args.generated_trajectory_adapter_input_space,
         generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
+        sender_reasoning_truncation_fraction=args.sender_reasoning_truncation_fraction,
+        latent_answer_suffix=args.latent_answer_suffix,
         generated_trajectory_adapter_target_alignment=args.generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=args.generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=(

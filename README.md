@@ -10,6 +10,7 @@ Recent validation runs exercise generated sender reasoning, adapter-fitted laten
 - The validation profiles encode that law directly: `--profile mps` is the GSM8K global-ridge profile, while `--profile long_context_mps` is the long-context per-step-ridge profile.
 - The current Pareto frontier is against token handoff at equal accuracy. GSM8K hits 100% with about 0.17s latent latency versus 3.1s token-context latency. Long-context replay hits 100% with 0.099s latent latency versus 40.9s token-context latency and 99.78% receiver-token savings.
 - Scaling over `train_limit` 8, 16, 32, 64, 128, and 256 over 32 handoffs behaves like a coverage phase transition rather than a smooth power law: accuracy stays at 0% while eval digits are unseen in the relevant slots, rises at partial coverage, then reaches 100% once the payload alphabet is covered. High readout similarity alone is not enough; per-slot coverage diagnostics are the safety signal for out-of-coverage errors.
+- Mid-reasoning ablations are supported with `--sender-reasoning-truncation-fraction`, which truncates both latent handoff and text-baseline reasoning strictly before the final-answer marker. `--latent-answer-suffix` can override the receiver continuation instruction used after the latent prefix.
 - The full validation ladder now reports semantic gates, transfer comparisons, heterogeneous readiness, leakage status, manifest digests, sender trace cache hit rates, adapter row cache hit rates, receiver-token pressure, and replay readiness in JSON.
 
 ## Local Checks

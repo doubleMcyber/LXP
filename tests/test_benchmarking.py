@@ -61,6 +61,8 @@ from benchmark_all import (
     _reasoner_metadata_for_text_hybrid,
     _select_generated_adapter_memory_rows,
     _sender_generation_cache_fingerprint,
+    _truncate_reasoning_token_ids,
+    _apply_sender_truncation_to_consensus,
     _uniform_training_row_step_count,
     _validate_eval_manifest_sample_lock,
 )
@@ -2550,3 +2552,99 @@ def test_anchored_source_mode_concatenates_sender_tail_embeddings() -> None:
     cfg.handoff.generated_trajectory_adapter.input_space = "raw"
     with pytest.raises(ValueError, match="agent_a"):
         _generated_trajectory_adapter_source_sequence(cfg, sender_state, state=None)
+
+
+class _TruncTokenizer:
+    # one token per word; decode joins with spaces
+    vocab = ["step", "one", "two", "three", "Final", "answer:", "42", "."]
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return " ".join(self.vocab[int(t)] for t in token_ids)
+
+
+def test_truncate_reasoning_cuts_strictly_before_final_answer_marker() -> None:
+    tokenizer = _TruncTokenizer()
+    # "step one two three Final answer: 42 ." — marker becomes visible at token 6
+    ids = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    half = _truncate_reasoning_token_ids(tokenizer, ids, 0.5)
+    # marker first visible once "answer:" lands (prefix length 6) -> pre-marker
+    # span is 5 tokens; half of it is 2
+    assert half == [0, 1]
+    assert "final answer" not in tokenizer.decode(half).lower()
+
+    nearly_all = _truncate_reasoning_token_ids(tokenizer, ids, 0.99)
+    assert "final answer" not in tokenizer.decode(nearly_all).lower()
+    assert len(nearly_all) >= 1
+
+    # no marker: fraction of the whole sequence, never empty
+    no_marker = _truncate_reasoning_token_ids(tokenizer, [0, 1, 2, 3], 0.5)
+    assert no_marker == [0, 1]
+    assert _truncate_reasoning_token_ids(tokenizer, [0], 0.5) == [0]
+
+
+def test_sender_truncation_slices_consensus_and_strips_marker() -> None:
+    cfg = OmegaConf.create(
+        {
+            "benchmark": {"sender_reasoning_truncation_fraction": 0.5},
+            "max_new_tokens": 8,
+        }
+    )
+    tokenizer = _TruncTokenizer()
+    consensus = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1).expand(1, 8, 4).clone()
+    result = {
+        "consensus_hidden_states": consensus,
+        "current_latent_step": consensus[:, -1:, :],
+        "attention_mask": torch.ones((1, 8), dtype=torch.long),
+        "latent_pooling": "last_token",
+        "generated_token_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+        "generated_reasoning_text": "step one two three Final answer: 42 .",
+        "generated_reasoning_token_count": 8,
+        "generated_latent_includes_prompt": False,
+        "generated_reasoning_status": "complete",
+        "generated_reasoning_final_answer_marker": True,
+    }
+
+    truncated = _apply_sender_truncation_to_consensus(result, cfg, tokenizer)
+
+    assert truncated["generated_token_ids"] == [0, 1]
+    assert tuple(truncated["consensus_hidden_states"].shape) == (1, 2, 4)
+    # causal prefix: the sliced latents are exactly the first rows of the original
+    assert torch.equal(truncated["consensus_hidden_states"], consensus[:, :2, :])
+    assert "final answer" not in truncated["generated_reasoning_text"].lower()
+    assert truncated["generated_reasoning_final_answer_marker"] is False
+    assert truncated["generated_reasoning_status"] != "complete"
+    # the original full-trace result (what gets disk-cached) is untouched
+    assert result["generated_token_ids"] == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert tuple(result["consensus_hidden_states"].shape) == (1, 8, 4)
+
+    cfg.benchmark.sender_reasoning_truncation_fraction = None
+    untouched = _apply_sender_truncation_to_consensus(result, cfg, tokenizer)
+    assert untouched is result
+
+
+def test_truncation_fraction_extends_rows_and_adapter_cache_keys_only_when_set() -> None:
+    base_cfg = OmegaConf.create(
+        {
+            "agent_a_model": "a",
+            "agent_b_model": "b",
+            "torch_dtype": "float32",
+            "max_new_tokens": 8,
+            "handoff": {"generated_trajectory_adapter": {"source_tail_tokens": 4}},
+        }
+    )
+    state = {
+        "global_alignment_cache_key": ("k",),
+        "global_reasoning_layer_indices": (0,),
+        "global_reasoning_layer_weights": (1.0,),
+    }
+    plain_rows = _generated_trajectory_adapter_training_rows_cache_key(
+        base_cfg, state, include_prompt=False
+    )
+    truncated_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    truncated_cfg.benchmark = {"sender_reasoning_truncation_fraction": 0.5}
+    truncated_rows = _generated_trajectory_adapter_training_rows_cache_key(
+        truncated_cfg, state, include_prompt=False
+    )
+    assert plain_rows != truncated_rows
+    assert plain_rows == truncated_rows[: len(plain_rows)]
