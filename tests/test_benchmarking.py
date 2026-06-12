@@ -63,6 +63,7 @@ from benchmark_all import (
     _sender_generation_cache_fingerprint,
     _truncate_reasoning_token_ids,
     _apply_sender_truncation_to_consensus,
+    _serialize_text_hybrid_prompt,
     _uniform_training_row_step_count,
     _validate_eval_manifest_sample_lock,
 )
@@ -2648,3 +2649,15 @@ def test_truncation_fraction_extends_rows_and_adapter_cache_keys_only_when_set()
     )
     assert plain_rows != truncated_rows
     assert plain_rows == truncated_rows[: len(plain_rows)]
+
+
+def test_text_hybrid_prompt_switches_to_continuation_instruction_when_truncated() -> None:
+    plain_cfg = OmegaConf.create({"benchmark": {}})
+    truncated_cfg = OmegaConf.create(
+        {"benchmark": {"sender_reasoning_truncation_fraction": 0.5}}
+    )
+    plain = _serialize_text_hybrid_prompt("Q?", "partial reasoning", None, plain_cfg)
+    truncated = _serialize_text_hybrid_prompt("Q?", "partial reasoning", None, truncated_cfg)
+    assert "give the final answer" in plain
+    assert "unfinished" in truncated
+    assert "Continue it step by step" in truncated

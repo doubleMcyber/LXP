@@ -487,12 +487,20 @@ def _serialize_text_hybrid_prompt(
     tokenizer: Any = None,
     cfg: Any = None,
 ) -> str:
-    final_instruction = (
-        "Use the reasoning above. Return exactly one line in this format: "
-        "Final answer: <answer>. Do not include reasoning, equations, markdown, or extra text."
-        if _answer_only_final_enabled(cfg)
-        else "Use the reasoning above and give the final answer."
-    )
+    if _sender_reasoning_truncation_fraction(cfg) is not None:
+        # Mid-reasoning handoff: the upstream trace is deliberately unfinished, so
+        # asking for "the final answer" primes a guess; the receiver must continue.
+        final_instruction = (
+            "The reasoning above is unfinished. Continue it step by step and finish "
+            "with exactly one line: Final answer: <answer>."
+        )
+    elif _answer_only_final_enabled(cfg):
+        final_instruction = (
+            "Use the reasoning above. Return exactly one line in this format: "
+            "Final answer: <answer>. Do not include reasoning, equations, markdown, or extra text."
+        )
+    else:
+        final_instruction = "Use the reasoning above and give the final answer."
     user_message = (
         f"{prompt}\n\n"
         f"Reasoning from Agent A:\n{reasoning_text.strip()}\n\n"
