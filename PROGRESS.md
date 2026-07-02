@@ -1,6 +1,6 @@
 # LXP — Progress Report
 
-_Last updated: 2026-07-02. Branch: `mac-mps-training`._
+_Last updated: 2026-07-02 (parity gap closed same day — see §3.6 and §4.1). Branch: `mac-mps-training`._
 
 LXP (Latent Exchange Protocol) is a machine-native communication layer for AI
 agents: instead of passing text between models, a **sender** model's continuous
@@ -162,17 +162,31 @@ Two largely independent tracks share this spine:
    64-row adapter prep now completes (~37.5 min, peak RSS 8.5 GB) and multi-sample
    sequential evals run flat.
 
+6. **RESOLVED 2026-07-02 — the production benchmark path now reproduces latent
+   continuation.** `generated_context_latent_handoff` scores **100% (8/8)**
+   row-identical with the trainer bridge eval, and at N=32 (all cached
+   validation rows, locked manifest `outputs/parity_fix/locked_continuation_32.json`):
+   **latent 65.6% (21/32) > text-hybrid 56.2% (18/32) > receiver-alone 21.9% (7/32)**,
+   latent uniquely solving 4 rows vs text's 1. Leak-free 128-row ridge adapter,
+   truncation 0.5, Qwen3.5-2B→2B. Artifacts: `outputs/parity_fix/`.
+
 ---
 
 ## 4. What is unproven, unfinished, or open
 
-1. **The benchmark-vs-trainer parity gap (the headline open problem).** The
-   production benchmark latent path scores **0%** (answer PPL ~18) on the *same*
-   truncated latents that the Phase-0 trainer continues from at 70%. The cause is
-   layout/framing/precision, not the latents. `scripts/parity_harness.py` exists
-   specifically to diff the two paths' first-token logits and localize the
-   divergence — **this is not yet resolved.** The Phase-0 layout fixes landed in
-   the production path, but full parity has not been demonstrated.
+1. ~~**The benchmark-vs-trainer parity gap.**~~ **RESOLVED 2026-07-02** (see
+   §3.6). Three stacked causes, none of them the latents or the adapter:
+   (a) historical runs used `generated_latent_handoff` (latent-only — the
+   receiver never saw the question); the continuation method is
+   `generated_context_latent_handoff`; (b) the default post-latent suffix
+   ("Repeat the final answer…") primed a guess — it now defaults to free
+   generation whenever sender truncation is active; (c) chunked context-prefill
+   (context forward, then latents with `past_key_values`) drifts numerically on
+   the hybrid linear-attention/SSM cache, enough to deflect 256-token greedy
+   decodes — the receiver-context prefix now runs one fused forward over
+   `[context, latents]`, matching the trainer mechanics. The earlier
+   "128 transcoder rows still 0/8" finding was this layout bug, not a density
+   limit.
 
 2. **Full-sequence latent transcoding of arbitrary reasoning does not work.**
    Transcoded full-trace latents score 0% (receiver emits degenerate loops);
@@ -238,8 +252,9 @@ dedicated `parity_harness.py` / `certify_latent_bridge.py` diagnostic scripts.
 ## 6. One-line status
 
 The latent-handoff **channel** and its cost/compression advantage are built and
-certified; **mid-reasoning latent continuation is proven at small N** with an
-untrained linear bridge. The two biggest open items are (a) closing the
-**benchmark-vs-trainer parity gap** so the production path reproduces the
-trainer's 70%, and (b) making **arbitrary full-sequence reasoning** transfer —
-likely via receiver-side fine-tuning rather than a wider linear transcoder.
+certified, and **mid-reasoning latent continuation now runs through the audited
+production benchmark** (latent 65.6% > text 56.2% > alone 21.9%, N=32, locked
+manifest). The biggest remaining items are (a) cross-family continuation
+(EXAONE→Qwen retest under the fixed layout), (b) scaling N beyond the 32 cached
+validation traces, and (c) the design-doc gates that were never run (long-horizon
+ODE study, MATH Level-5 head-to-head, GPU-scale profiles).
