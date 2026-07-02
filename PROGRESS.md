@@ -170,6 +170,16 @@ Two largely independent tracks share this spine:
    latent uniquely solving 4 rows vs text's 1. Leak-free 128-row ridge adapter,
    truncation 0.5, Qwen3.5-2B→2B. Artifacts: `outputs/parity_fix/`.
 
+7. **Cross-family latent continuation works (2026-07-02, N=8).**
+   EXAONE-4.0-1.2B → Qwen3.5-2B, truncation 0.5, through the audited path:
+   **latent 87.5% (7/8) > text 62.5% > receiver-alone 37.5%**, and the latent
+   handoff is *faster* than the text handoff (10.5s vs 17.6s/sample). The
+   adapter is the cached 32-row cross-family linear ridge — no receiver
+   fine-tuning. This refutes the earlier "cross-family incompatibility" reading
+   (§4.5): that failure was the old instruction/layout artifact.
+   Report: `outputs/parity_fix/crossfamily_continuation_report.json`.
+   Caveats: N=8, one truncation fraction, small-drafter→big-finisher direction.
+
 ---
 
 ## 4. What is unproven, unfinished, or open
@@ -205,10 +215,11 @@ Two largely independent tracks share this spine:
    readout sat at 0.6–0.72, below the 0.80 gate). This is now understood and
    documented; treat any historical 100% not listed in §3 with suspicion.
 
-5. **Cross-family transfer is unsettled.** Cross-family text continuation
-   (EXAONE→Qwen) underperformed receiver-alone under the *old* instruction; it
-   has not been retested under the validated continuation instruction. No
-   cross-family *latent* continuation result exists.
+5. ~~**Cross-family transfer is unsettled.**~~ **RESOLVED 2026-07-02** (see
+   §3.7): cross-family latent continuation (EXAONE→Qwen3.5-2B) scores 87.5%,
+   beating text by 25 points, under the fixed layout. Remaining: scale beyond
+   N=8 and test more family pairs / the reverse (big-drafter→small-finisher)
+   direction.
 
 6. **Design success criteria not yet met.** From `MD Files/`:
    - Phase-4 Gate ("500+ step trajectory without catastrophic drift"): ODE runs,
