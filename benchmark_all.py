@@ -26,6 +26,7 @@ from latent_pipeline import (
     _cosine_distance,
     _format_receiver_context_answer_suffix,
     _format_receiver_context_prompt,
+    _sender_truncation_active,
     _get_pipeline_state,
     _latent_prefix_mode,
     _latent_pooling_mode,
@@ -3799,6 +3800,12 @@ def _latent_answer_suffix(cfg: Any) -> str:
         # an explicit empty override means "no suffix": the latents end the prompt
         # and the receiver generates freely (the Phase 0 winning layout)
         return str(override)
+    if _sender_truncation_active(cfg):
+        # Mid-reasoning handoff: the latents carry unfinished work, and the context
+        # prompt already asks the receiver to continue it. Appending "Repeat the
+        # final answer" here would contradict that framing and prime a guess —
+        # the Phase 0 winning layout ends the prompt at the latents.
+        return ""
     return "\n\nRepeat the final answer from the latent reasoning.\nFinal answer:"
 
 

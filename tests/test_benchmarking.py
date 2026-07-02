@@ -2687,3 +2687,23 @@ def test_latent_answer_suffix_empty_override_means_no_suffix() -> None:
         {"handoff": {"receiver_context": {"latent_answer_suffix": "Continue."}}}
     )
     assert _latent_answer_suffix(custom_cfg) == "Continue."
+
+
+def test_latent_answer_suffix_defaults_to_empty_under_truncation() -> None:
+    # Mid-reasoning handoff: the context prompt asks the receiver to continue the
+    # unfinished work, so the default suffix must not prime an answer guess.
+    truncated_cfg = OmegaConf.create(
+        {
+            "benchmark": {"sender_reasoning_truncation_fraction": 0.5},
+            "handoff": {"receiver_context": {}},
+        }
+    )
+    assert _latent_answer_suffix(truncated_cfg) == ""
+    # an explicit override still wins even when truncation is active
+    override_cfg = OmegaConf.create(
+        {
+            "benchmark": {"sender_reasoning_truncation_fraction": 0.5},
+            "handoff": {"receiver_context": {"latent_answer_suffix": "Continue."}},
+        }
+    )
+    assert _latent_answer_suffix(override_cfg) == "Continue."

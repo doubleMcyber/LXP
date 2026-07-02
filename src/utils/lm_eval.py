@@ -180,17 +180,37 @@ def prepare_receiver_context_latent_prefix_state(
 
     context_token_count = 0
     if latent_position == "after_context":
-        context_prefix_state = prepare_text_prefix_state(
-            model=model,
-            tokenizer=tokenizer,
-            prefix_text=context_text,
+        # Fused single forward over [context tokens, latents]. Chunked prefill
+        # (context forward, then latents with past_key_values) is mathematically
+        # equivalent for pure attention but drifts numerically on hybrid
+        # linear-attention/SSM caches — enough to deflect long greedy decodes.
+        # One concatenated forward matches the latent-bridge trainer exactly.
+        model_device = next(model.parameters()).device
+        encoded = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+        context_ids = encoded["input_ids"].to(model_device)
+        context_token_count = int(context_ids.shape[1])
+        with torch.no_grad():
+            context_embeds = model.get_input_embeddings()(context_ids)
+        combined_prefix = torch.cat(
+            [
+                context_embeds,
+                handoff_step.to(device=model_device, dtype=context_embeds.dtype),
+            ],
+            dim=1,
         )
-        context_token_count = int(context_prefix_state["prefix_seq_len"])
-        context_kv_cache = _normalize_kv_cache(context_prefix_state["outputs"].past_key_values)
         latent_prefix_state = prepare_latent_prefix_state(
             model=model,
-            handoff_step=handoff_step,
-            kv_cache=context_kv_cache,
+            handoff_step=combined_prefix,
+            kv_cache=None,
+        )
+        # The receiver context supplies the effective prefix cache; report it as
+        # such even though it is built in the same forward as the latents.
+        latent_prefix_state.update(
+            {
+                "kv_cache_transferred": True,
+                "kv_cache_status": "transferred",
+                "kv_cache_reason": "receiver_context_fused_forward",
+            }
         )
         active_kv_cache_source = "receiver_context"
     else:
