@@ -3795,7 +3795,9 @@ def _decoded_text_prefix_for_suffix(suffix_text: str) -> str:
 def _latent_answer_suffix(cfg: Any) -> str:
     receiver_context_cfg = getattr(getattr(cfg, "handoff", None), "receiver_context", None)
     override = getattr(receiver_context_cfg, "latent_answer_suffix", None)
-    if override is not None and str(override).strip():
+    if override is not None:
+        # an explicit empty override means "no suffix": the latents end the prompt
+        # and the receiver generates freely (the Phase 0 winning layout)
         return str(override)
     return "\n\nRepeat the final answer from the latent reasoning.\nFinal answer:"
 

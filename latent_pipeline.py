@@ -459,13 +459,31 @@ def _answer_metric_variants(cfg: Optional[DictConfig], answer_text: Optional[str
     )
 
 
-def _format_receiver_context_prompt(prompt: str, tokenizer: Any = None, cfg: Optional[DictConfig] = None) -> str:
-    instruction = (
-        "Use the latent reasoning signal that follows. Return only the final answer "
-        "in the form: Final answer: <answer>."
-        if _answer_only_final_enabled(cfg)
-        else "Use the latent reasoning signal that follows and give the final answer."
+def _sender_truncation_active(cfg: Optional[DictConfig]) -> bool:
+    return (
+        getattr(getattr(cfg, "benchmark", None), "sender_reasoning_truncation_fraction", None)
+        is not None
     )
+
+
+def _format_receiver_context_prompt(prompt: str, tokenizer: Any = None, cfg: Optional[DictConfig] = None) -> str:
+    if _sender_truncation_active(cfg):
+        # Mid-reasoning handoff: the latents carry unfinished work; asking for "the
+        # final answer" primes a guess. Phase 0 measured this layout at +20 points
+        # over receiver-alone with the same latents that scored 0% under the old one.
+        instruction = (
+            "An assistant started solving this problem but stopped mid-reasoning. "
+            "Its partial work is handed to you as a latent summary after this message. "
+            "Continue the reasoning step by step and finish with exactly one line: "
+            "Final answer: <answer>."
+        )
+    elif _answer_only_final_enabled(cfg):
+        instruction = (
+            "Use the latent reasoning signal that follows. Return only the final answer "
+            "in the form: Final answer: <answer>."
+        )
+    else:
+        instruction = "Use the latent reasoning signal that follows and give the final answer."
     user_message = f"{prompt}\n\n{instruction}"
     return _maybe_apply_chat_template(tokenizer, user_message)
 

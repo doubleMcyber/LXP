@@ -63,6 +63,7 @@ from benchmark_all import (
     _sender_generation_cache_fingerprint,
     _truncate_reasoning_token_ids,
     _apply_sender_truncation_to_consensus,
+    _latent_answer_suffix,
     _serialize_text_hybrid_prompt,
     _uniform_training_row_step_count,
     _validate_eval_manifest_sample_lock,
@@ -2661,3 +2662,28 @@ def test_text_hybrid_prompt_switches_to_continuation_instruction_when_truncated(
     assert "give the final answer" in plain
     assert "unfinished" in truncated
     assert "Continue it step by step" in truncated
+
+
+def test_receiver_context_prompt_switches_to_continuation_when_truncated() -> None:
+    from latent_pipeline import _format_receiver_context_prompt
+
+    plain = _format_receiver_context_prompt("Q?", None, OmegaConf.create({"benchmark": {}}))
+    truncated = _format_receiver_context_prompt(
+        "Q?",
+        None,
+        OmegaConf.create({"benchmark": {"sender_reasoning_truncation_fraction": 0.5}}),
+    )
+    assert "give the final answer" in plain
+    assert "stopped mid-reasoning" in truncated
+    assert "Continue the reasoning" in truncated
+
+
+def test_latent_answer_suffix_empty_override_means_no_suffix() -> None:
+    default_cfg = OmegaConf.create({"handoff": {"receiver_context": {}}})
+    assert "Repeat the final answer" in _latent_answer_suffix(default_cfg)
+    empty_cfg = OmegaConf.create({"handoff": {"receiver_context": {"latent_answer_suffix": ""}}})
+    assert _latent_answer_suffix(empty_cfg) == ""
+    custom_cfg = OmegaConf.create(
+        {"handoff": {"receiver_context": {"latent_answer_suffix": "Continue."}}}
+    )
+    assert _latent_answer_suffix(custom_cfg) == "Continue."
