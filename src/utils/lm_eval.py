@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 import re
 from collections.abc import Sequence
@@ -45,6 +46,24 @@ def _tuple_kv_cache_batch_size(kv_cache: Any) -> Optional[int]:
     return int(key_tensor.shape[0])
 
 
+def _last_logit_forward_kwargs(model: Any) -> dict[str, Any]:
+    """Kwargs asking the model to compute only the last position's logits.
+
+    Prefix builders read only ``logits[:, -1, :]``, but without this the forward
+    transiently materializes the full ``[1, seq, vocab]`` logits tensor
+    (~4.9GB fp32 at 8k context) before ``_retain_last_position_logits`` can drop
+    it. Guarded via signature inspection because duck-typed test models do not
+    accept the kwarg.
+    """
+    try:
+        parameters = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "logits_to_keep" in parameters:
+        return {"logits_to_keep": 1}
+    return {}
+
+
 def _retain_last_position_logits(outputs: Any) -> Any:
     """Drop all but the last-position logits from a retained prefix forward.
 
@@ -78,6 +97,7 @@ def prepare_text_prefix_state(
             position_ids=position_ids,
             use_cache=True,
             return_dict=True,
+            **_last_logit_forward_kwargs(model),
         )
 
     return {
@@ -144,6 +164,7 @@ def prepare_latent_prefix_state(
             position_ids=position_ids,
             use_cache=True,
             return_dict=True,
+            **_last_logit_forward_kwargs(model),
         )
 
     return {
@@ -294,6 +315,7 @@ def append_text_to_prefix_state(
             position_ids=position_ids,
             use_cache=True,
             return_dict=True,
+            **_last_logit_forward_kwargs(model),
         )
 
     return {

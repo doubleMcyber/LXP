@@ -172,6 +172,41 @@ class TinyPrefixModel(torch.nn.Module):
         )
 
 
+class TinyLogitsToKeepModel(TinyPrefixModel):
+    """TinyPrefixModel variant that supports the logits_to_keep fast path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logits_to_keep_calls: list[int] = []
+
+    def forward(self, *, logits_to_keep=None, **kwargs):
+        outputs = super().forward(**kwargs)
+        if logits_to_keep is not None:
+            self.logits_to_keep_calls.append(int(logits_to_keep))
+            outputs.logits = outputs.logits[:, -int(logits_to_keep):, :]
+        return outputs
+
+
+def test_prefix_builders_request_only_last_logits_when_supported() -> None:
+    model = TinyLogitsToKeepModel()
+
+    prefix_state = prepare_latent_prefix_state(
+        model=model,
+        handoff_step=torch.zeros(1, 3, 4),
+        kv_cache=None,
+    )
+
+    assert model.logits_to_keep_calls == [1]
+    assert prefix_state["outputs"].logits.shape[1] == 1
+    # models without the kwarg still work via the guarded pass-through
+    fallback_state = prepare_latent_prefix_state(
+        model=TinyPrefixModel(),
+        handoff_step=torch.zeros(1, 3, 4),
+        kv_cache=None,
+    )
+    assert fallback_state["outputs"].logits.shape[1] == 1
+
+
 def test_prepare_latent_prefix_state_rejects_wrong_embedding_dimension() -> None:
     model = TinyPrefixModel()
 
