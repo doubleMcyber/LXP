@@ -170,7 +170,28 @@ Two largely independent tracks share this spine:
    latent uniquely solving 4 rows vs text's 1. Leak-free 128-row ridge adapter,
    truncation 0.5, Qwen3.5-2B→2B. Artifacts: `outputs/parity_fix/`.
 
-7. **Cross-family latent continuation works (2026-07-02, N=8).**
+7. **Truncation dose-response supports genuine computation transfer
+   (2026-07-04, N=32 per point).** Same Qwen3.5-2B→2B protocol as §3.6, audited
+   path, per-fraction leak-free adapters:
+
+   | truncation f | latent | text-hybrid | receiver-alone | latent lead |
+   |---|---|---|---|---|
+   | 0.25 | **75.0%** | 62.5% | 21.9% | +12.5 |
+   | 0.50 | **65.6%** | 56.2% | 21.9% | +9.4 |
+
+   The latent channel beats text at both fractions, and its lead *grows* the
+   earlier the handoff — consistent with transferring computation state rather
+   than a static answer signal. (f=0.75 run repeatedly killed externally on
+   this machine; rerun with the same argv + `--sender-reasoning-truncation-fraction 0.75`
+   to complete the curve.) Reports: `outputs/parity_fix/continuation32_f25_*`.
+
+8. **Long-context regression check passed after the parity fixes (2026-07-04).**
+   Full `long_context_mps` ladder re-run post fused-forward + `logits_to_keep`
+   changes: all 4 methods 100%, latent 0.43s vs 299s token-context, 99.78%
+   receiver-token savings, leakage ruled out, semantic/comparison/heterogeneous
+   gates all pass (digest `54f91d4e…`).
+
+9. **Cross-family latent continuation works (2026-07-02, N=8).**
    EXAONE-4.0-1.2B → Qwen3.5-2B, truncation 0.5, through the audited path:
    **latent 87.5% (7/8) > text 62.5% > receiver-alone 37.5%**, and the latent
    handoff is *faster* than the text handoff (10.5s vs 17.6s/sample). The
@@ -216,7 +237,7 @@ Two largely independent tracks share this spine:
    documented; treat any historical 100% not listed in §3 with suspicion.
 
 5. ~~**Cross-family transfer is unsettled.**~~ **RESOLVED 2026-07-02** (see
-   §3.7): cross-family latent continuation (EXAONE→Qwen3.5-2B) scores 87.5%,
+   §3.9): cross-family latent continuation (EXAONE→Qwen3.5-2B) scores 87.5%,
    beating text by 25 points, under the fixed layout. Remaining: scale beyond
    N=8 and test more family pairs / the reverse (big-drafter→small-finisher)
    direction.
