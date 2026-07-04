@@ -171,12 +171,31 @@ Two largely independent tracks share this spine:
    working tree containing the same fixes). At N=32 (all cached validation rows,
    locked manifest `outputs/parity_fix/locked_continuation_32.json`):
    **latent 65.6% (21/32) > text-hybrid 56.2% (18/32) > receiver-alone 21.9% (7/32)**.
-   Latent > alone is significant (McNemar p≈0.0005); **latent > text is
-   directional only at this N** (4 latent-only wins vs 1 text-only, McNemar
-   p≈0.375). On the 27 copy-proof rows (answer literal absent from the truncated
+   Latent > alone is significant (McNemar p≈0.0005); latent > text was
+   directional at N=32 (p≈0.375) and is **now significant at N=128 — see §3.6b**.
+   On the 27 copy-proof rows (answer literal absent from the truncated
    sender text): latent 66.7% vs text 59.3% — no parroting confound. Leak-free
    128-row ridge adapter, truncation 0.5, Qwen3.5-2B→2B. Artifacts:
    `outputs/parity_fix/`.
+
+   **§3.6b — N=128 (2026-07-04): the headline claim is statistically
+   significant.** Same protocol, GSM8K validation rows 0–127 (96 freshly
+   generated sender traces + 32 cached), locked manifest
+   `outputs/parity_fix/locked_continuation_128.json`:
+
+   | method | accuracy |
+   |---|---|
+   | `generated_context_latent_handoff` | **68.8% (88/128)** |
+   | `text_text_hybrid` | 57.0% (73/128) |
+   | `pure_text_cot` (receiver alone) | 14.1% (18/128) |
+
+   Paired per-row: **20 latent-only wins vs 5 text-only → McNemar exact
+   p = 0.0041**; latent vs alone p ≈ 2×10⁻¹⁸. Copy-proof stratum (answer
+   literal absent from the truncated sender text, 106/128 rows): latent 68.9%
+   vs text 57.5%. Latent is also faster per handoff than the text hybrid
+   (14.4s vs 18.5s). Adapter train split disjoint from eval (train head vs
+   validation tail), sender traces cached and marker-free.
+   Report: `outputs/parity_fix/continuation128_report.json`.
 
 7. **Truncation dose-response — latent leads at both measured fractions
    (2026-07-04, N=32 per point; directional, not yet significant).** Same
@@ -293,14 +312,11 @@ dedicated `parity_harness.py` / `certify_latent_bridge.py` diagnostic scripts.
 
 ## 6. One-line status
 
-The latent-handoff **channel** and its cost/compression advantage are built and
-re-certified post-fixes, **mid-reasoning latent continuation runs through the
-audited production benchmark** (latent 65.6% > text 56.2% > alone 21.9% at
-f=0.5; 75.0% > 62.5% > 21.9% at f=0.25; N=32, locked manifests), and
-**cross-family continuation works at N=8** (EXAONE→Qwen 87.5% > text 62.5%).
-The biggest remaining item is **statistical power**: latent > alone is
-significant, latent > text is directional (McNemar p≈0.2–0.4) — the N≥128
-locked-manifest run is the single experiment that cements or kills the headline
-claim. After that: the f=0.75 point, cross-family at N≥32, and the never-run
-design-doc gates (long-horizon ODE study, MATH Level-5 head-to-head, GPU-scale
-profiles).
+**The headline claim is proven at significance**: mid-reasoning latent handoff
+beats text handoff — latent 68.8% > text 57.0% > alone 14.1% at N=128, McNemar
+p = 0.0041, leak-free, locked manifest, through the audited production path
+(§3.6b). The channel's cost/compression advantage is re-certified post-fixes
+(§3.8), cross-family continuation works at N=8 (§3.9), and the truncation
+dose-response is consistent with computation-state transfer (§3.7). Remaining:
+the f=0.75 sweep point, cross-family at N≥32, and the never-run design-doc
+gates (long-horizon ODE study, MATH Level-5 head-to-head, GPU-scale profiles).
