@@ -197,22 +197,21 @@ Two largely independent tracks share this spine:
    validation tail), sender traces cached and marker-free.
    Report: `outputs/parity_fix/continuation128_report.json`.
 
-7. **Truncation dose-response — latent leads at both measured fractions
-   (2026-07-04, N=32 per point; directional, not yet significant).** Same
-   Qwen3.5-2B→2B protocol as §3.6, audited path, per-fraction leak-free adapters:
+7. **Truncation dose-response — latent leads at every measured fraction
+   (2026-07-04, N=32 per point; curve complete).** Same Qwen3.5-2B→2B protocol
+   as §3.6, audited path, per-fraction leak-free adapters:
 
    | truncation f | latent | text-hybrid | receiver-alone | latent lead | McNemar (latent vs text) |
    |---|---|---|---|---|---|
    | 0.25 | **75.0%** | 62.5% | 21.9% | +12.5 | p≈0.219 |
    | 0.50 | **65.6%** | 56.2% | 21.9% | +9.4 | p≈0.375 |
+   | 0.75 | **78.1%** | 56.2% | 21.9% | +21.9 | **p≈0.016** (7 latent-only vs 0 text-only) |
 
-   The latent channel leads text at both fractions and the lead is larger at the
-   earlier handoff — but the slope is one row and neither per-point lead is
-   statistically significant at N=32; treat "computation-state transfer" as the
-   working hypothesis these points are consistent with, pending the N≥128 run.
-   (f=0.75 run repeatedly killed externally on this machine; rerun with the same
-   argv + `--sender-reasoning-truncation-fraction 0.75` to complete the curve.)
-   Reports: `outputs/parity_fix/continuation32_f25_*`.
+   The latent channel leads text at all three fractions; at f=0.75 the lead is
+   significant even at N=32 (latent strictly dominates — zero rows where text
+   was right and latent wrong; copy-proof stratum 80.8% vs 57.7% over 26 rows).
+   The N=128 run at f=0.5 (§3.6b) anchors the mid-fraction significance.
+   Reports: `outputs/parity_fix/continuation32_f25_*`, `continuation32_f75_*`.
 
 8. **Long-context regression check passed after the parity fixes (2026-07-04).**
    Full `long_context_mps` ladder re-run post fused-forward + `logits_to_keep`
@@ -220,15 +219,22 @@ Two largely independent tracks share this spine:
    receiver-token savings, leakage ruled out, semantic/comparison/heterogeneous
    gates all pass (digest `54f91d4e…`).
 
-9. **Cross-family latent continuation works (2026-07-02, N=8).**
-   EXAONE-4.0-1.2B → Qwen3.5-2B, truncation 0.5, through the audited path:
-   **latent 87.5% (7/8) > text 62.5% > receiver-alone 37.5%**, and the latent
-   handoff is *faster* than the text handoff (10.5s vs 17.6s/sample). The
-   adapter is the cached 32-row cross-family linear ridge — no receiver
-   fine-tuning. This refutes the earlier "cross-family incompatibility" reading
-   (§4.5): that failure was the old instruction/layout artifact.
-   Report: `outputs/parity_fix/crossfamily_continuation_report.json`.
-   Caveats: N=8, one truncation fraction, small-drafter→big-finisher direction.
+9. **Cross-family latent continuation carries computation; parity with text,
+   not superiority (2026-07-04, N=32).** EXAONE-4.0-1.2B → Qwen3.5-2B,
+   truncation 0.5, audited path, locked manifest
+   (`outputs/parity_fix/locked_xfam_32.json`, leakage ruled out):
+   **latent 59.4% (19/32) ≈ text 62.5% (20/32)** (McNemar p=1.0; copy-proof
+   stratum an exact tie 62.1%/62.1% over 29 rows) — both far above
+   **receiver-alone 21.9%** (latent vs alone p=0.0018). Latent is ~40% faster
+   than the text handoff (13.1s vs 21.5s/sample) at equal fidelity, with lower
+   answer PPL (4.9 vs 7.4). The earlier N=8 run (87.5% vs 62.5%,
+   `crossfamily_continuation_report.json`) was anecdote — superseded by this
+   N=32 result. So: crossing the family boundary through a 32-row linear ridge
+   preserves the computation (refuting the old "incompatibility" reading, which
+   was the instruction artifact), but the latent *advantage over text* is so far
+   a same-family result. Note the cross-family adapter has only 32 training
+   rows vs 128 same-family — density is the obvious untested lever.
+   Report: `outputs/parity_fix/xfam32_report.json`.
 
 ---
 
@@ -266,10 +272,11 @@ Two largely independent tracks share this spine:
    documented; treat any historical 100% not listed in §3 with suspicion.
 
 5. ~~**Cross-family transfer is unsettled.**~~ **RESOLVED 2026-07-02** (see
-   §3.9): cross-family latent continuation (EXAONE→Qwen3.5-2B) scores 87.5%,
-   beating text by 25 points, under the fixed layout. Remaining: scale beyond
-   N=8 and test more family pairs / the reverse (big-drafter→small-finisher)
-   direction.
+   §3.9): cross-family latent continuation (EXAONE→Qwen3.5-2B) carries the
+   computation under the fixed layout — parity with text at N=32 (59.4% vs
+   62.5%, tie), both far above receiver-alone, latent ~40% faster. Remaining:
+   denser cross-family adapters (32→128 rows), more family pairs, the reverse
+   (big-drafter→small-finisher) direction.
 
 6. **Design success criteria not yet met.** From `MD Files/`:
    - Phase-4 Gate ("500+ step trajectory without catastrophic drift"): ODE runs,
