@@ -172,6 +172,41 @@ class TinyPrefixModel(torch.nn.Module):
         )
 
 
+class TinyLogitsToKeepModel(TinyPrefixModel):
+    """TinyPrefixModel variant that supports the logits_to_keep fast path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logits_to_keep_calls: list[int] = []
+
+    def forward(self, *, logits_to_keep=None, **kwargs):
+        outputs = super().forward(**kwargs)
+        if logits_to_keep is not None:
+            self.logits_to_keep_calls.append(int(logits_to_keep))
+            outputs.logits = outputs.logits[:, -int(logits_to_keep):, :]
+        return outputs
+
+
+def test_prefix_builders_request_only_last_logits_when_supported() -> None:
+    model = TinyLogitsToKeepModel()
+
+    prefix_state = prepare_latent_prefix_state(
+        model=model,
+        handoff_step=torch.zeros(1, 3, 4),
+        kv_cache=None,
+    )
+
+    assert model.logits_to_keep_calls == [1]
+    assert prefix_state["outputs"].logits.shape[1] == 1
+    # models without the kwarg still work via the guarded pass-through
+    fallback_state = prepare_latent_prefix_state(
+        model=TinyPrefixModel(),
+        handoff_step=torch.zeros(1, 3, 4),
+        kv_cache=None,
+    )
+    assert fallback_state["outputs"].logits.shape[1] == 1
+
+
 def test_prepare_latent_prefix_state_rejects_wrong_embedding_dimension() -> None:
     model = TinyPrefixModel()
 
@@ -232,6 +267,36 @@ def test_prepare_receiver_context_latent_prefix_state_uses_actor_prompt_cache() 
     assert prefix_state["receiver_context_token_count"] == 4
     assert prefix_state["active_kv_cache_source"] == "receiver_context"
     assert prefix_state["attention_mask"].shape == (1, 5)
+
+
+class CountingPrefixModel(TinyPrefixModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls: list[int] = []
+
+    def forward(self, **kwargs):
+        embeds = kwargs.get("inputs_embeds")
+        seq_len = int(embeds.shape[1]) if embeds is not None else int(kwargs["input_ids"].shape[1])
+        self.forward_calls.append(seq_len)
+        return super().forward(**kwargs)
+
+
+def test_after_context_prefix_runs_one_fused_forward() -> None:
+    # Chunked prefill (context forward, then latents with past_key_values) drifts
+    # numerically on hybrid linear-attention/SSM caches and deflects long greedy
+    # decodes — the parity fix requires ONE forward over [context, latents].
+    model = CountingPrefixModel()
+
+    prefix_state = prepare_receiver_context_latent_prefix_state(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        context_text="What is fifty thousand?",
+        handoff_step=torch.zeros(1, 3, 4),
+    )
+
+    assert model.forward_calls == [7]  # 4 context tokens + 3 latents, fused
+    assert prefix_state["prefix_seq_len"] == 7
+    assert prefix_state["kv_cache_reason"] == "receiver_context_fused_forward"
 
 
 def test_prepare_receiver_context_latent_prefix_state_can_append_answer_suffix() -> None:
