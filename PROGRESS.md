@@ -1,6 +1,7 @@
 # LXP — Progress Report
 
-_Last updated: 2026-07-02 (parity gap closed same day — see §3.6 and §4.1). Branch: `mac-mps-training`._
+_Last updated: 2026-07-04 (parity gap closed 07-02, dose-response + long-context
+re-certification 07-04 — see §3.6–3.9 and §4.1). Branch: `mac-mps-training`._
 
 LXP (Latent Exchange Protocol) is a machine-native communication layer for AI
 agents: instead of passing text between models, a **sender** model's continuous
@@ -163,27 +164,36 @@ Two largely independent tracks share this spine:
    sequential evals run flat.
 
 6. **RESOLVED 2026-07-02 — the production benchmark path now reproduces latent
-   continuation.** `generated_context_latent_handoff` scores **100% (8/8)**
-   row-identical with the trainer bridge eval, and at N=32 (all cached
-   validation rows, locked manifest `outputs/parity_fix/locked_continuation_32.json`):
-   **latent 65.6% (21/32) > text-hybrid 56.2% (18/32) > receiver-alone 21.9% (7/32)**,
-   latent uniquely solving 4 rows vs text's 1. Leak-free 128-row ridge adapter,
-   truncation 0.5, Qwen3.5-2B→2B. Artifacts: `outputs/parity_fix/`.
+   continuation.** `generated_context_latent_handoff` scores **100% (8/8)**,
+   matching the trainer bridge eval's 8/8 on the same sample indices (trainer
+   per-row records live in `outputs/latent_bridge_untrained/bridge_report.json`;
+   note the 8/8 run itself predates commit `fc473cf` — it ran from the then-dirty
+   working tree containing the same fixes). At N=32 (all cached validation rows,
+   locked manifest `outputs/parity_fix/locked_continuation_32.json`):
+   **latent 65.6% (21/32) > text-hybrid 56.2% (18/32) > receiver-alone 21.9% (7/32)**.
+   Latent > alone is significant (McNemar p≈0.0005); **latent > text is
+   directional only at this N** (4 latent-only wins vs 1 text-only, McNemar
+   p≈0.375). On the 27 copy-proof rows (answer literal absent from the truncated
+   sender text): latent 66.7% vs text 59.3% — no parroting confound. Leak-free
+   128-row ridge adapter, truncation 0.5, Qwen3.5-2B→2B. Artifacts:
+   `outputs/parity_fix/`.
 
-7. **Truncation dose-response supports genuine computation transfer
-   (2026-07-04, N=32 per point).** Same Qwen3.5-2B→2B protocol as §3.6, audited
-   path, per-fraction leak-free adapters:
+7. **Truncation dose-response — latent leads at both measured fractions
+   (2026-07-04, N=32 per point; directional, not yet significant).** Same
+   Qwen3.5-2B→2B protocol as §3.6, audited path, per-fraction leak-free adapters:
 
-   | truncation f | latent | text-hybrid | receiver-alone | latent lead |
-   |---|---|---|---|---|
-   | 0.25 | **75.0%** | 62.5% | 21.9% | +12.5 |
-   | 0.50 | **65.6%** | 56.2% | 21.9% | +9.4 |
+   | truncation f | latent | text-hybrid | receiver-alone | latent lead | McNemar (latent vs text) |
+   |---|---|---|---|---|---|
+   | 0.25 | **75.0%** | 62.5% | 21.9% | +12.5 | p≈0.219 |
+   | 0.50 | **65.6%** | 56.2% | 21.9% | +9.4 | p≈0.375 |
 
-   The latent channel beats text at both fractions, and its lead *grows* the
-   earlier the handoff — consistent with transferring computation state rather
-   than a static answer signal. (f=0.75 run repeatedly killed externally on
-   this machine; rerun with the same argv + `--sender-reasoning-truncation-fraction 0.75`
-   to complete the curve.) Reports: `outputs/parity_fix/continuation32_f25_*`.
+   The latent channel leads text at both fractions and the lead is larger at the
+   earlier handoff — but the slope is one row and neither per-point lead is
+   statistically significant at N=32; treat "computation-state transfer" as the
+   working hypothesis these points are consistent with, pending the N≥128 run.
+   (f=0.75 run repeatedly killed externally on this machine; rerun with the same
+   argv + `--sender-reasoning-truncation-fraction 0.75` to complete the curve.)
+   Reports: `outputs/parity_fix/continuation32_f25_*`.
 
 8. **Long-context regression check passed after the parity fixes (2026-07-04).**
    Full `long_context_mps` ladder re-run post fused-forward + `logits_to_keep`
@@ -284,9 +294,13 @@ dedicated `parity_harness.py` / `certify_latent_bridge.py` diagnostic scripts.
 ## 6. One-line status
 
 The latent-handoff **channel** and its cost/compression advantage are built and
-certified, and **mid-reasoning latent continuation now runs through the audited
-production benchmark** (latent 65.6% > text 56.2% > alone 21.9%, N=32, locked
-manifest). The biggest remaining items are (a) cross-family continuation
-(EXAONE→Qwen retest under the fixed layout), (b) scaling N beyond the 32 cached
-validation traces, and (c) the design-doc gates that were never run (long-horizon
-ODE study, MATH Level-5 head-to-head, GPU-scale profiles).
+re-certified post-fixes, **mid-reasoning latent continuation runs through the
+audited production benchmark** (latent 65.6% > text 56.2% > alone 21.9% at
+f=0.5; 75.0% > 62.5% > 21.9% at f=0.25; N=32, locked manifests), and
+**cross-family continuation works at N=8** (EXAONE→Qwen 87.5% > text 62.5%).
+The biggest remaining item is **statistical power**: latent > alone is
+significant, latent > text is directional (McNemar p≈0.2–0.4) — the N≥128
+locked-manifest run is the single experiment that cements or kills the headline
+claim. After that: the f=0.75 point, cross-family at N≥32, and the never-run
+design-doc gates (long-horizon ODE study, MATH Level-5 head-to-head, GPU-scale
+profiles).
