@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import weakref
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -45,6 +46,7 @@ from latent_pipeline import (
 )
 from src.data.loader import get_dataloader, pick_field
 from src.models.dynamics import _normalize_kv_cache
+from src.models.receiver_lora import receiver_lora_file_sha256, receiver_lora_scope
 from src.utils.alignment import (
     _device_resident,
     apply_alignment,
@@ -156,6 +158,7 @@ GENERATED_LATENT_METHODS = frozenset(
         "generated_context_latent_handoff",
     )
 )
+RECEIVER_LORA_SCOPES = frozenset(("latent_only", "all"))
 _SENDER_TRACE_STATE: Optional[dict[str, Any]] = None
 _SENDER_TRACE_STATE_KEY: Optional[tuple[Any, ...]] = None
 GSM8K_FINAL_ANSWER_REGEX = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
@@ -1175,6 +1178,90 @@ def _resolved_sample_indices(limit: int, sample_indices: Optional[Sequence[int]]
     return [int(index) for index in list(sample_indices)[: max(0, int(limit))]]
 
 
+def _receiver_lora_cfg(cfg: Any) -> Any:
+    return getattr(getattr(cfg, "handoff", None), "receiver_lora", None)
+
+
+def _receiver_lora_path(cfg: Any) -> Optional[str]:
+    value = getattr(_receiver_lora_cfg(cfg), "path", None)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value)
+
+
+def _receiver_lora_scope(cfg: Any) -> str:
+    value = str(getattr(_receiver_lora_cfg(cfg), "scope", "latent_only")).strip().lower()
+    scope = value or "latent_only"
+    if scope not in RECEIVER_LORA_SCOPES:
+        supported = ", ".join(sorted(RECEIVER_LORA_SCOPES))
+        raise ValueError(f"handoff.receiver_lora.scope must be one of: {supported}")
+    return scope
+
+
+def _receiver_lora_artifact_module_count(payload: Mapping[str, Any]) -> int:
+    explicit_count = payload.get("target_module_count", payload.get("module_count"))
+    if explicit_count is not None:
+        return int(explicit_count)
+    state = payload.get("state")
+    if isinstance(state, Mapping):
+        module_names = {
+            str(key).rsplit(".", 1)[0]
+            for key in state
+            if str(key).endswith((".A", ".B"))
+        }
+        return len(module_names)
+    raise ValueError("Receiver LoRA artifact does not expose target module count")
+
+
+def _receiver_lora_identity_manifest(cfg: Any) -> Optional[dict[str, Any]]:
+    lora_path = _receiver_lora_path(cfg)
+    if lora_path is None:
+        return None
+    payload = torch.load(Path(lora_path), map_location="cpu")
+    if not isinstance(payload, Mapping):
+        raise ValueError("Receiver LoRA artifact must be a dict")
+    if "rank" not in payload or "alpha" not in payload:
+        raise ValueError("Receiver LoRA artifact requires rank and alpha metadata")
+    return {
+        "path": lora_path,
+        "file_sha256": receiver_lora_file_sha256(lora_path),
+        "scope": _receiver_lora_scope(cfg),
+        "rank": int(payload["rank"]),
+        "alpha": float(payload["alpha"]),
+        "target_module_count": _receiver_lora_artifact_module_count(payload),
+    }
+
+
+def _receiver_lora_sha_for_row(cfg: Any, state: Mapping[str, Any]) -> Optional[str]:
+    lora_path = _receiver_lora_path(cfg)
+    if lora_path is None:
+        return None
+    cached_sha = state.get("receiver_lora_file_sha256")
+    if cached_sha:
+        return str(cached_sha)
+    return receiver_lora_file_sha256(lora_path)
+
+
+def _receiver_lora_sample_fields(
+    cfg: Any,
+    state: Mapping[str, Any],
+    *,
+    applied: bool,
+) -> dict[str, Any]:
+    if _receiver_lora_path(cfg) is None:
+        return {"receiver_lora_applied": False, "receiver_lora_sha": None}
+    return {
+        "receiver_lora_applied": bool(applied),
+        "receiver_lora_sha": _receiver_lora_sha_for_row(cfg, state),
+    }
+
+
+def _receiver_lora_scope_for_method(cfg: Any, agent_b: Any) -> Any:
+    if _receiver_lora_path(cfg) is not None and _receiver_lora_scope(cfg) == "latent_only":
+        return receiver_lora_scope(agent_b, True)
+    return nullcontext()
+
+
 def _build_generated_adapter_leakage_report(
     cfg: Any,
     *,
@@ -1291,6 +1378,7 @@ def _build_eval_manifest(
     device_map: Optional[str] = None,
     generated_trajectory_adapter_identity: Optional[Mapping[str, Any]] = None,
     handoff_identity: Optional[Mapping[str, Any]] = None,
+    receiver_lora_identity: Optional[Mapping[str, Any]] = None,
     sample_fingerprints: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     fingerprint_rows = [dict(row) for row in (sample_fingerprints or ())]
@@ -1325,6 +1413,8 @@ def _build_eval_manifest(
         "sample_fingerprints": fingerprint_rows,
         "sample_content_digest": _stable_json_digest(fingerprint_rows),
     }
+    if receiver_lora_identity is not None:
+        manifest["receiver_lora"] = dict(receiver_lora_identity)
     manifest["manifest_digest"] = _manifest_digest(manifest)
     return manifest
 
@@ -1370,6 +1460,16 @@ def _validate_eval_manifest_sample_lock(
     expected_fingerprints = locked_manifest.get("sample_fingerprints")
     if expected_fingerprints and resolved_manifest.get("sample_fingerprints") != expected_fingerprints:
         raise ValueError("Eval manifest sample fingerprints do not match resolved samples")
+    expected_lora = locked_manifest.get("receiver_lora")
+    resolved_lora = resolved_manifest.get("receiver_lora")
+    if isinstance(expected_lora, Mapping) and isinstance(resolved_lora, Mapping):
+        expected_sha = expected_lora.get("file_sha256")
+        resolved_sha = resolved_lora.get("file_sha256")
+        if expected_sha and resolved_sha and expected_sha != resolved_sha:
+            raise ValueError(
+                "Receiver LoRA file_sha256 mismatch: "
+                f"manifest={expected_sha}, resolved={resolved_sha}"
+            )
 
 
 def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str, Any]) -> None:
@@ -1500,6 +1600,21 @@ def _apply_eval_manifest_to_args(args: argparse.Namespace, manifest: Mapping[str
                 args.embedding_manifold_top_k = int(embedding_manifold["top_k"])
             if embedding_manifold.get("blend") is not None:
                 args.embedding_manifold_blend = float(embedding_manifold["blend"])
+    receiver_lora = manifest.get("receiver_lora")
+    if isinstance(receiver_lora, Mapping):
+        manifest_sha = str(receiver_lora.get("file_sha256") or "")
+        cli_lora_path = getattr(args, "receiver_lora_path", None)
+        if cli_lora_path is not None:
+            cli_sha = receiver_lora_file_sha256(cli_lora_path)
+            if manifest_sha and cli_sha != manifest_sha:
+                raise ValueError(
+                    "Receiver LoRA file_sha256 mismatch: "
+                    f"manifest={manifest_sha}, cli={cli_sha}"
+                )
+        else:
+            args.receiver_lora_path = Path(str(receiver_lora["path"]))
+        if getattr(args, "receiver_lora_scope", None) is None:
+            args.receiver_lora_scope = str(receiver_lora.get("scope", "latent_only"))
     smoke_profile = manifest.get("smoke_profile") or {}
     args.semantic_smoke = bool(smoke_profile.get("semantic_smoke", False))
     args.mvp_smoke = bool(smoke_profile.get("mvp_smoke", False))
@@ -4821,6 +4936,11 @@ def _run_generated_latent_variant(
     tokenizer_b = variant_state["tokenizer_b"]
     agent_b = variant_state["agent_b"]
     agent_b_device = next(agent_b.parameters()).device
+    receiver_lora_inactive_fields = _receiver_lora_sample_fields(
+        variant_cfg,
+        variant_state,
+        applied=False,
+    )
     # Long-context prompts are unique per sample, so retaining each device-resident
     # sender state in the shared consensus cache is pure accumulation (the disk trace
     # cache already covers cross-method reuse).
@@ -4858,6 +4978,7 @@ def _run_generated_latent_variant(
             "answer_token_count": 0,
             "answer_nll": None,
             "answer_perplexity": None,
+            **receiver_lora_inactive_fields,
             "alignment_mode": method_alignment_mode,
             "alignment_strategy": "hybrid_affine",
             "handoff_status": "generated_trajectory_adapter_missing",
@@ -5090,6 +5211,7 @@ def _run_generated_latent_variant(
             "answer_token_count": 0,
             "answer_nll": None,
             "answer_perplexity": None,
+            **receiver_lora_inactive_fields,
             **_alignment_distances(
                 prompt=prompt,
                 state=variant_state,
@@ -5238,6 +5360,7 @@ def _run_generated_latent_variant(
             "answer_token_count": 0,
             "answer_nll": None,
             "answer_perplexity": None,
+            **receiver_lora_inactive_fields,
             **_alignment_distances(
                 prompt=prompt,
                 state=variant_state,
@@ -5375,21 +5498,27 @@ def _run_generated_latent_variant(
         variant_cfg,
         variant_state,
     )
-    decode_metrics = _decode_handoff(
-        agent_b=agent_b,
-        tokenizer_b=tokenizer_b,
-        prompt=prompt if use_receiver_context else None,
-        cfg=variant_cfg,
-        handoff_step=handoff_step,
-        kv_cache_a=None,
-        max_new_tokens=int(cfg.max_new_tokens),
-        target_answer_text=target_answer_text,
-        append_answer_suffix_without_context=not use_receiver_context,
-        answer_suffix_text=_latent_answer_suffix(variant_cfg),
-    )
+    with _receiver_lora_scope_for_method(variant_cfg, agent_b):
+        decode_metrics = _decode_handoff(
+            agent_b=agent_b,
+            tokenizer_b=tokenizer_b,
+            prompt=prompt if use_receiver_context else None,
+            cfg=variant_cfg,
+            handoff_step=handoff_step,
+            kv_cache_a=None,
+            max_new_tokens=int(cfg.max_new_tokens),
+            target_answer_text=target_answer_text,
+            append_answer_suffix_without_context=not use_receiver_context,
+            answer_suffix_text=_latent_answer_suffix(variant_cfg),
+        )
     latent_trajectory_steps = int(handoff_source.shape[1])
     return {
         **decode_metrics,
+        **_receiver_lora_sample_fields(
+            variant_cfg,
+            variant_state,
+            applied=_receiver_lora_path(variant_cfg) is not None,
+        ),
         **_alignment_distances(
             prompt=prompt,
             state=variant_state,
@@ -5915,6 +6044,8 @@ def _configured_base_cfg(
     generated_trajectory_adapter_strategy: Optional[str] = None,
     sender_reasoning_truncation_fraction: Optional[float] = None,
     latent_answer_suffix: Optional[str] = None,
+    receiver_lora_path: Optional[Path] = None,
+    receiver_lora_scope: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -6004,6 +6135,15 @@ def _configured_base_cfg(
         )
     if latent_answer_suffix is not None:
         base_cfg.handoff.receiver_context.latent_answer_suffix = str(latent_answer_suffix)
+    if getattr(base_cfg.handoff, "receiver_lora", None) is None:
+        base_cfg.handoff.receiver_lora = OmegaConf.create(
+            {"path": None, "scope": "latent_only"}
+        )
+    if receiver_lora_path is not None:
+        base_cfg.handoff.receiver_lora.path = str(receiver_lora_path)
+    if receiver_lora_scope is not None:
+        base_cfg.handoff.receiver_lora.scope = str(receiver_lora_scope)
+    _receiver_lora_scope(base_cfg)
     if generated_trajectory_adapter_target_alignment is not None:
         base_cfg.handoff.generated_trajectory_adapter.target_alignment = str(
             generated_trajectory_adapter_target_alignment
@@ -6188,6 +6328,8 @@ def run_benchmark(
     generated_trajectory_adapter_strategy: Optional[str] = None,
     sender_reasoning_truncation_fraction: Optional[float] = None,
     latent_answer_suffix: Optional[str] = None,
+    receiver_lora_path: Optional[Path] = None,
+    receiver_lora_scope: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -6241,6 +6383,8 @@ def run_benchmark(
         generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
         sender_reasoning_truncation_fraction=sender_reasoning_truncation_fraction,
         latent_answer_suffix=latent_answer_suffix,
+        receiver_lora_path=receiver_lora_path,
+        receiver_lora_scope=receiver_lora_scope,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -6355,6 +6499,7 @@ def run_benchmark(
             else None
         ),
         handoff_identity=_handoff_identity_manifest(suite_cfg),
+        receiver_lora_identity=_receiver_lora_identity_manifest(suite_cfg),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -6507,6 +6652,16 @@ def run_benchmark(
                         if method_name in TEXT_BASELINE_METHODS
                         else _receiver_context_latent_position(row_cfg),
                     )
+                    receiver_lora_path = _receiver_lora_path(row_cfg)
+                    receiver_lora_sha = (
+                        None
+                        if receiver_lora_path is None
+                        else _receiver_lora_sha_for_row(row_cfg, row_state)
+                    )
+                    receiver_lora_default_applied = bool(
+                        receiver_lora_path is not None
+                        and _receiver_lora_scope(row_cfg) == "all"
+                    )
                     sample_rows.append(
                         {
                             **row_base,
@@ -6579,6 +6734,14 @@ def run_benchmark(
                             "alignment_bias_norm": row_result.get("alignment_bias_norm"),
                             "prompt_calibration_enabled": row_result.get("prompt_calibration_enabled"),
                             "prompt_calibration_bias_norm": row_result.get("prompt_calibration_bias_norm"),
+                            "receiver_lora_applied": row_result.get(
+                                "receiver_lora_applied",
+                                receiver_lora_default_applied,
+                            ),
+                            "receiver_lora_sha": row_result.get(
+                                "receiver_lora_sha",
+                                receiver_lora_sha,
+                            ),
                             "handoff_adapter_enabled": row_result.get("handoff_adapter_enabled"),
                             "handoff_adapter_status": row_result.get("handoff_adapter_status"),
                             "handoff_adapter_applied": row_result.get("handoff_adapter_applied"),
@@ -7130,6 +7293,8 @@ def prepare_generated_trajectory_adapter_cache(
     generated_trajectory_adapter_strategy: Optional[str] = None,
     sender_reasoning_truncation_fraction: Optional[float] = None,
     latent_answer_suffix: Optional[str] = None,
+    receiver_lora_path: Optional[Path] = None,
+    receiver_lora_scope: Optional[str] = None,
     generated_trajectory_adapter_target_alignment: Optional[str] = None,
     generated_trajectory_adapter_source_mode: Optional[str] = None,
     generated_trajectory_adapter_source_tail_tokens: Optional[int] = None,
@@ -7178,6 +7343,8 @@ def prepare_generated_trajectory_adapter_cache(
         generated_trajectory_adapter_strategy=generated_trajectory_adapter_strategy,
         sender_reasoning_truncation_fraction=sender_reasoning_truncation_fraction,
         latent_answer_suffix=latent_answer_suffix,
+        receiver_lora_path=receiver_lora_path,
+        receiver_lora_scope=receiver_lora_scope,
         generated_trajectory_adapter_target_alignment=generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=generated_trajectory_adapter_source_tail_tokens,
@@ -7278,6 +7445,7 @@ def prepare_generated_trajectory_adapter_cache(
             else None
         ),
         handoff_identity=_handoff_identity_manifest(suite_cfg),
+        receiver_lora_identity=_receiver_lora_identity_manifest(suite_cfg),
         sample_fingerprints=sample_fingerprint_rows,
     )
     _validate_eval_manifest_sample_lock(eval_manifest, locked_eval_manifest)
@@ -7692,6 +7860,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--receiver-lora-path",
+        type=Path,
+        default=None,
+        help="Optional receiver LoRA artifact path for Agent B.",
+    )
+    parser.add_argument(
+        "--receiver-lora-scope",
+        choices=tuple(sorted(RECEIVER_LORA_SCOPES)),
+        default=None,
+        help="Receiver LoRA activation scope (default: latent_only).",
+    )
+    parser.add_argument(
         "--generated-trajectory-adapter-source-mode",
         choices=("generated_text", "final_answer_tail", "final_answer_tail_anchored"),
         default=None,
@@ -8018,6 +8198,8 @@ def main() -> None:
             generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
             sender_reasoning_truncation_fraction=args.sender_reasoning_truncation_fraction,
             latent_answer_suffix=args.latent_answer_suffix,
+            receiver_lora_path=args.receiver_lora_path,
+            receiver_lora_scope=args.receiver_lora_scope,
             generated_trajectory_adapter_target_alignment=(
                 args.generated_trajectory_adapter_target_alignment
             ),
@@ -8178,6 +8360,8 @@ def main() -> None:
         generated_trajectory_adapter_strategy=args.generated_trajectory_adapter_strategy,
         sender_reasoning_truncation_fraction=args.sender_reasoning_truncation_fraction,
         latent_answer_suffix=args.latent_answer_suffix,
+        receiver_lora_path=args.receiver_lora_path,
+        receiver_lora_scope=args.receiver_lora_scope,
         generated_trajectory_adapter_target_alignment=args.generated_trajectory_adapter_target_alignment,
         generated_trajectory_adapter_source_mode=args.generated_trajectory_adapter_source_mode,
         generated_trajectory_adapter_source_tail_tokens=(

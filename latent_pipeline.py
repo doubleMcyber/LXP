@@ -69,7 +69,7 @@ _DTYPE_MAP = {
 }
 
 _PIPELINE_STATE: Optional[dict[str, Any]] = None
-_PIPELINE_STATE_KEY: Optional[tuple[str, str, str, str]] = None
+_PIPELINE_STATE_KEY: Optional[tuple[str, ...]] = None
 _GLOBAL_ALIGNMENT_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HANDOFF_ADAPTER_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _PREFERRED_REASONING_LAYERS: tuple[int, ...] = (12, 16, 20)
@@ -84,6 +84,7 @@ _SUPPORTED_RECEIVER_CONTEXT_MODES: frozenset[str] = frozenset({"none", "auto", "
 _SUPPORTED_RECEIVER_CONTEXT_LATENT_POSITIONS: frozenset[str] = frozenset(
     {"after_context", "before_context"}
 )
+_SUPPORTED_RECEIVER_LORA_SCOPES: frozenset[str] = frozenset({"latent_only", "all"})
 _FINAL_ANSWER_COMPLETE_REGEX = re.compile(
     r"final\s+answer\s*[:=]\s*(?:[$*`_\s]+)?-?\d[\d,]*(?:\.\d+)?(?:[$*`_\s]+|[^\d,.]|\.(?!\d))",
     re.IGNORECASE,
@@ -214,12 +215,35 @@ def _build_integration_time_space(
     return torch.linspace(0.0, 1.0, point_count, device=device, dtype=dtype)
 
 
-def _pipeline_state_key(cfg: DictConfig) -> tuple[str, str, str, str]:
+def _receiver_lora_cfg(cfg: Optional[DictConfig]) -> Any:
+    return getattr(_handoff_cfg(cfg), "receiver_lora", None)
+
+
+def _receiver_lora_path(cfg: Optional[DictConfig]) -> Optional[str]:
+    value = getattr(_receiver_lora_cfg(cfg), "path", None)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value)
+
+
+def _receiver_lora_scope(cfg: Optional[DictConfig]) -> str:
+    value = str(getattr(_receiver_lora_cfg(cfg), "scope", "latent_only")).strip().lower()
+    scope = value or "latent_only"
+    if scope not in _SUPPORTED_RECEIVER_LORA_SCOPES:
+        supported = ", ".join(sorted(_SUPPORTED_RECEIVER_LORA_SCOPES))
+        raise ValueError(f"handoff.receiver_lora.scope must be one of: {supported}")
+    return scope
+
+
+def _pipeline_state_key(cfg: DictConfig) -> tuple[str, ...]:
+    lora_path = _receiver_lora_path(cfg)
     return (
         str(cfg.agent_a_model),
         str(cfg.agent_b_model),
         str(cfg.torch_dtype),
         str(cfg.device_map),
+        str(lora_path or ""),
+        _receiver_lora_scope(cfg),
     )
 
 
@@ -1718,12 +1742,53 @@ def _get_pipeline_state(cfg: DictConfig) -> dict[str, Any]:
             torch_dtype=cfg.torch_dtype,
             device_map=cfg.device_map,
         )
+        lora_path = _receiver_lora_path(cfg)
+        lora_scope = _receiver_lora_scope(cfg)
+        receiver_lora_metadata: dict[str, Any] = {
+            "path": lora_path,
+            "scope": lora_scope,
+            "file_sha256": None,
+            "rank": None,
+            "alpha": None,
+            "target_module_count": 0,
+        }
+        if lora_path:
+            from src.models.receiver_lora import (
+                load_receiver_lora,
+                receiver_lora_file_sha256,
+                set_receiver_lora_enabled,
+            )
+
+            meta = load_receiver_lora(agent_b, lora_path)
+            target_module_count = set_receiver_lora_enabled(agent_b, lora_scope == "all")
+            file_sha256 = receiver_lora_file_sha256(lora_path)
+            receiver_lora_metadata.update(
+                {
+                    "file_sha256": file_sha256,
+                    "rank": meta.get("rank"),
+                    "alpha": meta.get("alpha"),
+                    "target_module_count": target_module_count,
+                }
+            )
+            print(
+                "Receiver LoRA loaded: "
+                f"{lora_path} sha={file_sha256[:12]} modules={target_module_count}",
+                flush=True,
+            )
         attach_latent_forward(agent_a)
         _PIPELINE_STATE = {
             "tokenizer_a": tokenizer_a,
             "tokenizer_b": tokenizer_b,
             "agent_a": agent_a,
             "agent_b": agent_b,
+            "receiver_lora_path": receiver_lora_metadata["path"],
+            "receiver_lora_scope": receiver_lora_metadata["scope"],
+            "receiver_lora_file_sha256": receiver_lora_metadata["file_sha256"],
+            "receiver_lora_rank": receiver_lora_metadata["rank"],
+            "receiver_lora_alpha": receiver_lora_metadata["alpha"],
+            "receiver_lora_target_module_count": receiver_lora_metadata[
+                "target_module_count"
+            ],
         }
         _PIPELINE_STATE_KEY = state_key
 
