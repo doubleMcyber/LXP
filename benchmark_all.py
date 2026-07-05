@@ -606,7 +606,11 @@ def _final_answer_marker_tail(text: str) -> str:
     if not marker_matches:
         return ""
     latest_match = sorted(marker_matches, key=lambda item: item.start())[-1]
-    return str(text)[latest_match.end() :].splitlines()[0].strip()
+    # a trace can end exactly at the marker, leaving an empty remainder
+    remainder_lines = str(text)[latest_match.end() :].splitlines()
+    if not remainder_lines:
+        return ""
+    return remainder_lines[0].strip()
 
 
 def _final_answer_tail_needs_scalar_verification(text: str) -> bool:
