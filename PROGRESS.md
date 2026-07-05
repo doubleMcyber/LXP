@@ -238,6 +238,26 @@ Two largely independent tracks share this spine:
    sender cache-miss generation and is not comparable — rerun warm for the
    economics number. Report: `outputs/paths/drafter_finisher32_report.json`.
 
+10. **Receiver-LoRA latent consumption: stable training proven, no certified
+   gain yet (2026-07-05).** The full pipeline (spec
+   `docs/latent_lora_training_spec.md`) ran end to end: live zero-init
+   identity check passed (8/8 decodes bit-identical through the production
+   path), 150 verified rollouts prepared, and the sender-NLL canary — the
+   objective that destroyed Phase-0 bridge training — trained *stably* on
+   receiver-side LoRA (+16.7 pts on the 30-row dev gate), confirming the
+   design's core mechanism (frozen channel, consumption-side adaptation).
+   But on the locked N=128 manifest the canary checkpoint gives **90/128
+   (70.3%) vs baseline 88/128 (68.8%)** — not significant (8-6 discordants,
+   p=0.79); the dev lift was small-N overfit. Non-degradation held exactly
+   (text/alone rows bit-identical; LoRA applied on all 128 latent rows).
+   Cross-family stretch: same-family-trained LoRA does NOT transfer
+   (53.1% vs 59.4%, n.s.) — pair-specific training needed, as
+   pre-registered. Objective A (on-policy rollout NLL) corrupts weights
+   with non-finite gradients within ~5 optimizer steps — twice, surviving a
+   loss-level guard — and its kill gates caught it both times; root cause
+   still open (suspected bf16 backward overflow specific to rollout
+   targets). Artifacts: `outputs/receiver_lora/`.
+
 9. **Cross-family latent continuation carries computation; parity with text,
    not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
    truncation 0.5, audited path, locked manifest
