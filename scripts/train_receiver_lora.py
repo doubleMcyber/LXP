@@ -14,6 +14,7 @@ import math
 import random
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Optional
 
@@ -369,6 +370,24 @@ def validate_target_weights(
 def finite_loss_value(loss: torch.Tensor) -> Optional[float]:
     value = float(loss.detach().float().cpu().item())
     return value if math.isfinite(value) else None
+
+
+def nonfinite_grad_names(
+    named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+) -> list[str]:
+    """Names of parameters whose accumulated .grad contains non-finite values.
+
+    Parameters without a gradient are skipped. This is the gradient-level
+    analog of the non-finite-loss guard: on MPS a backward pass can produce
+    inf/nan gradients while the loss itself stays finite, and
+    clip_grad_norm_ would then silently scale every gradient by nan.
+    """
+    names: list[str] = []
+    for name, parameter in named_parameters:
+        grad = parameter.grad
+        if grad is not None and not bool(torch.isfinite(grad).all()):
+            names.append(str(name))
+    return names
 
 
 def _skip_reason_key(reason: Optional[str]) -> str:
@@ -1297,9 +1316,12 @@ def _save_best_lora(
     torch.save(payload, path)
 
 
-def _empty_mps_cache_if_needed(device: torch.device) -> None:
-    if device.type == "mps" and hasattr(torch, "mps"):
-        torch.mps.empty_cache()
+# NOTE: do NOT call torch.mps.empty_cache() anywhere between training backward
+# passes. On MPS (torch 2.10, bf16 Qwen3.5 GatedDeltaNet backward) emptying the
+# cache deterministically poisons the gradients of the next accumulation window
+# while every loss stays finite; clip_grad_norm_ then scales all LoRA params to
+# nan in one optimizer step. torch.mps.synchronize() first does not help.
+# Reproduced/bisected 2026-07-05 (objective A, corruption at sample_step 32).
 
 
 def train(args: argparse.Namespace) -> None:
@@ -1364,6 +1386,11 @@ def train(args: argparse.Namespace) -> None:
         parameter
         for module in lora_modules.values()
         for parameter in (module.A, module.B)
+    ]
+    lora_named_params = [
+        (f"{name}.{suffix}", parameter)
+        for name, module in lora_modules.items()
+        for suffix, parameter in (("A", module.A), ("B", module.B))
     ]
     for parameter in lora_params:
         parameter.requires_grad_(True)
@@ -1616,7 +1643,6 @@ def train(args: argparse.Namespace) -> None:
             epoch_end_no_improve=epoch_end_no_improve,
             args=args,
         )
-        _empty_mps_cache_if_needed(device)
 
     print(
         f"Training receiver LoRA objective={args.objective}: "
@@ -1627,6 +1653,36 @@ def train(args: argparse.Namespace) -> None:
     stopped = False
     stop_status = "COMPLETED"
     nonfinite_loss_skips = 0
+    nonfinite_grad_skips = 0
+
+    def apply_optimizer_step(*, epoch: int, position: int) -> bool:
+        """Clip + step + schedule, unless the accumulated grads are non-finite.
+
+        Returns True when an optimizer step was taken. On non-finite grads the
+        whole accumulation window is zeroed and skipped: clip_grad_norm_ would
+        otherwise compute a nan total norm and scale every LoRA gradient (and
+        so every parameter and Adam moment) to nan in a single step.
+        """
+        nonlocal optimizer_step, nonfinite_grad_skips
+        bad_names = nonfinite_grad_names(lora_named_params)
+        if bad_names:
+            nonfinite_grad_skips += 1
+            optimizer.zero_grad(set_to_none=True)
+            print(
+                "skipping optimizer step with non-finite grads: "
+                f"epoch={epoch} position={position} "
+                f"tensors={len(bad_names)} first={bad_names[0]} "
+                f"skip_count={nonfinite_grad_skips}",
+                flush=True,
+            )
+            return False
+        torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        optimizer_step += 1
+        return True
+
     set_lora_train_mode()
     for epoch in range(start_epoch, max_epochs):
         order = list(range(len(train_samples)))
@@ -1668,13 +1724,9 @@ def train(args: argparse.Namespace) -> None:
             running_loss += loss_value
             should_step = accumulation_count >= max(1, int(args.grad_accum))
             if should_step:
-                torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                optimizer_step += 1
+                stepped = apply_optimizer_step(epoch=epoch, position=position)
                 accumulation_count = 0
-                if optimizer_step % 10 == 0:
+                if stepped and optimizer_step % 10 == 0:
                     latest = run_gate(
                         f"step_{optimizer_step}",
                         epoch=epoch,
@@ -1687,7 +1739,7 @@ def train(args: argparse.Namespace) -> None:
                         stopped = True
                         stop_status = "FAILED"
                         break
-                if optimizer_step % 5 == 0:
+                if stepped and optimizer_step % 5 == 0:
                     print(
                         f"epoch {epoch} optimizer_step {optimizer_step} "
                         f"sample_step {sample_step} "
@@ -1709,16 +1761,12 @@ def train(args: argparse.Namespace) -> None:
                     epoch_end_no_improve=epoch_end_no_improve,
                     args=args,
                 )
-                _empty_mps_cache_if_needed(device)
             if stopped:
                 break
         if not stopped and accumulation_count:
-            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            optimizer_step += 1
-            if optimizer_step % 10 == 0:
+            stepped = apply_optimizer_step(epoch=epoch, position=next_position - 1)
+            accumulation_count = 0
+            if stepped and optimizer_step % 10 == 0:
                 latest = run_gate(
                     f"step_{optimizer_step}",
                     epoch=epoch,
@@ -1780,7 +1828,6 @@ def train(args: argparse.Namespace) -> None:
             epoch_end_no_improve=epoch_end_no_improve,
             args=args,
         )
-        _empty_mps_cache_if_needed(device)
         start_position = 0
         if stopped:
             break
@@ -1791,11 +1838,13 @@ def train(args: argparse.Namespace) -> None:
     latest["best_dev_correct"] = best_dev_correct
     latest["best_dev_step"] = best_dev_step
     latest["nonfinite_loss_skips"] = nonfinite_loss_skips
+    latest["nonfinite_grad_skips"] = nonfinite_grad_skips
     write_lora_report(report_path, history, latest)
     print(
         f"DONE receiver LoRA status={stop_status} "
         f"best_dev_correct={best_dev_correct} "
-        f"nonfinite_loss_skips={nonfinite_loss_skips} report={report_path}",
+        f"nonfinite_loss_skips={nonfinite_loss_skips} "
+        f"nonfinite_grad_skips={nonfinite_grad_skips} report={report_path}",
         flush=True,
     )
 

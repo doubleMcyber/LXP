@@ -16,6 +16,7 @@ from train_receiver_lora import (  # noqa: E402
     evaluate_kill_rules,
     finite_loss_value,
     load_lora_checkpoint,
+    nonfinite_grad_names,
     save_lora_checkpoint,
     validate_target_token_ids,
     validate_target_weights,
@@ -264,3 +265,31 @@ def test_non_finite_loss_value_drives_skip_counter() -> None:
 
     assert skipped == 1
     assert finite_loss_value(torch.tensor(1.25)) == pytest.approx(1.25)
+
+
+def test_nonfinite_grad_names_flags_nan_and_inf_grads_only() -> None:
+    nan_param = nn.Parameter(torch.zeros(2, 2))
+    nan_param.grad = torch.tensor([[0.0, float("nan")], [0.0, 0.0]])
+    inf_param = nn.Parameter(torch.zeros(3))
+    inf_param.grad = torch.tensor([0.0, float("inf"), 1.0])
+    finite_param = nn.Parameter(torch.zeros(3))
+    finite_param.grad = torch.tensor([1.0, -2.0, 0.5])
+    gradless_param = nn.Parameter(torch.zeros(3))
+
+    names = nonfinite_grad_names(
+        [
+            ("layer.0.A", nan_param),
+            ("layer.0.B", inf_param),
+            ("layer.1.A", finite_param),
+            ("layer.1.B", gradless_param),
+        ]
+    )
+
+    assert names == ["layer.0.A", "layer.0.B"]
+
+
+def test_nonfinite_grad_names_all_finite_returns_empty() -> None:
+    parameter = nn.Parameter(torch.zeros(4))
+    parameter.grad = torch.ones(4)
+
+    assert nonfinite_grad_names([("only.A", parameter)]) == []
