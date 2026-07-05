@@ -252,11 +252,20 @@ Two largely independent tracks share this spine:
    (text/alone rows bit-identical; LoRA applied on all 128 latent rows).
    Cross-family stretch: same-family-trained LoRA does NOT transfer
    (53.1% vs 59.4%, n.s.) — pair-specific training needed, as
-   pre-registered. Objective A (on-policy rollout NLL) corrupts weights
-   with non-finite gradients within ~5 optimizer steps — twice, surviving a
-   loss-level guard — and its kill gates caught it both times; root cause
-   still open (suspected bf16 backward overflow specific to rollout
-   targets). Artifacts: `outputs/receiver_lora/`.
+   pre-registered. Objective A's NaN was root-caused by bisection:
+   **`torch.mps.empty_cache()` between gradient-accumulation backwards
+   deterministically poisons the next window's gradients to all-nan under a
+   finite loss** (torch 2.10 MPS + bf16; `synchronize()` does not help) —
+   fixed by removing the trigger and adding a gradient-finiteness gate
+   (commit `df2d18a`; the same hazard pattern exists unreviewed in
+   `train_latent_bridge.py:512`). With the fix, objective A trains NaN-free
+   (zero skips) but peaks at +2 dev rows and regresses; the gates correctly
+   failed it, leaving the canary as best checkpoint. **Final path-2 verdict:
+   the training-stability problem is solved; the capacity/data problem
+   remains** — rank-16 LoRA on ~150 rollouts does not move the locked N=128
+   result (70.3% vs 68.8%, n.s.). Named next-cycle levers: iterated STaR
+   rounds, more rollout data, MLP-target LoRA, pair-specific cross-family
+   training. Artifacts: `outputs/receiver_lora/`.
 
 9. **Cross-family latent continuation carries computation; parity with text,
    not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
