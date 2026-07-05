@@ -14,8 +14,11 @@ from train_receiver_lora import (  # noqa: E402
     build_cosine_with_warmup_scheduler,
     cosine_with_warmup_lr,
     evaluate_kill_rules,
+    finite_loss_value,
     load_lora_checkpoint,
     save_lora_checkpoint,
+    validate_target_token_ids,
+    validate_target_weights,
 )
 
 
@@ -223,3 +226,41 @@ def test_objective_b_weight_vector_starts_at_final_answer_line() -> None:
 
     assert weights[:expected_start] == [1.0] * expected_start
     assert weights[expected_start:] == [4.0] * (len(text) - expected_start)
+
+
+def test_target_token_validation_rejects_empty_continuation() -> None:
+    target_ids, reason = validate_target_token_ids(
+        [],
+        max_continuation_tokens=256,
+        target_vocab_size=151_000,
+    )
+
+    assert target_ids is None
+    assert reason == "empty_target"
+
+
+def test_target_token_validation_rejects_out_of_vocab_token() -> None:
+    target_ids, reason = validate_target_token_ids(
+        [42, 159_029],
+        max_continuation_tokens=256,
+        target_vocab_size=151_000,
+    )
+
+    assert target_ids is None
+    assert reason == "token_out_of_vocab:1:159029>=151000"
+
+
+def test_target_weight_validation_rejects_zero_weight_sum() -> None:
+    weights, reason = validate_target_weights([0.0, 0.0], target_len=2)
+
+    assert weights is None
+    assert reason == "non_positive_weight_sum"
+
+
+def test_non_finite_loss_value_drives_skip_counter() -> None:
+    skipped = 0
+    if finite_loss_value(torch.tensor(float("nan"))) is None:
+        skipped += 1
+
+    assert skipped == 1
+    assert finite_loss_value(torch.tensor(1.25)) == pytest.approx(1.25)

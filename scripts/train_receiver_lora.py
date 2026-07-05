@@ -313,6 +313,85 @@ def build_answer_weight_vector(
     return weights
 
 
+def validate_target_token_ids(
+    token_ids: Any,
+    *,
+    max_continuation_tokens: int,
+    target_vocab_size: Optional[int] = None,
+) -> tuple[Optional[list[int]], Optional[str]]:
+    if not isinstance(token_ids, (list, tuple)):
+        return None, "token_ids_not_sequence"
+    if not token_ids:
+        return None, "empty_target"
+    max_tokens = int(max_continuation_tokens)
+    if max_tokens <= 0:
+        return None, "empty_after_truncation"
+    if target_vocab_size is not None and int(target_vocab_size) <= 0:
+        raise ValueError("target_vocab_size must be positive when provided")
+    target_ids: list[int] = []
+    for index, token_id in enumerate(token_ids[:max_tokens]):
+        if not isinstance(token_id, int) or isinstance(token_id, bool):
+            return None, f"non_int_token:{index}:{type(token_id).__name__}"
+        token_int = int(token_id)
+        if token_int < 0:
+            return None, f"negative_token:{index}:{token_int}"
+        if target_vocab_size is not None and token_int >= int(target_vocab_size):
+            return None, f"token_out_of_vocab:{index}:{token_int}>={int(target_vocab_size)}"
+        target_ids.append(token_int)
+    if not target_ids:
+        return None, "empty_after_truncation"
+    return target_ids, None
+
+
+def validate_target_weights(
+    weights: Any,
+    *,
+    target_len: int,
+) -> tuple[Optional[list[float]], Optional[str]]:
+    if not isinstance(weights, (list, tuple)):
+        return None, "target_weights_not_sequence"
+    if len(weights) != int(target_len):
+        return None, "target_weights_length_mismatch"
+    weight_values: list[float] = []
+    for index, weight in enumerate(weights):
+        try:
+            weight_value = float(weight)
+        except (TypeError, ValueError):
+            return None, f"non_float_weight:{index}:{type(weight).__name__}"
+        if not math.isfinite(weight_value):
+            return None, f"non_finite_weight:{index}:{weight_value}"
+        weight_values.append(weight_value)
+    if sum(weight_values) <= 0.0:
+        return None, "non_positive_weight_sum"
+    return weight_values, None
+
+
+def finite_loss_value(loss: torch.Tensor) -> Optional[float]:
+    value = float(loss.detach().float().cpu().item())
+    return value if math.isfinite(value) else None
+
+
+def _skip_reason_key(reason: Optional[str]) -> str:
+    if not reason:
+        return "unknown"
+    return str(reason).split(":", 1)[0]
+
+
+def _record_sample_skip(
+    skipped: list[int],
+    skip_counts: dict[str, int],
+    sample: dict[str, Any],
+    reason: Optional[str],
+) -> None:
+    skipped.append(int(sample["sample_index"]))
+    key = _skip_reason_key(reason)
+    skip_counts[key] = skip_counts.get(key, 0) + 1
+
+
+def _format_skip_counts(skip_counts: dict[str, int]) -> str:
+    return ", ".join(f"{key}={skip_counts[key]}" for key in sorted(skip_counts))
+
+
 def cosine_with_warmup_lr(
     step: int,
     *,
@@ -766,7 +845,8 @@ def prepare_rollouts(
     cache_root = Path(cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
     config_digest = _current_rollout_config_digest(args)
-    stats = {"accepted": 0, "skipped": 0, "failed": 0, "written": 0}
+    target_vocab_size = int(receiver.get_input_embeddings().weight.shape[0])
+    stats = {"accepted": 0, "skipped": 0, "failed": 0, "written": 0, "invalid": 0}
 
     for sample in samples:
         path = rollout_cache_path(str(sample["question"]), cache_dir=cache_root)
@@ -821,6 +901,19 @@ def prepare_rollouts(
                 if verified:
                     break
 
+        validated_token_ids, token_error = validate_target_token_ids(
+            token_ids,
+            max_continuation_tokens=int(args.max_new_tokens),
+            target_vocab_size=target_vocab_size,
+        )
+        if validated_token_ids is None:
+            stats["invalid"] += 1
+            verified = False
+            token_ids = []
+            decoded_text = f"{decoded_text}\n\n[invalid_rollout_target: {token_error}]"
+        else:
+            token_ids = validated_token_ids
+
         payload = {
             "prompt_sha": prompt_sha(str(sample["question"])),
             "sample_index": int(sample["sample_index"]),
@@ -857,23 +950,27 @@ def _load_cached_rollout_target(
     sample: dict[str, Any],
     *,
     config_digest: str,
+    max_continuation_tokens: int,
+    target_vocab_size: Optional[int] = None,
     cache_dir: str | Path = DEFAULT_ROLLOUT_CACHE_DIR,
-) -> Optional[list[int]]:
+) -> tuple[Optional[list[int]], Optional[str]]:
     path = rollout_cache_path(str(sample["question"]), cache_dir=cache_dir)
     if not path.exists():
-        return None
+        return None, "missing_rollout"
     try:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:  # noqa: BLE001
-        return None
+        return None, "load_error"
     if not isinstance(payload, dict):
-        return None
+        return None, "payload_not_dict"
     if payload.get("config_digest") != config_digest or not bool(payload.get("verified")):
-        return None
+        return None, "stale_or_unverified_rollout"
     token_ids = payload.get("token_ids")
-    if not isinstance(token_ids, list) or not token_ids:
-        return None
-    return [int(token_id) for token_id in token_ids]
+    return validate_target_token_ids(
+        token_ids,
+        max_continuation_tokens=max_continuation_tokens,
+        target_vocab_size=target_vocab_size,
+    )
 
 
 def prepare_objective_samples(
@@ -882,23 +979,33 @@ def prepare_objective_samples(
     args: argparse.Namespace,
     tokenizer: Any,
     require_targets: bool,
-) -> tuple[list[dict[str, Any]], list[int]]:
+    target_vocab_size: Optional[int] = None,
+) -> tuple[list[dict[str, Any]], list[int], dict[str, int]]:
     prepared: list[dict[str, Any]] = []
     skipped: list[int] = []
+    skip_counts: dict[str, int] = {}
     config_digest = _current_rollout_config_digest(args)
     for sample in samples:
         if args.objective == "C":
-            target_ids = [int(token_id) for token_id in sample["target_continuation_ids"]]
+            target_ids, target_error = validate_target_token_ids(
+                sample["target_continuation_ids"],
+                max_continuation_tokens=int(args.max_continuation_tokens),
+                target_vocab_size=target_vocab_size,
+            )
         else:
-            target_ids = _load_cached_rollout_target(sample, config_digest=config_digest)
-            if target_ids is None:
-                skipped.append(int(sample["sample_index"]))
-                if require_targets:
-                    continue
-                target_ids = []
-        target_ids = target_ids[: int(args.max_continuation_tokens)]
-        if not target_ids:
-            skipped.append(int(sample["sample_index"]))
+            target_ids, target_error = _load_cached_rollout_target(
+                sample,
+                config_digest=config_digest,
+                max_continuation_tokens=int(args.max_continuation_tokens),
+                target_vocab_size=target_vocab_size,
+            )
+        if target_ids is None:
+            _record_sample_skip(skipped, skip_counts, sample, target_error)
+            if require_targets:
+                continue
+            target_ids = []
+        elif not target_ids:
+            _record_sample_skip(skipped, skip_counts, sample, "empty_target")
             if require_targets:
                 continue
         weights = (
@@ -906,12 +1013,18 @@ def prepare_objective_samples(
             if args.objective == "B"
             else [1.0 for _ in target_ids]
         )
+        weights, weight_error = validate_target_weights(weights, target_len=len(target_ids))
+        if weights is None:
+            _record_sample_skip(skipped, skip_counts, sample, weight_error)
+            if require_targets:
+                continue
+            weights = []
         item = dict(sample)
         item["target_ids"] = target_ids
         item["target_weights"] = weights
         item["objective"] = args.objective
         prepared.append(item)
-    return prepared, skipped
+    return prepared, skipped, skip_counts
 
 
 def receiver_lora_sample_nll(
@@ -921,20 +1034,27 @@ def receiver_lora_sample_nll(
     device: torch.device,
     model_dtype: torch.dtype,
 ) -> torch.Tensor:
-    target_ids = [int(token_id) for token_id in sample["target_ids"]]
-    if not target_ids:
-        raise ValueError("sample target_ids must be non-empty")
+    embedding = receiver.get_input_embeddings()
+    target_vocab_size = int(getattr(embedding, "num_embeddings", embedding.weight.shape[0]))
+    raw_target_ids = sample["target_ids"]
+    max_target_tokens = len(raw_target_ids) if isinstance(raw_target_ids, (list, tuple)) else 0
+    target_ids, target_error = validate_target_token_ids(
+        raw_target_ids,
+        max_continuation_tokens=max_target_tokens,
+        target_vocab_size=target_vocab_size,
+    )
+    if target_ids is None:
+        raise ValueError(f"invalid sample target_ids: {target_error}")
     target_len = len(target_ids)
     target = torch.tensor([target_ids], dtype=torch.long, device=device)
-    weights = torch.tensor(
-        [float(weight) for weight in sample.get("target_weights", [1.0] * target_len)],
-        dtype=torch.float32,
-        device=device,
+    weight_values, weight_error = validate_target_weights(
+        sample.get("target_weights", [1.0] * target_len),
+        target_len=target_len,
     )
-    if int(weights.numel()) != target_len:
-        raise ValueError("target_weights length must match target_ids length")
+    if weight_values is None:
+        raise ValueError(f"invalid target_weights: {weight_error}")
+    weights = torch.tensor(weight_values, dtype=torch.float32, device=device)
 
-    embedding = receiver.get_input_embeddings()
     context = torch.tensor([sample["context_ids"]], dtype=torch.long, device=device)
     with torch.no_grad():
         context_embeds = embedding(context).to(dtype=model_dtype)
@@ -966,7 +1086,7 @@ def receiver_lora_sample_nll(
         target.reshape(-1),
         reduction="none",
     )
-    return (per_token * weights).sum() / weights.sum().clamp_min(1.0)
+    return (per_token * weights).sum() / weights.sum()
 
 
 def _score_decoded(dataset: str, decoded_text: str, answer: Any) -> dict[str, Any]:
@@ -1221,32 +1341,8 @@ def train(args: argparse.Namespace) -> None:
         tokenizer=receiver_tokenizer,
         adapter_payload=adapter_payload,
     )
-    train_samples, train_skipped = prepare_objective_samples(
-        train_samples,
-        args=args,
-        tokenizer=receiver_tokenizer,
-        require_targets=True,
-    )
-    dev_nll_samples, dev_skipped = prepare_objective_samples(
-        dev_samples,
-        args=args,
-        tokenizer=receiver_tokenizer,
-        require_targets=True,
-    )
     if not train_samples or not dev_samples:
         raise SystemExit("No cached train/dev traces matched the requested row ranges.")
-    if args.objective in {"A", "B"} and train_skipped:
-        print(
-            f"objective {args.objective}: skipped {len(train_skipped)} train rows "
-            "without verified rollout targets",
-            flush=True,
-        )
-    if args.objective in {"A", "B"} and dev_skipped:
-        print(
-            f"objective {args.objective}: skipped {len(dev_skipped)} dev rows "
-            "without verified rollout targets for dev NLL",
-            flush=True,
-        )
 
     print(f"Loading frozen receiver {args.receiver_model} ({model_dtype}) ...", flush=True)
     receiver = AutoModelForCausalLM.from_pretrained(
@@ -1271,6 +1367,36 @@ def train(args: argparse.Namespace) -> None:
     ]
     for parameter in lora_params:
         parameter.requires_grad_(True)
+
+    target_vocab_size = int(receiver.get_input_embeddings().weight.shape[0])
+    train_samples, train_skipped, train_skip_counts = prepare_objective_samples(
+        train_samples,
+        args=args,
+        tokenizer=receiver_tokenizer,
+        require_targets=True,
+        target_vocab_size=target_vocab_size,
+    )
+    dev_nll_samples, dev_skipped, dev_skip_counts = prepare_objective_samples(
+        dev_samples,
+        args=args,
+        tokenizer=receiver_tokenizer,
+        require_targets=True,
+        target_vocab_size=target_vocab_size,
+    )
+    if not train_samples:
+        raise SystemExit("No train samples had usable objective targets.")
+    if args.objective in {"A", "B"} and train_skipped:
+        print(
+            f"objective {args.objective}: skipped {len(train_skipped)} train rows "
+            f"without usable rollout targets ({_format_skip_counts(train_skip_counts)})",
+            flush=True,
+        )
+    if args.objective in {"A", "B"} and dev_skipped:
+        print(
+            f"objective {args.objective}: skipped {len(dev_skipped)} dev rows "
+            f"without usable rollout targets for dev NLL ({_format_skip_counts(dev_skip_counts)})",
+            flush=True,
+        )
 
     optimizer_steps_per_epoch = max(1, math.ceil(len(train_samples) / max(1, int(args.grad_accum))))
     total_optimizer_steps = max(1, optimizer_steps_per_epoch * max_epochs)
@@ -1500,6 +1626,7 @@ def train(args: argparse.Namespace) -> None:
     )
     stopped = False
     stop_status = "COMPLETED"
+    nonfinite_loss_skips = 0
     set_lora_train_mode()
     for epoch in range(start_epoch, max_epochs):
         order = list(range(len(train_samples)))
@@ -1521,11 +1648,24 @@ def train(args: argparse.Namespace) -> None:
                 device=device,
                 model_dtype=model_dtype,
             )
+            loss_value = finite_loss_value(loss)
+            if loss_value is None:
+                nonfinite_loss_skips += 1
+                sample_step += 1
+                next_position = position + 1
+                print(
+                    "skipping non-finite loss before backward: "
+                    f"epoch={epoch} position={position} "
+                    f"sample_index={sample.get('sample_index')} "
+                    f"skip_count={nonfinite_loss_skips}",
+                    flush=True,
+                )
+                continue
             (loss / max(1, int(args.grad_accum))).backward()
             accumulation_count += 1
             sample_step += 1
             next_position = position + 1
-            running_loss += float(loss.detach().cpu().item())
+            running_loss += loss_value
             should_step = accumulation_count >= max(1, int(args.grad_accum))
             if should_step:
                 torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
@@ -1650,10 +1790,12 @@ def train(args: argparse.Namespace) -> None:
     latest["status"] = stop_status
     latest["best_dev_correct"] = best_dev_correct
     latest["best_dev_step"] = best_dev_step
+    latest["nonfinite_loss_skips"] = nonfinite_loss_skips
     write_lora_report(report_path, history, latest)
     print(
         f"DONE receiver LoRA status={stop_status} "
-        f"best_dev_correct={best_dev_correct} report={report_path}",
+        f"best_dev_correct={best_dev_correct} "
+        f"nonfinite_loss_skips={nonfinite_loss_skips} report={report_path}",
         flush=True,
     )
 
@@ -1713,7 +1855,8 @@ def run_prepare_rollouts(args: argparse.Namespace) -> dict[str, int]:
     print(
         "rollouts: "
         f"accepted={stats['accepted']} failed={stats['failed']} "
-        f"skipped={stats['skipped']} written={stats['written']}",
+        f"skipped={stats['skipped']} invalid={stats['invalid']} "
+        f"written={stats['written']}",
         flush=True,
     )
     return stats
