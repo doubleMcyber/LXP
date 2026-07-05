@@ -1,8 +1,8 @@
-"""Chunk 2 receiver-LoRA trainer data path.
+"""Receiver-LoRA rollout preparation and training.
 
-This file intentionally stops before the optimizer loop. It builds the same
-context/latent/target samples the eventual receiver-LoRA training step will
-consume, and it can prepare verified rollout continuations for objectives A/B.
+Builds the same context/latent/target samples the production fused-forward path
+consumes, prepares verified rollout continuations for objectives A/B, and trains
+the receiver-internal LoRA adapters with the registered gate system.
 """
 
 from __future__ import annotations
@@ -10,12 +10,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -24,17 +27,27 @@ from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 from benchmark_all import _answers_match, _predicted_answer  # noqa: E402
 from scripts.train_latent_bridge import (  # noqa: E402
+    ALONE_INSTRUCTION,
     CONTINUATION_INSTRUCTION,
+    TEXT_INSTRUCTION,
     chat_prefix_ids,
     load_bridge_samples,
 )
-from src.models.receiver_lora import RECEIVER_LORA_TARGET_SUFFIXES  # noqa: E402
+from src.models.receiver_lora import (  # noqa: E402
+    RECEIVER_LORA_FORMAT,
+    RECEIVER_LORA_TARGET_SUFFIXES,
+    apply_receiver_lora,
+    receiver_lora_state_dict,
+    set_receiver_lora_enabled,
+)
 from src.utils.alignment import apply_alignment  # noqa: E402
 from src.utils.lm_eval import (  # noqa: E402
+    _last_logit_forward_kwargs,
     _normalize_kv_cache,
     _reset_kv_cache_to_prefix,
     build_position_ids,
     greedy_decode_from_prefix,
+    prepare_text_prefix_state,
     prepare_receiver_context_latent_prefix_state,
 )
 
@@ -101,6 +114,25 @@ def prompt_sha(prompt: str) -> str:
 
 def context_text(tokenizer: Any, question: str) -> str:
     user_message = f"{question}\n\n{CONTINUATION_INSTRUCTION}"
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:  # noqa: BLE001
+        return user_message
+
+
+def chat_prefix_text(
+    tokenizer: Any,
+    question: str,
+    instruction: str,
+    body: str = "",
+) -> str:
+    user_message = f"{question}\n\n{instruction}"
+    if body:
+        user_message = f"{question}\n\nUnfinished reasoning:\n{body}\n\n{instruction}"
     try:
         return tokenizer.apply_chat_template(
             [{"role": "user", "content": user_message}],
@@ -248,6 +280,358 @@ def rollout_cache_path(
     cache_dir: str | Path = DEFAULT_ROLLOUT_CACHE_DIR,
 ) -> Path:
     return Path(cache_dir) / f"rollout_{prompt_sha(question)}.pt"
+
+
+def build_answer_weight_vector(
+    tokenizer: Any,
+    token_ids: list[int] | tuple[int, ...],
+    *,
+    final_answer_weight: float = 4.0,
+) -> list[float]:
+    token_ids = [int(token_id) for token_id in token_ids]
+    weights = [1.0 for _ in token_ids]
+    if not token_ids:
+        return weights
+
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+    matches = list(re.finditer(r"final\s+answer\s*:", decoded, flags=re.IGNORECASE))
+    if not matches:
+        return weights
+
+    marker_start = int(matches[-1].start())
+    line_start = decoded.rfind("\n", 0, marker_start) + 1
+    start_char = max(0, line_start)
+    start_index = len(token_ids) - 1
+    for index in range(len(token_ids)):
+        prefix_text = tokenizer.decode(token_ids[: index + 1], skip_special_tokens=True)
+        if len(prefix_text) > start_char:
+            start_index = index
+            break
+
+    for index in range(start_index, len(weights)):
+        weights[index] = float(final_answer_weight)
+    return weights
+
+
+def cosine_with_warmup_lr(
+    step: int,
+    *,
+    total_steps: int,
+    base_lr: float = 1e-4,
+    min_lr: float = 1e-5,
+    warmup_steps: int = 6,
+) -> float:
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if base_lr <= 0.0:
+        raise ValueError("base_lr must be positive")
+    if min_lr < 0.0:
+        raise ValueError("min_lr must be non-negative")
+    step = max(0, int(step))
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+    if step <= 0:
+        return 0.0
+    if warmup_steps and step <= warmup_steps:
+        return float(base_lr) * float(step) / float(warmup_steps)
+    if total_steps <= warmup_steps:
+        return float(base_lr)
+    decay_step = min(step, total_steps)
+    progress = (decay_step - warmup_steps) / float(total_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
+
+
+def build_cosine_with_warmup_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    base_lr: float = 1e-4,
+    min_lr: float = 1e-5,
+    warmup_steps: int = 6,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    def lr_lambda(scheduler_step: int) -> float:
+        lr = cosine_with_warmup_lr(
+            int(scheduler_step) + 1,
+            total_steps=total_steps,
+            base_lr=base_lr,
+            min_lr=min_lr,
+            warmup_steps=warmup_steps,
+        )
+        return lr / float(base_lr)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _metric_number(gate: dict[str, Any], variant: str, field: str) -> Optional[float]:
+    section = gate.get(variant)
+    if isinstance(section, dict) and field in section:
+        value = section[field]
+        if isinstance(value, (int, float)):
+            return float(value)
+    flat_keys = (
+        f"{variant}_{field}",
+        f"{variant}_{field.replace('_count', '')}",
+    )
+    for key in flat_keys:
+        value = gate.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _metric_count(gate: dict[str, Any], variant: str) -> Optional[int]:
+    value = _metric_number(gate, variant, "correct_count")
+    if value is None:
+        return None
+    return int(value)
+
+
+def _metric_accuracy(gate: dict[str, Any], variant: str) -> Optional[float]:
+    value = _metric_number(gate, variant, "accuracy")
+    if value is not None:
+        return float(value)
+    correct = _metric_number(gate, variant, "correct_count")
+    total = _metric_number(gate, variant, "sample_count")
+    if total is None:
+        total = gate.get("sample_count")
+    if isinstance(correct, (int, float)) and isinstance(total, (int, float)) and total:
+        return float(correct) / float(total)
+    return None
+
+
+def _copy_proof_accuracy(gate: dict[str, Any]) -> Optional[float]:
+    section = gate.get("copy_proof")
+    if isinstance(section, dict):
+        for key in ("latent_lora_accuracy", "accuracy"):
+            value = section.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    for key in ("copy_proof_latent_lora_accuracy", "copy_proof_accuracy"):
+        value = gate.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _first_defined(history: list[dict[str, Any]], getter: Any) -> Optional[float]:
+    for gate in history:
+        value = getter(gate)
+        if value is not None:
+            return value
+    return None
+
+
+def evaluate_kill_rules(history: list[dict[str, Any]]) -> dict[str, Any]:
+    rules: list[str] = []
+    if not history:
+        return {"kill": False, "rules": rules, "reason": None}
+
+    latent_base_correct = _first_defined(
+        history,
+        lambda gate: _metric_count(gate, "latent_base"),
+    )
+    if latent_base_correct is not None:
+        for gate in history:
+            optimizer_step = int(gate.get("optimizer_step", gate.get("global_step", 0)) or 0)
+            latent_lora_correct = _metric_count(gate, "latent_lora")
+            if (
+                optimizer_step >= 10
+                and latent_lora_correct is not None
+                and latent_lora_correct < int(latent_base_correct) - 2
+            ):
+                rules.append("latent_lora_below_base")
+                break
+
+    text_base_correct = _first_defined(history, lambda gate: _metric_count(gate, "text"))
+    if text_base_correct is not None:
+        for gate in history:
+            text_lora_correct = _metric_count(gate, "text_lora_canary")
+            if text_lora_correct is not None and text_lora_correct < int(text_base_correct) - 2:
+                rules.append("text_lora_canary_below_text")
+                break
+
+    step0_copy_accuracy = _first_defined(history, _copy_proof_accuracy)
+    step0_latent_accuracy = _first_defined(
+        history,
+        lambda gate: _metric_accuracy(gate, "latent_lora"),
+    )
+    if step0_copy_accuracy is not None and step0_latent_accuracy is not None:
+        for gate in history:
+            copy_accuracy = _copy_proof_accuracy(gate)
+            latent_accuracy = _metric_accuracy(gate, "latent_lora")
+            if (
+                copy_accuracy is not None
+                and latent_accuracy is not None
+                and copy_accuracy < float(step0_copy_accuracy)
+                and latent_accuracy > float(step0_latent_accuracy)
+            ):
+                rules.append("copy_proof_drop_with_overall_rise")
+                break
+
+    nll_gates: list[tuple[float, float]] = []
+    for gate in history:
+        dev_nll = gate.get("dev_nll")
+        latent_accuracy = _metric_accuracy(gate, "latent_lora")
+        if isinstance(dev_nll, (int, float)) and latent_accuracy is not None:
+            nll_gates.append((float(dev_nll), float(latent_accuracy)))
+    for index in range(2, len(nll_gates)):
+        previous_2, previous_1, current = (
+            nll_gates[index - 2],
+            nll_gates[index - 1],
+            nll_gates[index],
+        )
+        if (
+            current[0] < previous_1[0] < previous_2[0]
+            and current[1] < previous_1[1] < previous_2[1]
+        ):
+            rules.append("phase0_divergence")
+            break
+
+    return {"kill": bool(rules), "rules": rules, "reason": rules[0] if rules else None}
+
+
+def _mps_rng_state() -> Optional[torch.Tensor]:
+    mps = getattr(torch, "mps", None)
+    getter = getattr(mps, "get_rng_state", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _restore_mps_rng_state(state: Any) -> None:
+    if not torch.is_tensor(state):
+        return
+    mps = getattr(torch, "mps", None)
+    setter = getattr(mps, "set_rng_state", None)
+    if setter is None:
+        return
+    try:
+        setter(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _rng_states() -> dict[str, Any]:
+    states: dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "random": random.getstate(),
+    }
+    mps_state = _mps_rng_state()
+    if mps_state is not None:
+        states["mps"] = mps_state
+    return states
+
+
+def _restore_rng_states(states: dict[str, Any]) -> None:
+    torch_state = states.get("torch")
+    if torch.is_tensor(torch_state):
+        torch.set_rng_state(torch_state)
+    random_state = states.get("random")
+    if random_state is not None:
+        random.setstate(random_state)
+    _restore_mps_rng_state(states.get("mps"))
+
+
+def _module_trainable_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    lora_state = receiver_lora_state_dict(module)
+    if lora_state:
+        return lora_state
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+        if torch.is_tensor(value)
+    }
+
+
+def save_lora_checkpoint(
+    path: str | Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
+    epoch: int,
+    position_in_epoch: int,
+    sample_step: int,
+    optimizer_step: int,
+    best_dev_correct: int,
+    best_dev_step: int,
+    epoch_end_no_improve: int,
+    args: argparse.Namespace | dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "lora": _module_trainable_state_dict(model),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "epoch": int(epoch),
+        "position_in_epoch": int(position_in_epoch),
+        "sample_step": int(sample_step),
+        "global_step": int(optimizer_step),
+        "optimizer_step": int(optimizer_step),
+        "best_dev_correct": int(best_dev_correct),
+        "best_dev_step": int(best_dev_step),
+        "epoch_end_no_improve": int(epoch_end_no_improve),
+        "rng_states": _rng_states(),
+        "args": vars(args) if isinstance(args, argparse.Namespace) else dict(args),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    return payload
+
+
+def load_lora_checkpoint(
+    path: str | Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    restore_rng: bool = True,
+) -> dict[str, Any]:
+    snapshot = torch.load(Path(path), map_location="cpu", weights_only=False)
+    state = snapshot.get("lora", snapshot.get("state", {}))
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint LoRA state must be a dict")
+    model.load_state_dict(state, strict=False)
+    if optimizer is not None and snapshot.get("optimizer") is not None:
+        optimizer.load_state_dict(snapshot["optimizer"])
+    if scheduler is not None and snapshot.get("scheduler") is not None:
+        scheduler.load_state_dict(snapshot["scheduler"])
+    rng_states = snapshot.get("rng_states")
+    if restore_rng and isinstance(rng_states, dict):
+        _restore_rng_states(rng_states)
+    return snapshot
+
+
+def _json_default(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(value)
+    return str(value)
+
+
+def write_lora_report(
+    report_path: str | Path,
+    history: list[dict[str, Any]],
+    latest: dict[str, Any],
+) -> None:
+    Path(report_path).write_text(
+        json.dumps({"history": history, "latest": latest}, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+
+
+def _forward_logits_to_keep_kwargs(model: Any, logits_to_keep: int) -> dict[str, int]:
+    kwargs = _last_logit_forward_kwargs(model)
+    if "logits_to_keep" in kwargs:
+        return {"logits_to_keep": int(logits_to_keep)}
+    return {}
 
 
 def _top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -458,10 +842,820 @@ def prepare_rollouts(
     return stats
 
 
+def _load_report_history(report_path: Path) -> list[dict[str, Any]]:
+    if not report_path.exists():
+        return []
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    history = payload.get("history", [])
+    return history if isinstance(history, list) else []
+
+
+def _load_cached_rollout_target(
+    sample: dict[str, Any],
+    *,
+    config_digest: str,
+    cache_dir: str | Path = DEFAULT_ROLLOUT_CACHE_DIR,
+) -> Optional[list[int]]:
+    path = rollout_cache_path(str(sample["question"]), cache_dir=cache_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("config_digest") != config_digest or not bool(payload.get("verified")):
+        return None
+    token_ids = payload.get("token_ids")
+    if not isinstance(token_ids, list) or not token_ids:
+        return None
+    return [int(token_id) for token_id in token_ids]
+
+
+def prepare_objective_samples(
+    samples: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    require_targets: bool,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    prepared: list[dict[str, Any]] = []
+    skipped: list[int] = []
+    config_digest = _current_rollout_config_digest(args)
+    for sample in samples:
+        if args.objective == "C":
+            target_ids = [int(token_id) for token_id in sample["target_continuation_ids"]]
+        else:
+            target_ids = _load_cached_rollout_target(sample, config_digest=config_digest)
+            if target_ids is None:
+                skipped.append(int(sample["sample_index"]))
+                if require_targets:
+                    continue
+                target_ids = []
+        target_ids = target_ids[: int(args.max_continuation_tokens)]
+        if not target_ids:
+            skipped.append(int(sample["sample_index"]))
+            if require_targets:
+                continue
+        weights = (
+            build_answer_weight_vector(tokenizer, target_ids, final_answer_weight=4.0)
+            if args.objective == "B"
+            else [1.0 for _ in target_ids]
+        )
+        item = dict(sample)
+        item["target_ids"] = target_ids
+        item["target_weights"] = weights
+        item["objective"] = args.objective
+        prepared.append(item)
+    return prepared, skipped
+
+
+def receiver_lora_sample_nll(
+    *,
+    receiver: Any,
+    sample: dict[str, Any],
+    device: torch.device,
+    model_dtype: torch.dtype,
+) -> torch.Tensor:
+    target_ids = [int(token_id) for token_id in sample["target_ids"]]
+    if not target_ids:
+        raise ValueError("sample target_ids must be non-empty")
+    target_len = len(target_ids)
+    target = torch.tensor([target_ids], dtype=torch.long, device=device)
+    weights = torch.tensor(
+        [float(weight) for weight in sample.get("target_weights", [1.0] * target_len)],
+        dtype=torch.float32,
+        device=device,
+    )
+    if int(weights.numel()) != target_len:
+        raise ValueError("target_weights length must match target_ids length")
+
+    embedding = receiver.get_input_embeddings()
+    context = torch.tensor([sample["context_ids"]], dtype=torch.long, device=device)
+    with torch.no_grad():
+        context_embeds = embedding(context).to(dtype=model_dtype)
+        continuation_embeds = embedding(target).to(dtype=model_dtype)
+    latents = sample["latents"].to(device=device, dtype=model_dtype)
+    inputs_embeds = torch.cat([context_embeds, latents, continuation_embeds], dim=1)
+    prefix_len = int(context_embeds.shape[1] + latents.shape[1])
+    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+    outputs = receiver(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=build_position_ids(attention_mask),
+        use_cache=False,
+        return_dict=True,
+        **_forward_logits_to_keep_kwargs(receiver, target_len + 1),
+    )
+    logits = outputs.logits.float()
+    if int(logits.shape[1]) == target_len + 1:
+        prediction_logits = logits[:, :-1, :]
+    else:
+        prediction_logits = logits[:, prefix_len - 1 : prefix_len + target_len - 1, :]
+    if int(prediction_logits.shape[1]) != target_len:
+        raise ValueError(
+            "training logits length mismatch: "
+            f"got {int(prediction_logits.shape[1])}, expected {target_len}"
+        )
+    per_token = F.cross_entropy(
+        prediction_logits.reshape(-1, prediction_logits.shape[-1]),
+        target.reshape(-1),
+        reduction="none",
+    )
+    return (per_token * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _score_decoded(dataset: str, decoded_text: str, answer: Any) -> dict[str, Any]:
+    predicted = _predicted_answer(dataset, decoded_text)
+    correct = bool(predicted is not None and _answers_match(dataset, predicted, answer))
+    return {
+        "predicted": predicted,
+        "correct": correct,
+        "decoded": decoded_text[:200],
+    }
+
+
+@torch.no_grad()
+def _evaluate_latent_variant(
+    *,
+    receiver: Any,
+    tokenizer: Any,
+    samples: list[dict[str, Any]],
+    args: argparse.Namespace,
+    lora_enabled: bool,
+) -> list[dict[str, Any]]:
+    set_receiver_lora_enabled(receiver, bool(lora_enabled))
+    receiver.eval()
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        prefix_state = prepare_receiver_context_latent_prefix_state(
+            model=receiver,
+            tokenizer=tokenizer,
+            context_text=str(sample["context_text"]),
+            handoff_step=sample["latents"],
+            kv_cache=None,
+            suffix_text="",
+            latent_position="after_context",
+        )
+        decoded = greedy_decode_from_prefix(
+            model=receiver,
+            tokenizer=tokenizer,
+            prefix_state=prefix_state,
+            max_new_tokens=args.max_new_tokens,
+            stop_regex=None,
+        )["decoded_text"]
+        rows.append(
+            {
+                "sample_index": int(sample["sample_index"]),
+                "answer": str(sample["answer"]),
+                **_score_decoded(args.dataset, str(decoded), sample["answer"]),
+            }
+        )
+    return rows
+
+
+@torch.no_grad()
+def _evaluate_text_variant(
+    *,
+    receiver: Any,
+    tokenizer: Any,
+    samples: list[dict[str, Any]],
+    args: argparse.Namespace,
+    variant: str,
+    lora_enabled: bool,
+) -> list[dict[str, Any]]:
+    set_receiver_lora_enabled(receiver, bool(lora_enabled))
+    receiver.eval()
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        if variant == "text":
+            prefix_text = chat_prefix_text(
+                tokenizer,
+                str(sample["question"]),
+                TEXT_INSTRUCTION,
+                body=str(sample.get("truncated_text", "")),
+            )
+        elif variant == "alone":
+            prefix_text = chat_prefix_text(
+                tokenizer,
+                str(sample["question"]),
+                ALONE_INSTRUCTION,
+            )
+        else:
+            raise ValueError(f"unknown text variant: {variant}")
+        prefix_state = prepare_text_prefix_state(
+            model=receiver,
+            tokenizer=tokenizer,
+            prefix_text=prefix_text,
+        )
+        decoded = greedy_decode_from_prefix(
+            model=receiver,
+            tokenizer=tokenizer,
+            prefix_state=prefix_state,
+            max_new_tokens=args.max_new_tokens,
+            stop_regex=None,
+        )["decoded_text"]
+        rows.append(
+            {
+                "sample_index": int(sample["sample_index"]),
+                "answer": str(sample["answer"]),
+                **_score_decoded(args.dataset, str(decoded), sample["answer"]),
+            }
+        )
+    return rows
+
+
+def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    correct_count = sum(1 for row in rows if bool(row.get("correct")))
+    sample_count = len(rows)
+    accuracy = float(correct_count) / float(sample_count) if sample_count else 0.0
+    return {
+        "correct_count": int(correct_count),
+        "sample_count": int(sample_count),
+        "accuracy": accuracy,
+        "accuracy_percentage": round(100.0 * accuracy, 2),
+    }
+
+
+def _normalized_number(text: Any) -> str:
+    return re.sub(r"[^\d.]", "", str(text)).strip(".")
+
+
+def _copy_proof_indices(samples: list[dict[str, Any]]) -> set[int]:
+    indices: set[int] = set()
+    for sample in samples:
+        answer_token = _normalized_number(sample["answer"])
+        normalized_prefix = re.sub(r"[,\s]", "", str(sample.get("truncated_text", "")))
+        present = bool(answer_token) and answer_token in normalized_prefix
+        if not present:
+            indices.add(int(sample["sample_index"]))
+    return indices
+
+
+def _copy_proof_summary(
+    latent_lora_rows: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    indices = _copy_proof_indices(samples)
+    rows = [row for row in latent_lora_rows if int(row["sample_index"]) in indices]
+    summary = _summarize_rows(rows)
+    summary["stratum"] = "answer_not_in_prefix"
+    return summary
+
+
+@torch.no_grad()
+def _mean_dev_nll(
+    *,
+    receiver: Any,
+    samples: list[dict[str, Any]],
+    device: torch.device,
+    model_dtype: torch.dtype,
+) -> Optional[float]:
+    if not samples:
+        return None
+    set_receiver_lora_enabled(receiver, True)
+    receiver.eval()
+    losses: list[float] = []
+    for sample in samples:
+        loss = receiver_lora_sample_nll(
+            receiver=receiver,
+            sample=sample,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        losses.append(float(loss.detach().cpu().item()))
+    return float(sum(losses) / len(losses)) if losses else None
+
+
+def _identity_mismatches(
+    latent_lora_rows: list[dict[str, Any]],
+    latent_base_rows: list[dict[str, Any]],
+) -> list[int]:
+    base_by_index = {
+        int(row["sample_index"]): bool(row.get("correct"))
+        for row in latent_base_rows
+    }
+    mismatches: list[int] = []
+    for row in latent_lora_rows:
+        sample_index = int(row["sample_index"])
+        if bool(row.get("correct")) != base_by_index.get(sample_index):
+            mismatches.append(sample_index)
+    return mismatches
+
+
+def _save_best_lora(
+    path: Path,
+    *,
+    receiver: Any,
+    args: argparse.Namespace,
+    dev_gate: dict[str, Any],
+    module_count: int,
+) -> None:
+    latent_summary = dev_gate["latent_lora"]
+    payload = {
+        "format": RECEIVER_LORA_FORMAT,
+        "rank": int(args.rank),
+        "alpha": float(args.alpha),
+        "dropout": float(args.dropout),
+        "target_suffixes": RECEIVER_LORA_TARGET_SUFFIXES,
+        "base_model": str(args.receiver_model),
+        "state": receiver_lora_state_dict(receiver),
+        "train_args": vars(args),
+        "adapter_cache_key_digest": str(args.adapter_digest),
+        "objective": str(args.objective),
+        "dev_gate_accuracy": float(latent_summary["accuracy"]),
+        "dev_gate_correct_count": int(latent_summary["correct_count"]),
+        "global_step": int(dev_gate["global_step"]),
+        "optimizer_step": int(dev_gate["optimizer_step"]),
+        "sample_step": int(dev_gate["sample_step"]),
+        "module_count": int(module_count),
+    }
+    torch.save(payload, path)
+
+
+def _empty_mps_cache_if_needed(device: torch.device) -> None:
+    if device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+
+
 def train(args: argparse.Namespace) -> None:
-    del args
-    _ = RECEIVER_LORA_TARGET_SUFFIXES
-    raise SystemExit("chunk 3")
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "lora_checkpoint.pt"
+    best_path = output_dir / "best_lora.pt"
+    report_path = output_dir / "lora_report.json"
+    device = torch.device(args.device)
+    model_dtype = _torch_dtype(args.trace_dtype)
+    max_epochs = min(int(args.epochs), 1) if args.objective == "C" else min(int(args.epochs), 3)
+
+    print(f"Loading receiver tokenizer {args.receiver_model} ...", flush=True)
+    receiver_tokenizer = AutoTokenizer.from_pretrained(
+        args.receiver_model,
+        trust_remote_code=True,
+    )
+    sender_tokenizer = (
+        receiver_tokenizer
+        if args.sender_model == args.receiver_model
+        else AutoTokenizer.from_pretrained(args.sender_model, trust_remote_code=True)
+    )
+    adapter_payload = load_frozen_adapter(
+        _resolve_workspace_path(args.adapter_cache_path),
+        adapter_digest=args.adapter_digest,
+    )
+
+    print("Building receiver-LoRA train/dev samples ...", flush=True)
+    rows = load_bridge_sample_rows(args, tokenizer=sender_tokenizer, include_dev=True)
+    train_samples = assemble_training_samples(
+        rows["train"],
+        tokenizer=receiver_tokenizer,
+        adapter_payload=adapter_payload,
+    )
+    dev_samples = assemble_training_samples(
+        rows["dev"],
+        tokenizer=receiver_tokenizer,
+        adapter_payload=adapter_payload,
+    )
+    train_samples, train_skipped = prepare_objective_samples(
+        train_samples,
+        args=args,
+        tokenizer=receiver_tokenizer,
+        require_targets=True,
+    )
+    dev_nll_samples, dev_skipped = prepare_objective_samples(
+        dev_samples,
+        args=args,
+        tokenizer=receiver_tokenizer,
+        require_targets=True,
+    )
+    if not train_samples or not dev_samples:
+        raise SystemExit("No cached train/dev traces matched the requested row ranges.")
+    if args.objective in {"A", "B"} and train_skipped:
+        print(
+            f"objective {args.objective}: skipped {len(train_skipped)} train rows "
+            "without verified rollout targets",
+            flush=True,
+        )
+    if args.objective in {"A", "B"} and dev_skipped:
+        print(
+            f"objective {args.objective}: skipped {len(dev_skipped)} dev rows "
+            "without verified rollout targets for dev NLL",
+            flush=True,
+        )
+
+    print(f"Loading frozen receiver {args.receiver_model} ({model_dtype}) ...", flush=True)
+    receiver = AutoModelForCausalLM.from_pretrained(
+        args.receiver_model,
+        dtype=model_dtype,
+        trust_remote_code=True,
+    ).to(device)
+    receiver.eval()
+    for parameter in receiver.parameters():
+        parameter.requires_grad_(False)
+    lora_modules = apply_receiver_lora(
+        receiver,
+        rank=args.rank,
+        alpha=args.alpha,
+        dropout=args.dropout,
+    )
+    module_count = len(lora_modules)
+    lora_params = [
+        parameter
+        for module in lora_modules.values()
+        for parameter in (module.A, module.B)
+    ]
+    for parameter in lora_params:
+        parameter.requires_grad_(True)
+
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_samples) / max(1, int(args.grad_accum))))
+    total_optimizer_steps = max(1, optimizer_steps_per_epoch * max_epochs)
+    if args.max_steps:
+        total_optimizer_steps = min(total_optimizer_steps, int(args.max_steps))
+    optimizer = torch.optim.AdamW(
+        lora_params,
+        lr=float(args.lr),
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+    )
+    scheduler = build_cosine_with_warmup_scheduler(
+        optimizer,
+        total_steps=total_optimizer_steps,
+        base_lr=float(args.lr),
+        min_lr=1e-5,
+        warmup_steps=6,
+    )
+
+    history = _load_report_history(report_path)
+    start_epoch = 0
+    start_position = 0
+    sample_step = 0
+    optimizer_step = 0
+    best_dev_correct = -1
+    best_dev_step = -1
+    epoch_end_no_improve = 0
+    if checkpoint_path.exists():
+        snapshot = load_lora_checkpoint(
+            checkpoint_path,
+            model=receiver,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        start_epoch = int(snapshot.get("epoch", 0))
+        start_position = int(snapshot.get("position_in_epoch", 0))
+        sample_step = int(snapshot.get("sample_step", 0))
+        optimizer_step = int(snapshot.get("optimizer_step", snapshot.get("global_step", 0)))
+        best_dev_correct = int(snapshot.get("best_dev_correct", -1))
+        best_dev_step = int(snapshot.get("best_dev_step", -1))
+        epoch_end_no_improve = int(snapshot.get("epoch_end_no_improve", 0))
+        print(
+            f"Resumed receiver LoRA from optimizer_step={optimizer_step} "
+            f"sample_step={sample_step} epoch={start_epoch} position={start_position}",
+            flush=True,
+        )
+
+    def set_lora_train_mode() -> None:
+        receiver.eval()
+        set_receiver_lora_enabled(receiver, True)
+        for module in lora_modules.values():
+            module.train()
+
+    def append_gate(gate: dict[str, Any]) -> dict[str, Any]:
+        nonlocal best_dev_correct, best_dev_step
+        history.append(gate)
+        latest = dict(gate)
+        kill = evaluate_kill_rules(history)
+        latest["kill"] = kill
+        if kill["kill"]:
+            latest["status"] = "FAILED"
+        write_lora_report(report_path, history, latest)
+        dev_correct = int(gate["latent_lora"]["correct_count"])
+        if dev_correct > best_dev_correct:
+            best_dev_correct = dev_correct
+            best_dev_step = int(gate["optimizer_step"])
+            _save_best_lora(
+                best_path,
+                receiver=receiver,
+                args=args,
+                dev_gate=gate,
+                module_count=module_count,
+            )
+            print(
+                f"[gate:{gate['tag']}] new best latent_lora "
+                f"{dev_correct}/{gate['latent_lora']['sample_count']}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[gate:{gate['tag']}] latent_lora "
+                f"{dev_correct}/{gate['latent_lora']['sample_count']} "
+                f"dev_nll={gate.get('dev_nll')}",
+                flush=True,
+            )
+        return latest
+
+    def run_gate(
+        tag: str,
+        *,
+        epoch: int,
+        include_text_canary: bool,
+        include_copy_proof: bool,
+        include_constant_baselines: bool,
+    ) -> dict[str, Any]:
+        latent_lora_rows = _evaluate_latent_variant(
+            receiver=receiver,
+            tokenizer=receiver_tokenizer,
+            samples=dev_samples,
+            args=args,
+            lora_enabled=True,
+        )
+        gate: dict[str, Any] = {
+            "tag": tag,
+            "status": "RUNNING",
+            "epoch": int(epoch),
+            "sample_step": int(sample_step),
+            "global_step": int(optimizer_step),
+            "optimizer_step": int(optimizer_step),
+            "sample_count": len(dev_samples),
+            "latent_lora": _summarize_rows(latent_lora_rows),
+            "dev_nll": _mean_dev_nll(
+                receiver=receiver,
+                samples=dev_nll_samples,
+                device=device,
+                model_dtype=model_dtype,
+            ),
+            "rows": {"latent_lora": latent_lora_rows},
+        }
+        if include_copy_proof:
+            gate["copy_proof"] = _copy_proof_summary(latent_lora_rows, dev_samples)
+        if include_constant_baselines:
+            latent_base_rows = _evaluate_latent_variant(
+                receiver=receiver,
+                tokenizer=receiver_tokenizer,
+                samples=dev_samples,
+                args=args,
+                lora_enabled=False,
+            )
+            text_rows = _evaluate_text_variant(
+                receiver=receiver,
+                tokenizer=receiver_tokenizer,
+                samples=dev_samples,
+                args=args,
+                variant="text",
+                lora_enabled=False,
+            )
+            alone_rows = _evaluate_text_variant(
+                receiver=receiver,
+                tokenizer=receiver_tokenizer,
+                samples=dev_samples,
+                args=args,
+                variant="alone",
+                lora_enabled=False,
+            )
+            gate["latent_base"] = _summarize_rows(latent_base_rows)
+            gate["text"] = _summarize_rows(text_rows)
+            gate["alone"] = _summarize_rows(alone_rows)
+            gate["rows"]["latent_base"] = latent_base_rows
+            gate["rows"]["text"] = text_rows
+            gate["rows"]["alone"] = alone_rows
+            mismatches = _identity_mismatches(latent_lora_rows, latent_base_rows)
+            gate["step0_identity_mismatches"] = mismatches
+        else:
+            baseline_gate = next(
+                (item for item in history if "latent_base" in item and "text" in item),
+                None,
+            )
+            if baseline_gate is not None:
+                gate["latent_base"] = baseline_gate["latent_base"]
+                gate["text"] = baseline_gate["text"]
+                gate["alone"] = baseline_gate.get("alone")
+        if include_text_canary:
+            text_lora_rows = _evaluate_text_variant(
+                receiver=receiver,
+                tokenizer=receiver_tokenizer,
+                samples=dev_samples,
+                args=args,
+                variant="text",
+                lora_enabled=True,
+            )
+            gate["text_lora_canary"] = _summarize_rows(text_lora_rows)
+            gate["rows"]["text_lora_canary"] = text_lora_rows
+        return append_gate(gate)
+
+    if args.eval_only:
+        if not checkpoint_path.exists():
+            print("eval-only: no lora_checkpoint.pt found; evaluating current init", flush=True)
+        run_gate(
+            "eval_only",
+            epoch=start_epoch,
+            include_text_canary=True,
+            include_copy_proof=True,
+            include_constant_baselines=not history,
+        )
+        return
+
+    if optimizer_step == 0 and not history:
+        print("Running step-0 identity gate ...", flush=True)
+        latest = run_gate(
+            "step0",
+            epoch=0,
+            include_text_canary=False,
+            include_copy_proof=True,
+            include_constant_baselines=True,
+        )
+        mismatches = latest.get("step0_identity_mismatches", [])
+        if mismatches:
+            latest["status"] = "FAILED"
+            latest["failure_reason"] = "step0_identity_mismatch"
+            write_lora_report(report_path, history, latest)
+            raise SystemExit(
+                "Step-0 identity gate failed for sample_index rows: "
+                f"{','.join(str(index) for index in mismatches)}"
+            )
+        save_lora_checkpoint(
+            checkpoint_path,
+            model=receiver,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=0,
+            position_in_epoch=0,
+            sample_step=sample_step,
+            optimizer_step=optimizer_step,
+            best_dev_correct=best_dev_correct,
+            best_dev_step=best_dev_step,
+            epoch_end_no_improve=epoch_end_no_improve,
+            args=args,
+        )
+        _empty_mps_cache_if_needed(device)
+
+    print(
+        f"Training receiver LoRA objective={args.objective}: "
+        f"{max_epochs} epochs, {len(train_samples)} samples, "
+        f"{total_optimizer_steps} optimizer steps max",
+        flush=True,
+    )
+    stopped = False
+    stop_status = "COMPLETED"
+    set_lora_train_mode()
+    for epoch in range(start_epoch, max_epochs):
+        order = list(range(len(train_samples)))
+        random.Random(int(args.seed) + epoch).shuffle(order)
+        position_start = start_position if epoch == start_epoch else 0
+        accumulation_count = 0
+        running_loss = 0.0
+        next_position = position_start
+        optimizer.zero_grad(set_to_none=True)
+        for position in range(position_start, len(order)):
+            if args.max_steps and optimizer_step >= int(args.max_steps):
+                stopped = True
+                stop_status = "MAX_STEPS"
+                break
+            sample = train_samples[order[position]]
+            loss = receiver_lora_sample_nll(
+                receiver=receiver,
+                sample=sample,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            (loss / max(1, int(args.grad_accum))).backward()
+            accumulation_count += 1
+            sample_step += 1
+            next_position = position + 1
+            running_loss += float(loss.detach().cpu().item())
+            should_step = accumulation_count >= max(1, int(args.grad_accum))
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_step += 1
+                accumulation_count = 0
+                if optimizer_step % 10 == 0:
+                    latest = run_gate(
+                        f"step_{optimizer_step}",
+                        epoch=epoch,
+                        include_text_canary=False,
+                        include_copy_proof=False,
+                        include_constant_baselines=False,
+                    )
+                    set_lora_train_mode()
+                    if latest.get("kill", {}).get("kill"):
+                        stopped = True
+                        stop_status = "FAILED"
+                        break
+                if optimizer_step % 5 == 0:
+                    print(
+                        f"epoch {epoch} optimizer_step {optimizer_step} "
+                        f"sample_step {sample_step} "
+                        f"loss={running_loss / max(1, accumulation_count or args.grad_accum):.4f}",
+                        flush=True,
+                    )
+            if args.checkpoint_every and sample_step % int(args.checkpoint_every) == 0:
+                save_lora_checkpoint(
+                    checkpoint_path,
+                    model=receiver,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    position_in_epoch=position + 1,
+                    sample_step=sample_step,
+                    optimizer_step=optimizer_step,
+                    best_dev_correct=best_dev_correct,
+                    best_dev_step=best_dev_step,
+                    epoch_end_no_improve=epoch_end_no_improve,
+                    args=args,
+                )
+                _empty_mps_cache_if_needed(device)
+            if stopped:
+                break
+        if not stopped and accumulation_count:
+            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            optimizer_step += 1
+            if optimizer_step % 10 == 0:
+                latest = run_gate(
+                    f"step_{optimizer_step}",
+                    epoch=epoch,
+                    include_text_canary=False,
+                    include_copy_proof=False,
+                    include_constant_baselines=False,
+                )
+                set_lora_train_mode()
+                if latest.get("kill", {}).get("kill"):
+                    stopped = True
+                    stop_status = "FAILED"
+        if stopped:
+            save_lora_checkpoint(
+                checkpoint_path,
+                model=receiver,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                position_in_epoch=next_position,
+                sample_step=sample_step,
+                optimizer_step=optimizer_step,
+                best_dev_correct=best_dev_correct,
+                best_dev_step=best_dev_step,
+                epoch_end_no_improve=epoch_end_no_improve,
+                args=args,
+            )
+            break
+
+        prior_best_dev_correct = best_dev_correct
+        latest = run_gate(
+            f"epoch_{epoch}",
+            epoch=epoch,
+            include_text_canary=True,
+            include_copy_proof=True,
+            include_constant_baselines=False,
+        )
+        set_lora_train_mode()
+        if latest.get("kill", {}).get("kill"):
+            stopped = True
+            stop_status = "FAILED"
+        elif int(latest["latent_lora"]["correct_count"]) > prior_best_dev_correct:
+            epoch_end_no_improve = 0
+        else:
+            epoch_end_no_improve += 1
+            if epoch_end_no_improve >= 2:
+                stopped = True
+                stop_status = "EARLY_STOPPED"
+        save_lora_checkpoint(
+            checkpoint_path,
+            model=receiver,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch + 1,
+            position_in_epoch=0,
+            sample_step=sample_step,
+            optimizer_step=optimizer_step,
+            best_dev_correct=best_dev_correct,
+            best_dev_step=best_dev_step,
+            epoch_end_no_improve=epoch_end_no_improve,
+            args=args,
+        )
+        _empty_mps_cache_if_needed(device)
+        start_position = 0
+        if stopped:
+            break
+
+    latest = history[-1] if history else {}
+    latest = dict(latest)
+    latest["status"] = stop_status
+    latest["best_dev_correct"] = best_dev_correct
+    latest["best_dev_step"] = best_dev_step
+    write_lora_report(report_path, history, latest)
+    print(
+        f"DONE receiver LoRA status={stop_status} "
+        f"best_dev_correct={best_dev_correct} report={report_path}",
+        flush=True,
+    )
 
 
 def _torch_dtype(trace_dtype: str) -> torch.dtype:
