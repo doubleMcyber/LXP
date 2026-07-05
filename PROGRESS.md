@@ -219,8 +219,27 @@ Two largely independent tracks share this spine:
    receiver-token savings, leakage ruled out, semantic/comparison/heterogeneous
    gates all pass (digest `54f91d4e…`).
 
+9a. **Adapter density fixes cross-family (2026-07-05, N=32).** Rerunning §3.9's
+   exact protocol with a 128-row cross-family adapter (was 32):
+   **latent 75.0% (24/32) > text 62.5% (20/32)** — the tie is broken
+   (7 latent-only vs 3 text-only discordants, p≈0.34, directional at this N;
+   leakage ruled out). Cross-family latent moved from 59.4%→75.0% purely by
+   quadrupling adapter training rows, now matching the same-family pattern.
+   Report: `outputs/paths/xfam128_report.json`.
+
+9b. **Drafter→finisher works: cheap latents lift a bigger finisher
+   (2026-07-05, N=32).** Qwen3.5-**0.8B** drafter (truncated 0.5) →
+   Qwen3.5-**2B** finisher, audited path, locked manifest, leak-free:
+   **latent 68.8% (22/32) > same-drafter text 53.1% (17/32) > 2B-alone 21.9%**.
+   Latent strictly dominates text (5-0 discordants, p=0.0625 — one row short
+   of significance at N=32, zero reverse cases; copy-proof stratum 66.7% vs
+   51.9%; latent vs alone p=0.0003). The 0.8B's latents bring the 2B to the
+   same 68.8% the 2B→2B handoff achieves. Latency for this run includes
+   sender cache-miss generation and is not comparable — rerun warm for the
+   economics number. Report: `outputs/paths/drafter_finisher32_report.json`.
+
 9. **Cross-family latent continuation carries computation; parity with text,
-   not superiority (2026-07-04, N=32).** EXAONE-4.0-1.2B → Qwen3.5-2B,
+   not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
    truncation 0.5, audited path, locked manifest
    (`outputs/parity_fix/locked_xfam_32.json`, leakage ruled out):
    **latent 59.4% (19/32) ≈ text 62.5% (20/32)** (McNemar p=1.0; copy-proof
