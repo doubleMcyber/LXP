@@ -267,6 +267,17 @@ Two largely independent tracks share this spine:
    rounds, more rollout data, MLP-target LoRA, pair-specific cross-family
    training. Artifacts: `outputs/receiver_lora/`.
 
+11. **MATH Level-5 is outside the 2B sender's capability envelope (2026-07-05,
+   N=32) — null result, correctly attributed.** With the working dataset
+   source (`EleutherAI/hendrycks_math`; the original was unloadable) and a
+   768-token sender budget, the 2B sender completed **0/32** reasoning traces,
+   so both handoff arms degenerate to receiver-alone: all three methods score
+   an identical 15/32 (46.9%) with zero discordant rows. This is a sender
+   scoping statement, not a channel failure — the continuation protocol needs
+   a sender that can finish the problem class. The design-doc MATH gate should
+   be run with ≥7B senders on GPU hardware.
+   Report: `outputs/paths/math32_report.json`.
+
 9. **Cross-family latent continuation carries computation; parity with text,
    not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
    truncation 0.5, audited path, locked manifest
