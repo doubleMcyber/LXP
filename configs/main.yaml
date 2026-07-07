@@ -62,6 +62,9 @@ alignment:
 handoff:
   latent_pooling: "last_token"
   latent_prefix_mode: "sequence"
+  receiver_lora:
+    path: null
+    scope: "latent_only"
   adapter:
     enabled: false
     train_on_missing: false

@@ -508,8 +508,13 @@ def main() -> None:
                     },
                     checkpoint_path,
                 )
-                if device.type == "mps" and hasattr(torch, "mps"):
-                    torch.mps.empty_cache()
+                # NOTE: do NOT call torch.mps.empty_cache() here. checkpoint_every
+                # (25) is not a multiple of grad_accum (8), so this save lands mid
+                # accumulation window with un-stepped gradients present. On MPS
+                # (torch 2.10, bf16 Qwen3.5) emptying the cache between backwards
+                # deterministically poisons the next window's gradients to nan while
+                # the loss stays finite; synchronize() does not help. Same fix as
+                # scripts/train_receiver_lora.py (commit df2d18a).
         outcome = run_eval(f"epoch_{epoch}")
         bridge_accuracy = float(outcome["accuracy"].get("bridge", -1.0))
         if bridge_accuracy > best_accuracy:

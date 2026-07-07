@@ -3,7 +3,21 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
+
+# EleutherAI mirror of the Hendrycks MATH dataset. Split across per-subject
+# configs; each config exposes "train"/"test" splits with fields
+# problem/level/type/solution (same schema as the legacy competition_math
+# script dataset). Order is fixed so seeded splits are reproducible.
+_HENDRYCKS_MATH_SUBJECTS = (
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
+)
 
 
 def pick_field(row: dict, keys: tuple[str, ...]) -> str:
@@ -62,6 +76,22 @@ def _apply_train_validation_split(dataset: Any, split: str, validation_size: Opt
     return dataset.select(range(0, validation_start))
 
 
+def _finalize_math_level5(
+    dataset: Any,
+    split: str,
+    limit: Optional[int],
+    validation_size: Optional[int],
+    sample_indices: Optional[Sequence[int]],
+) -> Any:
+    if "level" in dataset.column_names:
+        level5 = dataset.filter(lambda row: "Level 5" in str(row.get("level", "")))
+    else:
+        level5 = dataset
+    if split in {"train", "validation"}:
+        level5 = _apply_train_validation_split(level5, split, validation_size)
+    return _select_rows(level5, limit, sample_indices=sample_indices)
+
+
 def load_math_level5(
     limit: int = 100,
     split: str = "test",
@@ -70,22 +100,33 @@ def load_math_level5(
     sample_indices: Optional[Sequence[int]] = None,
 ):
     """Load MATH Level 5 problems from Hugging Face."""
-    dataset_candidates = [
-        ("hendrycks/competition_math", "train" if split == "validation" else split),
-        ("competition_math", "train" if split == "validation" else split),
-    ]
+    # Validation is derived from the train tail, so it reads the train split.
+    dataset_split = "train" if split == "validation" else split
     last_error: Optional[Exception] = None
 
-    for dataset_name, dataset_split in dataset_candidates:
+    # Preferred source: EleutherAI/hendrycks_math, split across per-subject
+    # configs. Load each config in the fixed subject order and concatenate so
+    # the row order is deterministic and seeded splits are reproducible.
+    try:
+        parts = [
+            load_dataset("EleutherAI/hendrycks_math", subject, split=dataset_split)
+            for subject in _HENDRYCKS_MATH_SUBJECTS
+        ]
+        dataset = concatenate_datasets(parts)
+        return _finalize_math_level5(
+            dataset, split, limit, validation_size, sample_indices
+        )
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
+
+    # Fallbacks: legacy script datasets (only load if someone has them cached;
+    # modern `datasets` can no longer fetch them fresh).
+    for dataset_name in ("hendrycks/competition_math", "competition_math"):
         try:
             dataset = load_dataset(dataset_name, split=dataset_split)
-            if "level" in dataset.column_names:
-                level5 = dataset.filter(lambda row: "Level 5" in str(row.get("level", "")))
-            else:
-                level5 = dataset
-            if split in {"train", "validation"}:
-                level5 = _apply_train_validation_split(level5, split, validation_size)
-            return _select_rows(level5, limit, sample_indices=sample_indices)
+            return _finalize_math_level5(
+                dataset, split, limit, validation_size, sample_indices
+            )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
 

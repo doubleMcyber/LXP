@@ -2707,3 +2707,15 @@ def test_latent_answer_suffix_defaults_to_empty_under_truncation() -> None:
         }
     )
     assert _latent_answer_suffix(override_cfg) == "Continue."
+
+
+def test_final_answer_marker_tail_handles_trace_ending_at_marker() -> None:
+    from benchmark_all import _final_answer_marker_tail
+
+    # the marker regex consumes the whole answer line; the tail is any
+    # same-line text trailing the match
+    assert _final_answer_marker_tail("Final answer: 42 units\nmore") != ""
+    # a generated trace can end exactly where the match ends (regression:
+    # this raised IndexError and deterministically killed trace-warm runs)
+    assert _final_answer_marker_tail("work...\nFinal answer: 42") == ""
+    assert _final_answer_marker_tail("no marker here") == ""

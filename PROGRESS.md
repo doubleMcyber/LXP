@@ -219,8 +219,80 @@ Two largely independent tracks share this spine:
    receiver-token savings, leakage ruled out, semantic/comparison/heterogeneous
    gates all pass (digest `54f91d4e…`).
 
+9a. **Adapter density fixes cross-family (2026-07-05, N=32).** Rerunning §3.9's
+   exact protocol with a 128-row cross-family adapter (was 32):
+   **latent 75.0% (24/32) > text 62.5% (20/32)** — the tie is broken
+   (7 latent-only vs 3 text-only discordants, p≈0.34, directional at this N;
+   leakage ruled out). Cross-family latent moved from 59.4%→75.0% purely by
+   quadrupling adapter training rows, now matching the same-family pattern.
+   Report: `outputs/paths/xfam128_report.json`.
+
+9b. **Drafter→finisher works: cheap latents lift a bigger finisher
+   (2026-07-05, N=32).** Qwen3.5-**0.8B** drafter (truncated 0.5) →
+   Qwen3.5-**2B** finisher, audited path, locked manifest, leak-free:
+   **latent 68.8% (22/32) > same-drafter text 53.1% (17/32) > 2B-alone 21.9%**.
+   Latent strictly dominates text (5-0 discordants, p=0.0625 — one row short
+   of significance at N=32, zero reverse cases; copy-proof stratum 66.7% vs
+   51.9%; latent vs alone p=0.0003). The 0.8B's latents bring the 2B to the
+   same 68.8% the 2B→2B handoff achieves. Latency for this run includes
+   sender cache-miss generation and is not comparable — rerun warm for the
+   economics number. Report: `outputs/paths/drafter_finisher32_report.json`.
+
+   *Warm-cache economics (2026-07-07, N=16 rows 0-15, both caches verified
+   warm — `sender_trace_cache_hit` and `handoff_adapter_cache_hit` True on
+   every applicable row):* finisher-side cost is **near parity**: latent
+   16.2 s/sample vs text 17.4 s (medians 15.6 vs 17.1). Latent generates
+   38% fewer receiver tokens (117/sample vs 188) but at lower tokens/sec
+   (7.2 vs 10.8), which cancels the token saving on this same-family pair.
+   Accuracy on these rows: latent 93.8% > text 75.0% > alone 25.0%. So the
+   honest drafter→finisher economics claim is *accuracy at equal finisher
+   cost*, not speed; the earlier "latent ~40% faster" figure is cross-family
+   (EXAONE→Qwen, 13.1 vs 21.5 s, `outputs/parity_fix/xfam32_report.json`)
+   and should be cited as such. Report:
+   `outputs/paths/df_latency16_report.json`.
+
+10. **Receiver-LoRA latent consumption: stable training proven, no certified
+   gain yet (2026-07-05).** The full pipeline (spec
+   `docs/latent_lora_training_spec.md`) ran end to end: live zero-init
+   identity check passed (8/8 decodes bit-identical through the production
+   path), 150 verified rollouts prepared, and the sender-NLL canary — the
+   objective that destroyed Phase-0 bridge training — trained *stably* on
+   receiver-side LoRA (+16.7 pts on the 30-row dev gate), confirming the
+   design's core mechanism (frozen channel, consumption-side adaptation).
+   But on the locked N=128 manifest the canary checkpoint gives **90/128
+   (70.3%) vs baseline 88/128 (68.8%)** — not significant (8-6 discordants,
+   p=0.79); the dev lift was small-N overfit. Non-degradation held exactly
+   (text/alone rows bit-identical; LoRA applied on all 128 latent rows).
+   Cross-family stretch: same-family-trained LoRA does NOT transfer
+   (53.1% vs 59.4%, n.s.) — pair-specific training needed, as
+   pre-registered. Objective A's NaN was root-caused by bisection:
+   **`torch.mps.empty_cache()` between gradient-accumulation backwards
+   deterministically poisons the next window's gradients to all-nan under a
+   finite loss** (torch 2.10 MPS + bf16; `synchronize()` does not help) —
+   fixed by removing the trigger and adding a gradient-finiteness gate
+   (commit `df2d18a`; the same hazard pattern exists unreviewed in
+   `train_latent_bridge.py:512`). With the fix, objective A trains NaN-free
+   (zero skips) but peaks at +2 dev rows and regresses; the gates correctly
+   failed it, leaving the canary as best checkpoint. **Final path-2 verdict:
+   the training-stability problem is solved; the capacity/data problem
+   remains** — rank-16 LoRA on ~150 rollouts does not move the locked N=128
+   result (70.3% vs 68.8%, n.s.). Named next-cycle levers: iterated STaR
+   rounds, more rollout data, MLP-target LoRA, pair-specific cross-family
+   training. Artifacts: `outputs/receiver_lora/`.
+
+11. **MATH Level-5 is outside the 2B sender's capability envelope (2026-07-05,
+   N=32) — null result, correctly attributed.** With the working dataset
+   source (`EleutherAI/hendrycks_math`; the original was unloadable) and a
+   768-token sender budget, the 2B sender completed **0/32** reasoning traces,
+   so both handoff arms degenerate to receiver-alone: all three methods score
+   an identical 15/32 (46.9%) with zero discordant rows. This is a sender
+   scoping statement, not a channel failure — the continuation protocol needs
+   a sender that can finish the problem class. The design-doc MATH gate should
+   be run with ≥7B senders on GPU hardware.
+   Report: `outputs/paths/math32_report.json`.
+
 9. **Cross-family latent continuation carries computation; parity with text,
-   not superiority (2026-07-04, N=32).** EXAONE-4.0-1.2B → Qwen3.5-2B,
+   not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
    truncation 0.5, audited path, locked manifest
    (`outputs/parity_fix/locked_xfam_32.json`, leakage ruled out):
    **latent 59.4% (19/32) ≈ text 62.5% (20/32)** (McNemar p=1.0; copy-proof

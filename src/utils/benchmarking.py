@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-REPORT_SCHEMA_VERSION = 23
+REPORT_SCHEMA_VERSION = 24
 
 STANDARD_SAMPLE_FIELDS: list[str] = [
     "report_schema_version",
@@ -78,6 +78,8 @@ STANDARD_SAMPLE_FIELDS: list[str] = [
     "alignment_bias_norm",
     "prompt_calibration_enabled",
     "prompt_calibration_bias_norm",
+    "receiver_lora_applied",
+    "receiver_lora_sha",
     "handoff_adapter_enabled",
     "handoff_adapter_status",
     "handoff_adapter_applied",
