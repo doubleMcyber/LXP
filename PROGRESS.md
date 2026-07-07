@@ -304,6 +304,21 @@ Two largely independent tracks share this spine:
    be run with ≥7B senders on GPU hardware.
    Report: `outputs/paths/math32_report.json`.
 
+   *Budget-bump escalation (2026-07-07): the null survives 2× the budget.*
+   Rerunning the identical protocol at a **1536-token** sender budget
+   (verified delivered: truncated trace counts cap at 768 = 1536×0.5,
+   all traces regenerated, zero cache hits) still yields **0/32 completed
+   sender traces** and the same three-way 46.9% collapse with zero
+   discordants. Trace tails show the sender mid-derivation at the cap, so
+   the binding constraint is tokens-to-solve for this model class (likely
+   ≥3k for Qwen3.5-2B on MATH L5), compounding with capability. Next
+   escalations (3072-token budget ≈17 h on this Mac, or a 4B sender with
+   an 8 GB download) are deferred to GPU hardware as before — the MATH
+   gate needs either a stronger sender or a much larger budget, and
+   nothing about the channel itself is implicated.
+   Report: `outputs/paths/math1536_report.json` (locked manifest
+   `outputs/paths/locked_math1536.json`).
+
 9. **Cross-family latent continuation carries computation; parity with text,
    not superiority (2026-07-04, N=32; superseded by §3.9a's density result).** EXAONE-4.0-1.2B → Qwen3.5-2B,
    truncation 0.5, audited path, locked manifest
@@ -356,11 +371,11 @@ Two largely independent tracks share this spine:
    readout sat at 0.6–0.72, below the 0.80 gate). This is now understood and
    documented; treat any historical 100% not listed in §3 with suspicion.
 
-5. ~~**Cross-family transfer is unsettled.**~~ **RESOLVED 2026-07-02** (see
-   §3.9): cross-family latent continuation (EXAONE→Qwen3.5-2B) carries the
-   computation under the fixed layout — parity with text at N=32 (59.4% vs
-   62.5%, tie), both far above receiver-alone, latent ~40% faster. Remaining:
-   denser cross-family adapters (32→128 rows), more family pairs, the reverse
+5. ~~**Cross-family transfer is unsettled.**~~ **RESOLVED, now SIGNIFICANT
+   2026-07-07** (see §3.9/9a): cross-family latent continuation
+   (EXAONE→Qwen3.5-2B) beats text at N=128 (78.1% vs 64.1%, McNemar
+   p=0.0064) with a 128-row adapter; the 32-row adapter was a tie, so
+   density was the lever. Remaining: more family pairs, the reverse
    (big-drafter→small-finisher) direction.
 
 6. **Design success criteria not yet met.** From `MD Files/`:
