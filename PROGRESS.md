@@ -238,6 +238,19 @@ Two largely independent tracks share this spine:
    sender cache-miss generation and is not comparable — rerun warm for the
    economics number. Report: `outputs/paths/drafter_finisher32_report.json`.
 
+   *Warm-cache economics (2026-07-07, N=16 rows 0-15, both caches verified
+   warm — `sender_trace_cache_hit` and `handoff_adapter_cache_hit` True on
+   every applicable row):* finisher-side cost is **near parity**: latent
+   16.2 s/sample vs text 17.4 s (medians 15.6 vs 17.1). Latent generates
+   38% fewer receiver tokens (117/sample vs 188) but at lower tokens/sec
+   (7.2 vs 10.8), which cancels the token saving on this same-family pair.
+   Accuracy on these rows: latent 93.8% > text 75.0% > alone 25.0%. So the
+   honest drafter→finisher economics claim is *accuracy at equal finisher
+   cost*, not speed; the earlier "latent ~40% faster" figure is cross-family
+   (EXAONE→Qwen, 13.1 vs 21.5 s, `outputs/parity_fix/xfam32_report.json`)
+   and should be cited as such. Report:
+   `outputs/paths/df_latency16_report.json`.
+
 10. **Receiver-LoRA latent consumption: stable training proven, no certified
    gain yet (2026-07-05).** The full pipeline (spec
    `docs/latent_lora_training_spec.md`) ran end to end: live zero-init
