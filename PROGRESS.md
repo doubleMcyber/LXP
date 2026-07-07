@@ -227,6 +227,19 @@ Two largely independent tracks share this spine:
    quadrupling adapter training rows, now matching the same-family pattern.
    Report: `outputs/paths/xfam128_report.json`.
 
+   *N=128 significance run (2026-07-07): the cross-family advantage is now
+   SIGNIFICANT.* Same protocol extended to GSM8K validation rows 0-127
+   (locked manifest `outputs/paths/locked_xfam128sig.json`, digest
+   d2ebe32d…): **latent 78.1% (100/128) > text-hybrid 64.1% (82/128) >
+   receiver-alone 14.1%** — McNemar 29 latent-only vs 11 text-only
+   discordants, **exact p = 0.0064**; latent vs alone p≈7e-22. Copy-proof
+   stratum (119/128 rows where the answer literal is absent from the
+   truncated sender text): 79.0% vs 64.7%, p = 0.0095. Zero row errors.
+   Latency from this run is not citable (96 cold sender-trace rows landed
+   inside the text-hybrid timers). Cross-family latent-beats-text is no
+   longer directional; it matches the same-family N=128 headline.
+   Report: `outputs/paths/xfam128sig_report.json`.
+
 9b. **Drafter→finisher works: cheap latents lift a bigger finisher
    (2026-07-05, N=32).** Qwen3.5-**0.8B** drafter (truncated 0.5) →
    Qwen3.5-**2B** finisher, audited path, locked manifest, leak-free:
